@@ -40,10 +40,14 @@ mkdir -p "$BIN_DIR"
 log() { echo "[bench] $*" >&2; }
 
 # ---------------------------------------------------------------- build
+# NB: a version must be injected — SaveConfig writes constant.Version as
+# configVersion, and LoadConfig rejects anything not starting with "0.",
+# so an unversioned dev build cannot re-load its own saved config.
+VERSION_LDFLAG="-X 'magitrickle/constant.Version=0.99.0'"
 log "building daemon (host, no tags, no upx)"
-( cd "$REPO_DIR/src/backend" && go build -trimpath -ldflags="-w -s" -o "$BIN_DIR/magitrickled" ./cmd/magitrickled )
+( cd "$REPO_DIR/src/backend" && go build -trimpath -ldflags="-w -s $VERSION_LDFLAG" -o "$BIN_DIR/magitrickled" ./cmd/magitrickled )
 log "building bench tools"
-( cd "$BENCH_DIR" && go build -o "$BIN_DIR/dnsstub" ./dnsstub && go build -o "$BIN_DIR/dnsload" ./dnsload && go build -o "$BIN_DIR/configbench" ./configbench )
+( cd "$BENCH_DIR" && go build -o "$BIN_DIR/dnsstub" ./dnsstub && go build -o "$BIN_DIR/dnsload" ./dnsload && go build -ldflags="$VERSION_LDFLAG" -o "$BIN_DIR/configbench" ./configbench )
 
 # ---------------------------------------------------------------- env info
 {
