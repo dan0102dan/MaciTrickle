@@ -58,7 +58,8 @@ jobs:
 
       - name: Run differential suites
         working-directory: src/backend-c
-        run: sh tests/differential/run_diff.sh
+        # sudo: the Go oracle exercises the real /var/lib/magitrickle path
+        run: sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh
 
   cross_build:
     name: Cross-build skeleton (mipsel)

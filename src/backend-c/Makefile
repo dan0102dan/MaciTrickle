@@ -37,28 +37,61 @@ CFLAGS  += --sysroot=$(SYSROOT)
 LDFLAGS += --sysroot=$(SYSROOT)
 endif
 
-LIB_SRCS := \
+# Core: no external library dependencies (cross-buildable everywhere).
+CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
     src/core/lifecycle.c \
     src/logging/log.c \
     src/platform/loop.c
 
-MAIN_SRC := src/main/main.c
+# Config/rules/subscriptions: need libyaml + libpcre2-8 (host + feed
+# sysroots; the cross skeleton target builds core only until Phase 8
+# toolchain descriptors provide the dep sysroots).
+CONFIG_SRCS := \
+    src/config/duration.c \
+    src/config/id.c \
+    src/config/models.c \
+    src/config/yaml_scalar.c \
+    src/config/yaml_load.c \
+    src/config/yaml_save.c \
+    src/rules/wildcard.c \
+    src/rules/match.c \
+    src/subscriptions/subparse.c
 
-LIB_OBJS := $(LIB_SRCS:%.c=$(BUILDDIR)/%.o)
+LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS)
+
+MAIN_SRC := src/main/main.c
+CONFIGTOOL_SRC := src/tools/configtool.c
+
+CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
+CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
+LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
+CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
+
+DEP_LIBS := -lyaml -lpcre2-8
 
 TEST_SRCS := $(wildcard tests/unit/*.c)
 TEST_BINS := $(TEST_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/%)
 
-.PHONY: all clean test sanitize static_analysis
+.PHONY: all core clean test sanitize static_analysis
 
-all: $(BUILDDIR)/magitrickled-c
+ifneq ($(CROSS_COMPILE),)
+all: core
+else
+all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool
+endif
 
-$(BUILDDIR)/magitrickled-c: $(LIB_OBJS) $(MAIN_OBJ)
+core: $(BUILDDIR)/magitrickled-c
+
+$(BUILDDIR)/magitrickled-c: $(CORE_OBJS) $(MAIN_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILDDIR)/mt-configtool: $(LIB_OBJS) $(CONFIGTOOL_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(DEP_LIBS)
 
 $(BUILDDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -68,7 +101,7 @@ $(BUILDDIR)/%.o: %.c
 
 $(BUILDDIR)/tests/%: tests/unit/%.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Itests/vendor $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -Itests/vendor $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(LDLIBS) $(DEP_LIBS)
 
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t"; $$t; done
@@ -82,14 +115,14 @@ sanitize:
 
 static_analysis:
 	@if command -v clang-tidy >/dev/null; then \
-	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) -- $(CSTD) -Iinclude \
+	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) -- $(CSTD) -Iinclude \
 	        -D_POSIX_C_SOURCE=200809L -DMT_VERSION=\"$(MT_VERSION)\"; \
 	else echo "clang-tidy not found (skipped)"; fi
 	@if command -v cppcheck >/dev/null; then \
 	    cppcheck --std=c11 --enable=warning,performance,portability \
 	        --error-exitcode=1 --inline-suppr -Iinclude \
 	        -D_POSIX_C_SOURCE=200809L \
-	        $(LIB_SRCS) $(MAIN_SRC); \
+	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC); \
 	else echo "cppcheck not found (skipped)"; fi
 
 clean:

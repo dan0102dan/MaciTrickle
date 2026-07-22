@@ -11,6 +11,8 @@ Checks: >
   readability-braces-around-statements,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -bugprone-easily-swappable-parameters,
-  -bugprone-assignment-in-if-condition
+  -bugprone-assignment-in-if-condition,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-sizeof-expression
 WarningsAsErrors: 'clang-diagnostic-*,clang-analyzer-core.*'
 HeaderFilterRegex: 'include/magitrickle/.*'

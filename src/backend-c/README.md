@@ -9,21 +9,32 @@ oracle until Phase 9.
 ## Layout
 
 ```
-include/magitrickle/   public module headers (err, log, queue, lifecycle, loop)
+include/magitrickle/   public module headers
 src/
   main/                daemon entry (skeleton: loop + signals + logging)
   core/                lifecycle (partial-init unwinding)
   logging/             leveled console logger (zerolog-compatible levels)
   platform/            Linux-only layer: epoll/timerfd/signalfd/eventfd loop
   util/                error model, bounded queue
+  config/              Phase 2: models, Go-compatible duration, 4-byte IDs,
+                       YAML load/save with go-yaml-v2 byte parity (libyaml),
+                       atomic file write
+  rules/               Phase 2: rule matching (domain/namespace/wildcard/
+                       PCRE2 regex) + per-group index (hash + reversed trie)
+  subscriptions/       Phase 2: list parser/type-detect/refresh/is_due
+  tools/               mt-configtool (differential-test driver CLI)
 tests/
   unit/                greatest.h-based unit tests
   vendor/              vendored test framework (greatest.h, ISC)
-  differential/        run_diff.sh — Go↔C parity suites (grows per phase)
+  differential/        run_diff.sh + fixtures/corpora — Go↔C parity suites
 spikes/
   regex_corpus/        dlclark/regexp2 vs PCRE2 corpus (+known divergences)
   yaml_emit/           go-yaml v2 vs libyaml byte-shape check
 ```
+
+Host deps for the config/rules layer: `libyaml-dev`, `libpcre2-dev`.
+The differential config suite needs root (the Go oracle runs the real
+`App.LoadConfig`/`SaveConfig` against `/var/lib/magitrickle`).
 
 ## Commands
 
