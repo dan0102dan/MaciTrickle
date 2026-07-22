@@ -1,0 +1,10 @@
+date_utc: 2026-07-22T21:39:49Z
+kernel: Linux 6.18.5
+arch: x86_64
+cc: gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+cpu_model: Intel(R) Xeon(R) Processor @ 2.10GHz
+cpus: 4
+libc: ldd (Ubuntu GLIBC 2.39-0ubuntu8.7) 2.39
+git_commit: 33261959bc56778c61350d5631790267728a846d
+binary_size_bytes: 101368
+note: transport-only (no rule matching/cache/ipset yet — Phase 4/5)

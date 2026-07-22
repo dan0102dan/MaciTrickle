@@ -38,12 +38,16 @@ LDFLAGS += --sysroot=$(SYSROOT)
 endif
 
 # Core: no external library dependencies (cross-buildable everywhere).
+# Core: no external library dependencies (cross-buildable everywhere),
+# includes the DNS wire codec and the epoll proxy transport.
 CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
     src/core/lifecycle.c \
     src/logging/log.c \
-    src/platform/loop.c
+    src/platform/loop.c \
+    src/dns/wire.c \
+    src/dns/proxy.c
 
 # Config/rules/subscriptions: need libyaml + libpcre2-8 (host + feed
 # sysroots; the cross skeleton target builds core only until Phase 8
@@ -63,35 +67,47 @@ LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
+DNSTOOL_SRC := src/tools/dnstool.c
 
 CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
 CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
 LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
+DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
 DEP_LIBS := -lyaml -lpcre2-8
 
 TEST_SRCS := $(wildcard tests/unit/*.c)
 TEST_BINS := $(TEST_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/%)
 
-.PHONY: all core clean test sanitize static_analysis
+FUZZ_SRCS := $(wildcard tests/fuzz/*.c)
+FUZZ_BINS := $(FUZZ_SRCS:tests/fuzz/%.c=$(BUILDDIR)/fuzz/%)
 
+.PHONY: all core clean test sanitize static_analysis fuzz
+
+# The full daemon loads YAML config, so it links the config layer + deps.
+# Cross builds compile only the dependency-free core (Phase 8 provides the
+# feed sysroots for libyaml/pcre2 needed to cross-build the whole daemon).
 ifneq ($(CROSS_COMPILE),)
 all: core
 else
-all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool
+all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool $(BUILDDIR)/mt-dnstool
 endif
 
-core: $(BUILDDIR)/magitrickled-c
+core: $(CORE_OBJS)
 
-$(BUILDDIR)/magitrickled-c: $(CORE_OBJS) $(MAIN_OBJ)
+$(BUILDDIR)/magitrickled-c: $(LIB_OBJS) $(MAIN_OBJ)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(DEP_LIBS)
 
 $(BUILDDIR)/mt-configtool: $(LIB_OBJS) $(CONFIGTOOL_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(DEP_LIBS)
+
+$(BUILDDIR)/mt-dnstool: $(CORE_OBJS) $(DNSTOOL_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILDDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -110,6 +126,28 @@ sanitize:
 	$(MAKE) BUILD=sanitize \
 	    OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	    LDFLAGS="-fsanitize=address,undefined" test
+
+# libFuzzer targets (host, clang). Each runs a short smoke by default in CI
+# via `make fuzz FUZZ_RUNS=...`; without args they run interactively.
+FUZZ_CC ?= clang
+FUZZ_RUNS ?= 100000
+$(BUILDDIR)/fuzz/%: tests/fuzz/%.c $(CORE_SRCS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) -std=c11 -g -O1 -Iinclude -D_POSIX_C_SOURCE=200809L \
+	    -fsanitize=fuzzer,address,undefined -o $@ $< $(CORE_SRCS)
+
+# corpus/ is a working directory (gitignored); it is seeded from the small
+# committed seeds/ set so a fresh checkout gets useful starting inputs.
+fuzz: $(FUZZ_BINS)
+	@set -e; for f in $(FUZZ_BINS); do \
+	    name=$$(basename $$f); \
+	    echo "== $$f ($(FUZZ_RUNS) runs)"; \
+	    mkdir -p tests/fuzz/corpus/$$name; \
+	    [ -d tests/fuzz/seeds/$$name ] && \
+	        cp -n tests/fuzz/seeds/$$name/* tests/fuzz/corpus/$$name/ 2>/dev/null || true; \
+	    $$f -runs=$(FUZZ_RUNS) -max_len=1600 \
+	        tests/fuzz/corpus/$$name 2>&1 | tail -3 || exit 1; \
+	done
 
 # ---- analysis ---------------------------------------------------------
 

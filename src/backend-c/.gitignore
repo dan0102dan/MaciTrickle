@@ -1,3 +1,5 @@
 build/
 spikes/*/out/
 tests/differential/out/
+tests/differential/corpus/dns_corpus.hex
+tests/fuzz/corpus/

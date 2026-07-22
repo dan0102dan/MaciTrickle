@@ -39,6 +39,13 @@ jobs:
         working-directory: src/backend-c
         run: make static_analysis
 
+      - name: Fuzz smoke (libFuzzer, short)
+        working-directory: src/backend-c
+        run: |
+          sudo apt-get install -y clang libclang-rt-18-dev || \
+            sudo apt-get install -y clang
+          make fuzz FUZZ_RUNS=200000
+
   differential:
     name: Differential spikes (regexp2/PCRE2, yaml.v2/libyaml)
     runs-on: ubuntu-latest

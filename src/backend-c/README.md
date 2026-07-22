@@ -22,11 +22,17 @@ src/
   rules/               Phase 2: rule matching (domain/namespace/wildcard/
                        PCRE2 regex) + per-group index (hash + reversed trie)
   subscriptions/       Phase 2: list parser/type-detect/refresh/is_due
-  tools/               mt-configtool (differential-test driver CLI)
+  dns/                 Phase 3: wire codec (parse/pack, decompression
+                       guards, fake-PTR, AAAA-strip) + epoll MITM proxy
+                       transport (UDP pktinfo, TCP one-query-per-conn,
+                       upstream pools, backpressure)
+  tools/               mt-configtool, mt-dnstool (differential drivers)
 tests/
   unit/                greatest.h-based unit tests
   vendor/              vendored test framework (greatest.h, ISC)
   differential/        run_diff.sh + fixtures/corpora — Go↔C parity suites
+                       (config, rules, subscriptions, DNS wire vs miekg)
+  fuzz/                libFuzzer targets (DNS parser, fake-PTR) + seeds
 spikes/
   regex_corpus/        dlclark/regexp2 vs PCRE2 corpus (+known divergences)
   yaml_emit/           go-yaml v2 vs libyaml byte-shape check
@@ -43,8 +49,17 @@ make                   # host build -> build/host/magitrickled-c
 make test              # unit tests
 make sanitize          # ASan+UBSan test run
 make static_analysis   # clang-tidy (.clang-tidy) + cppcheck
+make fuzz FUZZ_RUNS=200000                            # libFuzzer smoke
 make CROSS_COMPILE=mipsel-linux-gnu- [SYSROOT=...]   # cross skeleton
 sh tests/differential/run_diff.sh                    # parity suites
+```
+
+Run the daemon (Phase 3: DNS proxy only):
+
+```sh
+build/host/magitrickled-c --config /path/to/config.yaml
+# functional smoke + throughput vs a stub upstream:
+SCRATCH=/tmp sh ../../tools/bench/run_c_smoke.sh
 ```
 
 CI (`.github/workflows/check-c.yml`) builds with `-Werror`, runs tests,

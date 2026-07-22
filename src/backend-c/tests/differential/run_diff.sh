@@ -45,6 +45,7 @@ fi
 echo "== differential: building tools"
 ( cd "$BACKEND_C_DIR" && make >/dev/null )
 CONFIGTOOL="$BACKEND_C_DIR/build/host/mt-configtool"
+DNSTOOL="$BACKEND_C_DIR/build/host/mt-dnstool"
 ( cd "$DIR/oracle_go" && go mod tidy >/dev/null 2>&1 && \
   go build -ldflags "-X 'magitrickle/constant.Version=0.99.0'" \
       -o "$OUT/oracle" . )
@@ -110,5 +111,25 @@ if ! diff -u "$OUT/subparse.go.txt" "$OUT/subparse.c.txt" \
 else
     echo "   $(grep -c . "$OUT/subparse.go.txt") rules: OK"
 fi
+
+echo "== differential: DNS wire corpus (miekg/dns vs C)"
+( cd "$DIR/dns_gen_go" && go mod tidy >/dev/null 2>&1 && go run . ) \
+    > "$DIR/corpus/dns_corpus.hex"
+( cd "$DIR/dns_oracle_go" && go mod tidy >/dev/null 2>&1 && \
+  go build -o "$OUT/dns_oracle" . )
+DNS_ORACLE="$OUT/dns_oracle"
+DNS_CORPUS="$DIR/corpus/dns_corpus.hex"
+for mode in dump stripaaaa ptrcheck; do
+    "$DNS_ORACLE" "$mode" < "$DNS_CORPUS" > "$OUT/dns.$mode.go.txt"
+    "$DNSTOOL" "$mode" < "$DNS_CORPUS" > "$OUT/dns.$mode.c.txt"
+    if ! diff -u "$OUT/dns.$mode.go.txt" "$OUT/dns.$mode.c.txt" \
+         > "$OUT/dns.$mode.diff" 2>&1; then
+        echo "   DNS $mode DIVERGENCE:"
+        head -30 "$OUT/dns.$mode.diff"
+        fail=1
+    else
+        echo "   dns $mode: $(grep -c '^===' "$OUT/dns.$mode.go.txt") messages: OK"
+    fi
+done
 
 exit $fail
