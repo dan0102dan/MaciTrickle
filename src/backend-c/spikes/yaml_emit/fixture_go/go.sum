@@ -1,0 +1,6 @@
+github.com/IGLOU-EU/go-wildcard/v2 v2.1.0 h1:WFqyYAuIYLJ6mHZ4rp/bYXiR4E1IvXW4+zInYWdQBqI=
+github.com/IGLOU-EU/go-wildcard/v2 v2.1.0/go.mod h1:/sUMQ5dk2owR0ZcjRI/4AZ+bUFF5DxGCQrDMNBXUf5o=
+github.com/dlclark/regexp2 v1.11.5 h1:Q/sSnsKerHeCkc/jSTNq1oCm7KiVgUMZRDUoRu0JQZQ=
+github.com/dlclark/regexp2 v1.11.5/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
+go.yaml.in/yaml/v2 v2.4.4 h1:tuyd0P+2Ont/d6e2rl3be67goVK4R6deVxCUX5vyPaQ=
+go.yaml.in/yaml/v2 v2.4.4/go.mod h1:gMZqIpDtDqOfM0uNfy0SkpRhvUryYH0Z6wdMYcacYXQ=

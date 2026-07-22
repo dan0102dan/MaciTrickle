@@ -34,10 +34,14 @@ mandatory before Phase 3 exit.
 
 ## D-04 — YAML via libyaml with Go-yaml-v2 compatibility shims
 
-Status: proposed. Duration strings + bare-int-nanoseconds parsing, legacy
-ms/s normalization preserved (contract §1), canonical save order fixed by
-explicit emitter sequence, unknown keys ignored. Differential tests are
-the gate.
+Status: **accepted** (Phase 1 spike, `src/backend-c/spikes/yaml_emit/`).
+libyaml event API with indent=2, width=-1 воспроизводит вывод yaml.v2
+**байт-в-байт** (895-байтовый config-fixture идентичен), включая стили:
+plain для обычных скаляров, single-quoted для строк с `[`/`#`/`*`,
+flow `[]` для пустых списков. Требуемые shims: явный порядок ключей,
+duration-строки (`5s`, `1h0m0s`), выбор quote-стиля по правилам yaml.v2
+(нужен небольшой классификатор скаляров в Phase 2). Duration parsing
+(строки + int=наносекунды + legacy ms/s нормализация) — на стороне load.
 
 ## D-05 — JSON via cJSON
 
@@ -52,11 +56,21 @@ documented hardening, covered by tests.
 
 ## D-07 — Regex: PCRE2 with corpus-proven parity + explicit failure mode
 
-Status: proposed. regexp2 (.NET) parity proven for the known corpus;
-patterns that fail to compile in PCRE2 are rejected at load with a clear
-log/API error (rule matches nothing — same net effect as Go's invalid-regex
-behaviour), never silently rewritten. Add match/depth limits (regex DoS
-hardening — Go version has none). Divergences documented in release notes.
+Status: **accepted** (Phase 1 spike, `src/backend-c/spikes/regex_corpus/`).
+Corpus of 47 cases (repo tests + user-style patterns + .NET constructs):
+44/47 identical with `PCRE2_CASELESS|PCRE2_UTF|PCRE2_UCP` vs
+`regexp2.IgnoreCase`. Divergences (frozen in `known_divergences.tsv`):
+1. POSIX classes `[[:alpha:]]` — regexp2 не поддерживает (тихо не матчит),
+   PCRE2 матчит корректно. Итог: С-версия «чинит» ранее сломанные паттерны.
+2. Possessive quantifiers (`a*+`) — regexp2 compile_error, PCRE2 работает.
+   Ранее нерабочие правила начнут работать.
+3. .NET balancing groups (`(?<-name>…)`) — regexp2 работает, PCRE2
+   compile_error. Единственная реальная потеря; для доменного матчинга
+   экзотика. Политика: явная ошибка при загрузке, без автопереписывания.
+Lookahead/lookbehind, backrefs, named groups (обе формы `(?<n>`/`(?'n'`),
+inline options, `\A/\z/\Z`, `\p{L}`, atomic groups, conditionals — parity
+подтверждён. Match/depth limits включены (1e6/1e4) как hardening.
+Phase 2: прогнать корпус, расширенный реальными пользовательскими списками.
 
 ## D-08 — ipset/route/link via libmnl; iptables via save/restore exec
 

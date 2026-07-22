@@ -128,7 +128,7 @@ BUILD_KEY_APK_PUB ?= public-key.pem
 # Targets
 #
 
-.PHONY: _return_export_dynamic_env all clear clean download download_backend download_frontend redownload redownload_backend redownload_frontend build build_backend build_frontend rebuild rebuild_backend rebuild_frontend prepare_files package package_ipk FORCE
+.PHONY: _return_export_dynamic_env all clear clean download download_backend download_frontend redownload redownload_backend redownload_frontend build build_backend build_backend_c build_frontend rebuild rebuild_backend rebuild_frontend prepare_files package package_ipk FORCE
 
 all: download build package
 
@@ -186,6 +186,11 @@ endif
 	@touch "$(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)"
 
 build_backend: $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)
+
+# C backend (migration in progress, docs/c-rewrite/): host build only for
+# now; becomes the production build_backend at migration Phase 8.
+build_backend_c:
+	$(MAKE) -C ./src/backend-c MT_VERSION="$(PKG_VERSION)"
 
 rebuild_backend:
 	@rm -f "$(STAMPS_DIR)/build-backend"

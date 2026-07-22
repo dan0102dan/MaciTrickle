@@ -10,7 +10,7 @@ with tests green, cross-build green, docs updated, report delivered.
 | Phase | Status |
 |---|---|
 | 0 — audit & baseline | **done (this branch)** |
-| 1 — C foundation | not started |
+| 1 — C foundation | **done (this branch)** — see phase-1-report.md |
 | 2 — models/YAML/rules | not started |
 | 3 — DNS transport/parser | not started |
 | 4 — DNS processing/cache | not started |
