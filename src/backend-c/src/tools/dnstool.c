@@ -106,8 +106,8 @@ static void rr_rdata(const mt_dns_rr_t *rr, char *buf, size_t buf_len)
             /* find longest run of zero groups for :: compression */
             uint16_t g[8];
             for (int i = 0; i < 8; i++) {
-                g[i] = (uint16_t)((rr->rdata[i * 2] << 8) |
-                                  rr->rdata[i * 2 + 1]);
+                size_t off = (size_t)i * 2;
+                g[i] = (uint16_t)((rr->rdata[off] << 8) | rr->rdata[off + 1]);
             }
             int best_start = -1, best_len = 0, cur_start = -1, cur_len = 0;
             for (int i = 0; i < 8; i++) {
@@ -222,11 +222,11 @@ static void dump_section(const char *tag, const mt_dns_rr_t *rrs, size_t n,
     char **lines = calloc(n > 0 ? n : 1, sizeof(char *));
     size_t count = 0;
     for (size_t i = 0; i < n; i++) {
-        char name[1024], rdata[1200], tbuf[16];
+        char name[1024], rdata[2200], tbuf[16];
         name_lower(rrs[i].name, rrs[i].name_len, name, sizeof(name));
         rr_rdata(&rrs[i], rdata, sizeof(rdata));
         const char *tn = type_name(rrs[i].rtype, tbuf, sizeof(tbuf));
-        char line[2600];
+        char line[3600];
         snprintf(line, sizeof(line), "%s %s %u %s %s", tag, name,
                  rrs[i].ttl, tn, rdata);
         lines[count++] = strdup(line);

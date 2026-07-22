@@ -124,3 +124,59 @@ sync only; `IsMatch` returns false. The C rule engine keeps this split
 Status: accepted. 1000-concurrency and on-device cells deferred (noise /
 no hardware); documented in benchmark-methodology.md; device runs are a
 Phase 5/8 obligation, scripts already parameterized (`GROUP_ENABLE=1`).
+
+## D-17 — No locking in the cache/matching hot path (single event-loop thread)
+
+Status: accepted (Phase 4). D-02/D-12 anticipated RCU-style snapshots for
+a *possibly* multi-threaded reader set. In the implemented architecture
+(D-02) the DNS proxy, the records cache, and rule matching all run
+exclusively on the single `mt_loop` thread — there are no concurrent
+readers to guard against, so `dns_cache` and `rulesnap` take no locks and
+the "atomic swap" of a rule-set snapshot is just a plain pointer store
+from that same thread. This satisfies the Phase 4 exit criterion ("no
+global lock in match path") by construction rather than by adding
+synchronization primitives that would have nothing to protect against
+yet. When Phase 7 introduces a worker thread for subscription fetch
+(libcurl calls, D-02), the *build* step may run there, but the resulting
+snapshot's *publication* must be marshalled onto the loop thread via
+`mt_loop_post` before any reader sees it — at that point this decision
+gets revisited with real cross-thread publication (refcounting or a
+generation counter), not before.
+
+## D-18 — Rule-set snapshot matches per-group as an aggregate OR, not Go's per-rule loop
+
+Status: accepted (Phase 4). Go's `dns.go` processes each group's rules in
+config order with two different early-exit idioms: A/AAAA records use
+`break Rule` (stop the whole group after the first matching rule),
+CNAME records use `continue Rule` (keep checking every rule in the group,
+independently deciding per rule whether to act). Both idioms feed the
+*same* action inputs regardless of which specific rule fired — A/AAAA
+always adds the same (IP, TTL) pair, CNAME always adds the same cached
+address set with the same per-address remaining TTL — so the *final
+observable state* (what ends up in a group's ipset) is identical whether
+you evaluate "did any enabled rule in this group match any candidate
+name" once, or replay Go's rule-by-rule loop. The C rule-set snapshot
+(`rulesnap.h`) therefore builds one aggregate `mt_matcher_t` per enabled
+group (OR over its enabled rules) and asks it once per (group, DNS
+record) pair.
+
+The one thing this changes: Go's CNAME path can invoke `AddIPv4Subnet`/
+`AddIPv6Subnet` multiple times for a single response when several rules
+in the same group independently match different aliases (each call is
+idempotent — same subnet, same TTL, `Replace: true` — so it is pure
+redundant netlink traffic, explicitly called out as an optimization
+target in spec §16 "уменьшить... количество netlink round trips"). The C
+path collapses this to one call. No difference in resulting ipset
+contents; fewer redundant operations. Documented here per the "не
+исправляй несовместимое поведение молча" rule rather than left as a
+silent divergence.
+
+Disabled groups are excluded from the snapshot entirely (not just
+skipped at match time): Go's `RuleSet.AddIPv4Subnet` no-ops whenever the
+group's runtime/model enable flag is off, so a disabled group can never
+produce an observable action regardless of whether its rules match —
+there is nothing to gain from building or querying an index for it.
+
+Subscription-derived synthetic groups are not part of the snapshot yet
+(subscription sync lands in Phase 7); only `mt_config_t.groups` (user
+groups) participate today.

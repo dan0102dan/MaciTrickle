@@ -1,7 +1,7 @@
 # MagiTrickle C backend
 
-Phase 1 foundation of the Go→C migration
-(план и статус: `docs/c-rewrite/migration-plan.md`; контракты:
+Go→C migration, through Phase 4 (план и статус:
+`docs/c-rewrite/migration-plan.md`; контракты:
 `docs/c-rewrite/compatibility-contract.md`). The Go backend in
 `src/backend/` remains the production implementation and behavioural
 oracle until Phase 9.
@@ -25,13 +25,22 @@ src/
   dns/                 Phase 3: wire codec (parse/pack, decompression
                        guards, fake-PTR, AAAA-strip) + epoll MITM proxy
                        transport (UDP pktinfo, TCP one-query-per-conn,
-                       upstream pools, backpressure)
-  tools/               mt-configtool, mt-dnstool (differential drivers)
+                       upstream pools, backpressure); Phase 4: response
+                       processing pipeline (dns.go handleMessage port)
+  dns_cache/           Phase 4: records cache (address/alias/reverse-alias,
+                       bounded domain count, 30s expiry sweep) — no
+                       external deps, no locking (single loop thread)
+  rules/               Phase 2: matching; Phase 4: rule-set snapshot
+                       (per-group aggregate matcher, immutable, swapped on
+                       the loop thread — decisions.md D-17/D-18)
+  tools/               mt-configtool, mt-dnstool, mt-cachetool
+                       (differential-test drivers)
 tests/
   unit/                greatest.h-based unit tests
   vendor/              vendored test framework (greatest.h, ISC)
   differential/        run_diff.sh + fixtures/corpora — Go↔C parity suites
-                       (config, rules, subscriptions, DNS wire vs miekg)
+                       (config, rules, subscriptions, DNS wire vs miekg,
+                       records cache vs recordsCache)
   fuzz/                libFuzzer targets (DNS parser, fake-PTR) + seeds
 spikes/
   regex_corpus/        dlclark/regexp2 vs PCRE2 corpus (+known divergences)
@@ -54,12 +63,15 @@ make CROSS_COMPILE=mipsel-linux-gnu- [SYSROOT=...]   # cross skeleton
 sh tests/differential/run_diff.sh                    # parity suites
 ```
 
-Run the daemon (Phase 3: DNS proxy only):
+Run the daemon (DNS proxy + records cache + rule matching; netfilter/API
+land in later phases — the match "sink" only logs for now):
 
 ```sh
 build/host/magitrickled-c --config /path/to/config.yaml
 # functional smoke + throughput vs a stub upstream:
 SCRATCH=/tmp sh ../../tools/bench/run_c_smoke.sh
+# sustained-churn soak (flat RSS check):
+sh ../../tools/bench/run_c_soak.sh
 ```
 
 CI (`.github/workflows/check-c.yml`) builds with `-Werror`, runs tests,

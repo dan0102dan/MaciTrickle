@@ -37,9 +37,9 @@ CFLAGS  += --sysroot=$(SYSROOT)
 LDFLAGS += --sysroot=$(SYSROOT)
 endif
 
-# Core: no external library dependencies (cross-buildable everywhere).
 # Core: no external library dependencies (cross-buildable everywhere),
-# includes the DNS wire codec and the epoll proxy transport.
+# includes the DNS wire codec, the epoll proxy transport, and the records
+# cache (no deps of its own).
 CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
@@ -47,7 +47,8 @@ CORE_SRCS := \
     src/logging/log.c \
     src/platform/loop.c \
     src/dns/wire.c \
-    src/dns/proxy.c
+    src/dns/proxy.c \
+    src/dns_cache/cache.c
 
 # Config/rules/subscriptions: need libyaml + libpcre2-8 (host + feed
 # sysroots; the cross skeleton target builds core only until Phase 8
@@ -61,13 +62,16 @@ CONFIG_SRCS := \
     src/config/yaml_save.c \
     src/rules/wildcard.c \
     src/rules/match.c \
-    src/subscriptions/subparse.c
+    src/rules/snapshot.c \
+    src/subscriptions/subparse.c \
+    src/dns/pipeline.c
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
 DNSTOOL_SRC := src/tools/dnstool.c
+CACHETOOL_SRC := src/tools/cachetool.c
 
 CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
 CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
@@ -75,6 +79,7 @@ LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
+CACHETOOL_OBJ := $(CACHETOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
 DEP_LIBS := -lyaml -lpcre2-8
 
@@ -92,7 +97,7 @@ FUZZ_BINS := $(FUZZ_SRCS:tests/fuzz/%.c=$(BUILDDIR)/fuzz/%)
 ifneq ($(CROSS_COMPILE),)
 all: core
 else
-all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool $(BUILDDIR)/mt-dnstool
+all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool $(BUILDDIR)/mt-dnstool $(BUILDDIR)/mt-cachetool
 endif
 
 core: $(CORE_OBJS)
@@ -106,6 +111,10 @@ $(BUILDDIR)/mt-configtool: $(LIB_OBJS) $(CONFIGTOOL_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(DEP_LIBS)
 
 $(BUILDDIR)/mt-dnstool: $(CORE_OBJS) $(DNSTOOL_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILDDIR)/mt-cachetool: $(CORE_OBJS) $(CACHETOOL_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -153,14 +162,14 @@ fuzz: $(FUZZ_BINS)
 
 static_analysis:
 	@if command -v clang-tidy >/dev/null; then \
-	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) -- $(CSTD) -Iinclude \
+	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC) -- $(CSTD) -Iinclude \
 	        -D_POSIX_C_SOURCE=200809L -DMT_VERSION=\"$(MT_VERSION)\"; \
 	else echo "clang-tidy not found (skipped)"; fi
 	@if command -v cppcheck >/dev/null; then \
 	    cppcheck --std=c11 --enable=warning,performance,portability \
 	        --error-exitcode=1 --inline-suppr -Iinclude \
 	        -D_POSIX_C_SOURCE=200809L \
-	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC); \
+	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC); \
 	else echo "cppcheck not found (skipped)"; fi
 
 clean:

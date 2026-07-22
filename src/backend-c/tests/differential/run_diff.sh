@@ -11,6 +11,9 @@
 #              (or both fail), plus C-save must reload cleanly in Go
 #   match    — rule matching corpus (models.Rule.IsMatch vs mt_rule_matcher)
 #   subparse — subscription list parsing corpus
+#   dns      — DNS wire corpus (miekg/dns vs mt-dnstool: dump/stripaaaa/ptrcheck)
+#   cache    — records cache script (recordsCache vs mt_cache; structural
+#              comparison only, see cache_oracle_go for why)
 #
 # Requires root for the config suite (the Go oracle exercises the real
 # /var/lib/magitrickle path). Exit non-zero on any unexpected divergence.
@@ -131,5 +134,21 @@ for mode in dump stripaaaa ptrcheck; do
         echo "   dns $mode: $(grep -c '^===' "$OUT/dns.$mode.go.txt") messages: OK"
     fi
 done
+
+echo "== differential: DNS records cache (recordsCache vs mt_cache)"
+CACHETOOL="$BACKEND_C_DIR/build/host/mt-cachetool"
+( cd "$DIR/cache_oracle_go" && go mod tidy >/dev/null 2>&1 && \
+  go build -o "$OUT/cache_oracle" . )
+CACHE_ORACLE="$OUT/cache_oracle"
+CACHE_SCRIPT="$DIR/corpus/cache_script.txt"
+"$CACHE_ORACLE" < "$CACHE_SCRIPT" > "$OUT/cache.go.txt"
+"$CACHETOOL" < "$CACHE_SCRIPT" > "$OUT/cache.c.txt"
+if ! diff -u "$OUT/cache.go.txt" "$OUT/cache.c.txt" > "$OUT/cache.diff" 2>&1; then
+    echo "   DIVERGENCE:"
+    cat "$OUT/cache.diff"
+    fail=1
+else
+    echo "   $(grep -c . "$OUT/cache.go.txt") queries: OK"
+fi
 
 exit $fail

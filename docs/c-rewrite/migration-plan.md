@@ -13,7 +13,7 @@ with tests green, cross-build green, docs updated, report delivered.
 | 1 — C foundation | **done (this branch)** — see phase-1-report.md |
 | 2 — models/YAML/rules | **done (this branch)** — see phase-2-report.md |
 | 3 — DNS transport/parser | **done (this branch)** — see phase-3-report.md |
-| 4 — DNS processing/cache | not started |
+| 4 — DNS processing/cache | **done (this branch)** — see phase-4-report.md |
 | 5 — netfilter/netlink | not started |
 | 6 — API/WebUI | not started |
 | 7 — subscriptions/integration | not started |
