@@ -417,6 +417,47 @@ static void build_response_bytes(mt_http_conn_t *c, const mt_http_res_t *res) {
     c->wbuf_sent = 0;
 }
 
+/* Collapses "." and ".." segments the way Go's path.Clean does for a
+ * rooted path (the input here always starts with '/'): a ".." at or
+ * above the root is simply dropped rather than escaping upward. This is
+ * what makes it safe for the static file handler (see the not-found
+ * fallback wired up by main.c) to join mt_http_req_path()'s result onto
+ * a filesystem root without a path-traversal hole -- matches the
+ * contract already documented on mt_http_req_path in httpd.h. */
+#define MT_HTTPD_MAX_CLEAN_SEGMENTS 64
+static void path_clean(const char *in, char *out, size_t out_cap) {
+    seg_t kept[MT_HTTPD_MAX_CLEAN_SEGMENTS];
+    size_t n_kept = 0;
+    size_t len = strlen(in);
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && in[i] == '/') { i++; }
+        if (i >= len) { break; }
+        size_t start = i;
+        while (i < len && in[i] != '/') { i++; }
+        size_t seg_len = i - start;
+        if (seg_len == 1 && in[start] == '.') {
+            continue;
+        } else if (seg_len == 2 && in[start] == '.' && in[start + 1] == '.') {
+            if (n_kept > 0) { n_kept--; }
+        } else if (n_kept < MT_HTTPD_MAX_CLEAN_SEGMENTS) {
+            kept[n_kept].p = in + start;
+            kept[n_kept].len = seg_len;
+            n_kept++;
+        }
+    }
+    size_t o = 0;
+    if (o + 1 < out_cap) { out[o++] = '/'; }
+    for (size_t k = 0; k < n_kept; k++) {
+        if (k > 0 && o + 1 < out_cap) { out[o++] = '/'; }
+        size_t copy = kept[k].len;
+        if (o + copy >= out_cap) { copy = out_cap > o + 1 ? out_cap - 1 - o : 0; }
+        memcpy(out + o, kept[k].p, copy);
+        o += copy;
+    }
+    out[o < out_cap ? o : out_cap - 1] = '\0';
+}
+
 /* Parses the request line + headers already accumulated in
  * c->rbuf[0..c->header_end); fills *req (body left for the caller to
  * attach once fully read). Returns false on malformed input. */
@@ -449,7 +490,9 @@ static bool parse_headers(mt_http_conn_t *c, mt_http_req_t *req) {
 
     const char *qmark = memchr(path_start, '?', full_path_len);
     size_t path_only_len = qmark ? (size_t)(qmark - path_start) : full_path_len;
-    percent_decode(path_start, path_only_len, req->path, sizeof(req->path), false);
+    char decoded_path[sizeof(req->path)] = {0};
+    percent_decode(path_start, path_only_len, decoded_path, sizeof(decoded_path), false);
+    path_clean(decoded_path, req->path, sizeof(req->path));
 
     if (qmark) {
         const char *q = qmark + 1;

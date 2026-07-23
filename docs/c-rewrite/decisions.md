@@ -578,3 +578,98 @@ the real-netfilter-backed failure path through these handlers is a thin,
 already-tested pass-through of `mt_ruleset_t`/`mt_app_t` return codes
 (see `test_app.c`'s `add_group_while_running_rolls_back_on_failure`),
 so it isn't re-exercised at the HTTP layer here.
+
+## D-27: System endpoints, static skin serving, and main.c HTTP wiring
+
+Ports the remaining pieces of `api/v1/handlers.go` not covered by D-26
+(`ListInterfaces`, `SaveConfig`, `NetfilterDHook` — `system.h`/`system.c`)
+and `http.go`'s wildcard static-file fallback (`staticfiles.h`/
+`staticfiles.c`), then wires everything built across Phase 6 so far into
+`main.c` — this is the first point at which the C daemon actually serves
+the HTTP/Unix-socket API end to end, not just in unit tests.
+
+**Security fix found while building this task: `mt_http_req_path()`
+wasn't actually cleaning `..`/`.` segments.** httpd.h's contract
+(written during task #31) already *claimed* `mt_http_req_path` returns a
+"path-cleaned (matches Go's `path.Clean`)" string, but the task #31
+implementation only percent-decoded the path — it never collapsed dot
+segments. That gap was harmless until this task, since nothing yet
+joined the request path onto a filesystem root, but `staticfiles.c`'s
+skin-file serving does exactly that. A request like
+`GET /../../../../etc/passwd` would have joined onto
+`<skins_dir>/<skin>/../../../../etc/passwd` and, depending on nesting
+depth, could have escaped the skin directory entirely. Fixed by adding
+`path_clean()` to `httpd.c` (Go `path.Clean` semantics for a rooted
+path: `.` segments are dropped, `..` pops the last kept segment or is
+simply dropped at/above the root — since the input is always absolute,
+this can never escape upward) and applying it to every parsed request
+path before it's exposed via `mt_http_req_path()`. Verified directly:
+`test_staticfiles.c`'s `path_traversal_is_contained_under_skin_root`
+sends exactly that request against a real skin fixture directory and
+asserts a plain in-skin 404, not real `/etc/passwd` contents.
+
+**Static file serving (`staticfiles.c`)** ports `http.go`'s `r.Get("/*",
+...)` handler closely, including its exact up-to-2-stat retry loop
+(directory → append `/index.html` → retry once, matching Go's
+`for i := 0; i < 2; i++`) and its three response shapes: normal file
+(content-type by extension: html/css/js/ico/png/svg, else
+`text/plain`), missing file (404 JSON `{"error":...}`), and missing
+file *at `/` specifically* (404 with Go's exact
+`noSkinFoundPlaceholder` HTML string). Registered only as the TCP
+`mt_httpd_t` instance's not-found fallback (`mt_httpd_set_not_found`),
+never on the Unix socket instance — matches `unixsocket.go`, which
+mounts only the v1 API router. Non-GET requests to an unmatched path
+get a plain 404 here rather than chi's default text/plain 404 page;
+documented as a cosmetic, status-code-level-only difference (D-05
+already established that byte-identical bodies aren't a goal).
+
+**`main.c` refactor: `mt_app_t` replaces the ad hoc `mt_ruleset_t**`
+array.** Phase 5's `main.c` built and owned its own raw ruleset array
+inline. Since the Phase 6 HTTP handlers (D-26, this entry) need a real,
+running `mt_app_t*` to mutate, `struct daemon`'s `rulesets`/`n_rulesets`
+fields are gone, replaced by `mt_app_t *app` (plus `mt_httpd_t
+*http_tcp`/`*http_unix`). `find_ruleset`/`on_link_up`/`on_addr_change`
+now go through `mt_app_find_group_by_id`/`mt_app_user_group_count`/
+`mt_app_user_group_at` instead of iterating the old array directly. The
+startup sequence still enables+syncs every initially-configured group
+itself (via `mt_app_user_group_at`) *before* calling
+`mt_app_set_running(app, true)` — exactly the ordering app.h's own
+header comment already prescribed (mirrors Go's `Start()` CAS happening
+before that same loop), so a group added later through the HTTP API
+gets its own immediate enable+sync via `mt_app_add_group`, while the
+initial set is brought up directly by `main()`.
+
+**HTTP/Unix-socket topology matches Go exactly:** the Unix socket
+(`MT_SOCK_PATH`) always starts and always mounts the full v1 router
+(groups/rules/system/auth — matches `unixsocket.go`, which has no
+enabled-gate and never installs the auth middleware); the TCP WebUI
+only starts when `cfg.app.http_web.enabled`, and only the TCP instance
+gets `mt_auth_middleware` and the static-file not-found fallback
+(matches `http.go`). `SaveConfig`'s path/version (needed by every
+`?save=true` handler and the `/system/config/save` endpoint) come from
+the same `config_path`/`MT_VERSION` `main()` already resolves at
+startup — no new state.
+
+**Verified two ways.** Unit-level: `test_system.c` (4 tests: blackhole
+prepended with `name` omitted per Go's `omitempty`, config save
+round-trip through a real temp file, no-op-without-a-path, netfilter.d
+hook success + malformed-body 400) and `test_staticfiles.c` (7 tests
+including the path-traversal-containment test above), both against a
+real `mt_httpd_t` over the same background-loop-thread harness as
+`test_groups.c`. End-to-end: built and ran the actual
+`magitrickled-c` binary against a scratch config (remap53 disabled,
+`showAllInterfaces: true`, no groups) and drove it with real `curl`
+over both the TCP WebUI and the Unix socket: `GET /groups` (empty),
+`POST /groups` with `enable:false` (200, persisted), the *same* POST
+with the default `enable:true` (500 — the sandbox's known-missing
+`ip_set` kernel module, same root cause as `test_app.c`'s rollback
+test, and confirmed the failed group was *not* left in `GET /groups`
+afterward), `GET /system/interfaces`, `GET /auth`, `GET /` (the
+no-skin-installed HTML placeholder, since no skin is built into this
+scratch environment), `POST /system/config/save`, and
+`POST /system/hooks/netfilterd`; `SIGTERM` produced a clean shutdown
+log and left no `MT__`-prefixed iptables chains behind afterward.
+
+Full suite (24 unit-test binaries, up from 22), `make static_analysis`
+(clang-tidy + cppcheck), and `make sanitize` (ASan+UBSan) all clean
+after these changes.

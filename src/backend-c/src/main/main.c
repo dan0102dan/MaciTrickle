@@ -8,9 +8,13 @@
  * see dnspipeline.h), dispatching matches into the matched group's ipset
  * (rule_set.go's AddIPv4Subnet/AddIPv6Subnet, ported — see ruleset.h).
  *
- * Not yet ported: HTTP/Unix API and subscriptions (later phases). The Go
- * backend remains authoritative until the migration completes
- * (docs/c-rewrite/).
+ * Also wires up the HTTP/Unix-socket API (Phase 6): groups/rules CRUD,
+ * system endpoints (interfaces/config-save/netfilter.d hook), auth
+ * (crypt+JWT), and skin static file serving, all sharing one mt_app_t
+ * that now owns the per-group mt_ruleset_t registry this file used to
+ * manage inline. Subscription HTTP endpoints are not yet wired (task
+ * #36). The Go backend remains authoritative until the migration
+ * completes (docs/c-rewrite/).
  */
 #include <errno.h>
 #include <ifaddrs.h>
@@ -22,18 +26,25 @@
 #include <string.h>
 #include <time.h>
 
+#include "magitrickle/app.h"
+#include "magitrickle/auth.h"
 #include "magitrickle/dns_cache.h"
 #include "magitrickle/dnspipeline.h"
 #include "magitrickle/dnsproxy.h"
+#include "magitrickle/groups.h"
+#include "magitrickle/httpd.h"
 #include "magitrickle/iptables.h"
 #include "magitrickle/log.h"
 #include "magitrickle/loop.h"
 #include "magitrickle/netfilter_cleaner.h"
 #include "magitrickle/netlink_watcher.h"
+#include "magitrickle/paths.h"
 #include "magitrickle/port_remap.h"
 #include "magitrickle/rtnl.h"
 #include "magitrickle/rulesnap.h"
 #include "magitrickle/ruleset.h"
+#include "magitrickle/staticfiles.h"
+#include "magitrickle/system.h"
 #include "magitrickle/version.h"
 #include "magitrickle/yamlio.h"
 
@@ -53,8 +64,9 @@ struct daemon {
     mt_rtnl_t *rtnl;
     mt_nl_watcher_t *watcher;
     mt_port_remap_t *port_remap;
-    mt_ruleset_t **rulesets;
-    size_t n_rulesets;
+    mt_app_t *app;
+    mt_httpd_t *http_tcp;
+    mt_httpd_t *http_unix;
 };
 
 static int64_t now_unix(void)
@@ -65,18 +77,19 @@ static int64_t now_unix(void)
 /* Reverse-order teardown of everything in `struct daemon`. Every
  * destroy/free/disable below is NULL-safe and idempotent, so this can be
  * called from any partially-constructed state (d is always zero-initialized
- * at the top of main). Rulesets/port_remap borrow ipt4/ipt6/rtnl, so they
- * must be torn down before those; the loop must outlive the watcher/proxy
- * fds registered on it. */
+ * at the top of main). The HTTP servers must be destroyed while the loop is
+ * still alive (mt_httpd_destroy removes their fds from it). app/port_remap
+ * borrow ipt4/ipt6/rtnl/cache, so they must be torn down before those; the
+ * loop must outlive the watcher/proxy fds registered on it too. */
 static void daemon_teardown(struct daemon *d)
 {
-    for (size_t i = 0; i < d->n_rulesets; i++) {
-        mt_ruleset_disable(d->rulesets[i]);
-        mt_ruleset_free(d->rulesets[i]);
-    }
-    free(d->rulesets);
-    d->rulesets = NULL;
-    d->n_rulesets = 0;
+    mt_httpd_destroy(d->http_tcp);
+    d->http_tcp = NULL;
+    mt_httpd_destroy(d->http_unix);
+    d->http_unix = NULL;
+
+    mt_app_destroy(d->app);
+    d->app = NULL;
 
     if (d->port_remap) {
         mt_port_remap_disable(d->port_remap);
@@ -104,12 +117,7 @@ static void daemon_teardown(struct daemon *d)
 
 static mt_ruleset_t *find_ruleset(struct daemon *d, mt_id_t id)
 {
-    for (size_t i = 0; i < d->n_rulesets; i++) {
-        if (mt_id_equal(mt_ruleset_group(d->rulesets[i])->id, id)) {
-            return d->rulesets[i];
-        }
-    }
-    return NULL;
+    return mt_app_find_group_by_id(d->app, id);
 }
 
 static void on_signal(mt_loop_t *loop, int signo, void *ud)
@@ -184,12 +192,13 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
                * netlink_watcher.h), matching Go's net.FlagUp filter */
     struct daemon *d = ud;
     MT_DEBUG("interface up: %s", iface_name);
-    for (size_t i = 0; i < d->n_rulesets; i++) {
-        const mt_group_t *g = mt_ruleset_group(d->rulesets[i]);
+    for (size_t i = 0; i < mt_app_user_group_count(d->app); i++) {
+        mt_ruleset_t *rs = mt_app_user_group_at(d->app, i);
+        const mt_group_t *g = mt_ruleset_group(rs);
         if (g->iface == NULL || strcmp(g->iface, iface_name) != 0) {
             continue;
         }
-        mt_err_t err = mt_ruleset_on_link_up(d->rulesets[i]);
+        mt_err_t err = mt_ruleset_on_link_up(rs);
         if (err != MT_OK) {
             MT_ERROR("error while handling interface up: group=%s err=%s",
                      g->name, mt_err_str(err));
@@ -201,12 +210,13 @@ static void on_addr_change(const char *iface_name, void *ud)
 {
     struct daemon *d = ud;
     MT_DEBUG("interface address changed: %s", iface_name);
-    for (size_t i = 0; i < d->n_rulesets; i++) {
-        const mt_group_t *g = mt_ruleset_group(d->rulesets[i]);
+    for (size_t i = 0; i < mt_app_user_group_count(d->app); i++) {
+        mt_ruleset_t *rs = mt_app_user_group_at(d->app, i);
+        const mt_group_t *g = mt_ruleset_group(rs);
         if (g->iface == NULL || strcmp(g->iface, iface_name) != 0) {
             continue;
         }
-        mt_err_t err = mt_ruleset_on_addr_change(d->rulesets[i]);
+        mt_err_t err = mt_ruleset_on_addr_change(rs);
         if (err != MT_OK) {
             MT_ERROR(
                 "error while handling interface addr change: group=%s "
@@ -294,6 +304,26 @@ static mt_err_t collect_link_addrs(char *const *link_names, size_t n_link,
     *out = arr;
     *out_n = n;
     return MT_OK;
+}
+
+/* HTTP glue callbacks -- ud is always the daemon's mt_config_t (see main()),
+ * matching what auth.h/staticfiles.h expect. */
+static bool auth_enabled_fn(void *ud)
+{
+    const mt_config_t *cfg = ud;
+    return cfg->app.http_web.auth.enabled;
+}
+
+static const char *auth_state_dir_fn(void *ud)
+{
+    (void)ud;
+    return MT_APP_STATE_DIR;
+}
+
+static const char *static_skin_fn(void *ud)
+{
+    const mt_config_t *cfg = ud;
+    return cfg->app.http_web.skin;
 }
 
 int main(int argc, char **argv)
@@ -520,50 +550,114 @@ int main(int argc, char **argv)
         }
     }
 
-    /* ---- per-group netfilter rulesets -------------------------------------- */
+    /* ---- app layer: per-group netfilter rulesets + HTTP mutation API -------- */
 
-    if (cfg.n_groups > 0) {
-        d.rulesets = calloc(cfg.n_groups, sizeof(*d.rulesets));
-        if (d.rulesets == NULL) {
-            MT_ERROR("failed to allocate rulesets");
-            daemon_teardown(&d);
-            mt_config_clear(&cfg);
-            return 1;
-        }
-    }
-    mt_ruleset_deps_t deps = {
+    mt_app_deps_t app_deps = {
+        .cfg = &cfg,
+        .cache = d.cache,
         .ipt4 = d.ipt4,
         .ipt6 = d.ipt6,
         .rtnl = d.rtnl,
-        .ipset_prefix = cfg.app.netfilter.ipset.table_prefix,
-        .chain_prefix = cfg.app.netfilter.iptables.chain_prefix,
         .start_idx = cfg.app.netfilter.start_mark_table_index,
     };
-    for (size_t i = 0; i < cfg.n_groups; i++) {
-        mt_ruleset_t *rs = mt_ruleset_new(cfg.groups[i], &deps);
-        if (rs == NULL) {
-            MT_ERROR("failed to allocate ruleset for group %s", cfg.groups[i]->name);
-            daemon_teardown(&d);
-            mt_config_clear(&cfg);
-            return 1;
-        }
-        d.rulesets[d.n_rulesets++] = rs;
+    d.app = mt_app_create(&app_deps);
+    if (d.app == NULL) {
+        MT_ERROR("failed to create app");
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
     }
-    for (size_t i = 0; i < d.n_rulesets; i++) {
-        err = mt_ruleset_enable(d.rulesets[i]);
+    for (size_t i = 0; i < mt_app_user_group_count(d.app); i++) {
+        mt_ruleset_t *rs = mt_app_user_group_at(d.app, i);
+        err = mt_ruleset_enable(rs);
         if (err != MT_OK) {
             MT_ERROR("failed to enable group: %s", mt_err_str(err));
             daemon_teardown(&d);
             mt_config_clear(&cfg);
             return 1;
         }
-        err = mt_ruleset_sync(d.rulesets[i], d.cache, now_unix());
+        err = mt_ruleset_sync(rs, d.cache, now_unix());
         if (err != MT_OK) {
             MT_ERROR("failed to sync group: %s", mt_err_str(err));
             daemon_teardown(&d);
             mt_config_clear(&cfg);
             return 1;
         }
+    }
+    /* Only now mark the app "running" -- matches Go's Start() CAS
+     * happening before this same enable/sync loop, so a group added later
+     * via the HTTP API (mt_app_add_group) gets its own immediate
+     * enable+sync, while the initial set was already brought up above. */
+    mt_app_set_running(d.app, true);
+
+    /* ---- HTTP API: Unix socket (always on) + TCP WebUI (config-gated) ------ */
+
+    mt_groups_ctx_t groups_ctx = {
+        .app = d.app,
+        .config_path = config_path,
+        .config_version = MT_VERSION,
+    };
+    mt_system_ctx_t system_ctx = {
+        .app = d.app,
+        .config_path = config_path,
+        .config_version = MT_VERSION,
+    };
+    mt_auth_ctx_t auth_ctx = {
+        .enabled = auth_enabled_fn,
+        .state_dir = auth_state_dir_fn,
+        .ud = &cfg,
+    };
+
+    if (mt_httpd_create(d.loop, &d.http_unix) != MT_OK) {
+        MT_ERROR("failed to create Unix socket server");
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
+    }
+    mt_groups_register_routes(d.http_unix, &groups_ctx);
+    mt_system_register_routes(d.http_unix, &system_ctx);
+    mt_httpd_route(d.http_unix, "GET", "/api/v1/auth", mt_auth_status_handler, &auth_ctx);
+    mt_httpd_route(d.http_unix, "POST", "/api/v1/auth", mt_auth_login_handler, &auth_ctx);
+    err = mt_httpd_listen_unix(d.http_unix, MT_SOCK_PATH);
+    if (err != MT_OK) {
+        MT_ERROR("failed to listen on Unix socket %s: %s", MT_SOCK_PATH, mt_err_str(err));
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
+    }
+    MT_INFO("Unix socket API listening on %s", MT_SOCK_PATH);
+
+    mt_static_ctx_t static_ctx = {
+        .skins_dir = MT_APP_SHARE_DIR "/skins",
+        .skin_name = static_skin_fn,
+        .ud = &cfg,
+    };
+    if (cfg.app.http_web.enabled) {
+        if (mt_httpd_create(d.loop, &d.http_tcp) != MT_OK) {
+            MT_ERROR("failed to create HTTP server");
+            daemon_teardown(&d);
+            mt_config_clear(&cfg);
+            return 1;
+        }
+        mt_groups_register_routes(d.http_tcp, &groups_ctx);
+        mt_system_register_routes(d.http_tcp, &system_ctx);
+        mt_httpd_route(d.http_tcp, "GET", "/api/v1/auth", mt_auth_status_handler, &auth_ctx);
+        mt_httpd_route(d.http_tcp, "POST", "/api/v1/auth", mt_auth_login_handler, &auth_ctx);
+        mt_httpd_set_middleware(d.http_tcp, mt_auth_middleware, &auth_ctx);
+        mt_httpd_set_not_found(d.http_tcp, mt_static_handler, &static_ctx);
+        err = mt_httpd_listen_tcp(d.http_tcp, cfg.app.http_web.host.address,
+                                  cfg.app.http_web.host.port);
+        if (err != MT_OK) {
+            MT_ERROR("failed to listen HTTP %s:%u: %s", cfg.app.http_web.host.address,
+                     cfg.app.http_web.host.port, mt_err_str(err));
+            daemon_teardown(&d);
+            mt_config_clear(&cfg);
+            return 1;
+        }
+        MT_INFO("HTTP WebUI listening on %s:%u", cfg.app.http_web.host.address,
+                cfg.app.http_web.host.port);
+    } else {
+        MT_INFO("HTTP WebUI disabled by configuration");
     }
 
     MT_INFO("service started");
