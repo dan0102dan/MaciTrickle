@@ -57,7 +57,13 @@ CORE_SRCS := \
     src/iptables/chain_override.c \
     src/iptables/chain_delete.c \
     src/iptables/engine.c \
-    src/iptables/executable_real.c
+    src/iptables/executable_real.c \
+    src/crypto/md5.c \
+    src/crypto/sha256.c \
+    src/crypto/sha512.c \
+    src/crypto/hmac.c \
+    src/crypto/base64.c \
+    src/crypto/crypt.c
 
 # Config/rules/subscriptions: need libyaml + libpcre2-8 (host + feed
 # sysroots; the cross skeleton target builds core only until Phase 8
@@ -88,7 +94,16 @@ NETFILTER_SRCS := \
     src/netlink/rtnl.c \
     src/netlink/watcher.c
 
-LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS)
+# API: HTTP/Unix JSON API (Phase 6). Needs cJSON (host + feed sysroots,
+# same cross-build caveat as CONFIG_SRCS/NETFILTER_SRCS). jwt.c lives here
+# (not in the dependency-free CORE_SRCS crypto/ group) because it needs
+# cJSON for claims (de)serialization, even though it's a "crypto" file.
+API_SRCS := \
+    src/api/json.c \
+    src/api/httpd.c \
+    src/crypto/jwt.c
+
+LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
@@ -98,13 +113,14 @@ CACHETOOL_SRC := src/tools/cachetool.c
 CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
 CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
 NETFILTER_OBJS := $(NETFILTER_SRCS:%.c=$(BUILDDIR)/%.o)
-LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS)
+API_OBJS := $(API_SRCS:%.c=$(BUILDDIR)/%.o)
+LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS) $(API_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 CACHETOOL_OBJ := $(CACHETOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
-DEP_LIBS := -lyaml -lpcre2-8 -lmnl
+DEP_LIBS := -lyaml -lpcre2-8 -lmnl -lcjson
 
 # fake_iptables.c/fake_ipset_nl.c are test *support* (the former a port of
 # executable-fake.go, gated behind Go's `testing` build tag there; the

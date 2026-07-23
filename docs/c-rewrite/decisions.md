@@ -45,7 +45,19 @@ duration-строки (`5s`, `1h0m0s`), выбор quote-стиля по пра�
 
 ## D-05 — JSON via cJSON
 
-Status: proposed. Payloads are small; availability in both feeds decides.
+Status: **accepted** (Phase 6). Dynamically linked (`libcjson`, MIT,
+confirmed available in both OpenWrt and Entware feeds per
+dependencies.md), same pattern as libyaml/PCRE2/libmnl — not vendored.
+`include/magitrickle/json.h` wraps it with two helpers matching
+`api/utils/helpers.go`'s shape: `mt_json_error()` builds `{"error":"..."}`
+(Go's `types.ErrorRes`), `mt_json_dump()` serializes compact (no
+whitespace), matching Go's default un-indented `json.Marshal` output.
+Byte-identical serialization with Go (e.g. Go's default HTML-escaping of
+`<`/`>`/`&` in strings) is explicitly NOT a goal — the API compatibility
+contract is verified by structural/normalized comparison (parse both
+sides, compare values), per migration-plan.md's Phase 6 description; a
+JSON parser reads an escaped and a literal `<` identically, so this only
+affects wire bytes, never observable behaviour.
 
 ## D-06 — HTTP server: own bounded HTTP/1.1 on the shared loop
 
@@ -293,3 +305,90 @@ be material in practice. It has not been benchmarked at scale; if a
 future phase needs `sync()` to handle large domain counts (e.g. a
 subscription-derived group with thousands of rules, Phase 7), this
 should be revisited with a real hash table rather than assumed fine.
+
+## D-23 — Own vendored MD5/SHA-256/SHA-512/HMAC/JWT (auth crypto)
+
+Status: accepted (Phase 6), confirms the "Own vendored single-file
+implementations" verdict already recorded in dependencies.md. `api/auth/
+crypt.go` and `api/auth/jwt.go` are themselves already from-scratch
+reimplementations in Go (not calls into a system crypt(3) or a JWT
+library) — Poul-Henning Kamp's MD5-crypt and Ulrich Drepper's SHA-256/512-
+crypt reference algorithms, plus a minimal hand-rolled HS256 JWT. The C
+port (`src/crypto/{md5,sha256,sha512,hmac,base64,crypt,jwt}.c`,
+`include/magitrickle/{hash,crypt,jwt}.h`) follows the Go source closely
+— this is the one case in the whole rewrite where a near line-by-line
+port is the *correct* choice rather than a spec violation: these are
+fixed, previously-specified cryptographic algorithms where byte-exact
+arithmetic is the entire point (RFC 1321 MD5, FIPS 180-4 SHA-2, RFC 2104
+HMAC), not incidental control-flow that should be reworked idiomatically.
+No OpenSSL/mbedtls dependency is introduced for these three primitives,
+matching the explicit rejection of that option in dependencies.md ("linking
+the whole app to a TLS lib for 3 primitives").
+
+Verified two ways: (1) unit tests against published NIST/RFC test
+vectors for the raw primitives (empty string, "abc", the two-block NIST
+SHA-256 vector, RFC 4231 HMAC test case 1); (2) a **differential** check
+against the real Go implementation — `tests/unit/test_crypt.c` and
+`tests/unit/test_jwt.c` use vectors captured by temporarily adding a
+`TestGenVectors`/`TestGenJWTVectors` test file to `api/auth` in the Go
+tree, running it with `go test`, and copying the printed output/tokens
+into the C test's expected strings (the temporary Go test file was never
+committed). All vectors match byte-for-byte, including the JWT tokens
+(satisfying migration-plan.md's explicit "JWT byte-compatible" bar) and
+crypt(3) hashes for both default and custom `rounds=N` salts.
+
+Hardening beyond Go (spec: bounded memory): `mt_crypt_password` caps the
+password length at `MAX_PASSWORD_LEN` (4096 bytes) before the SHA-crypt
+pseq/sseq scratch buffers are allocated; Go imposes no such bound, but no
+real password reaches anywhere near this size, so behaviour is unchanged
+for every real input.
+
+## D-06 (revisited) — Own bounded HTTP/1.1 server, confirmed
+
+Status: **accepted** (Phase 6), resolving the "proposed, pending Phase 1
+spike" note left on the original D-06 entry. `src/api/httpd.c` /
+`include/magitrickle/httpd.h` implement a small, purpose-built HTTP/1.1
+server on the shared `mt_loop` (epoll) rather than adopting libmicrohttpd
+— the API surface is fixed and small (~25 routes under `/api/v1`, JSON
+bodies "≤100 KB" per dependencies.md, plus whole-file static serving),
+so a general-purpose HTTP library added little beyond what a few hundred
+lines of purpose-built parsing/routing already covers, and building it in
+means the connection state machine reuses the exact non-blocking
+accept/partial-read/partial-write pattern already established for the
+DNS proxy's TCP path (`src/dns/proxy.c`) instead of introducing a second
+concurrency model.
+
+Supports HTTP/1.1 keep-alive (one request read to completion, response
+written, then the next request read on the same connection) and
+`Connection: close`/HTTP/1.0 single-request mode; does **not** support
+chunked request bodies (every real client here — the frontend's
+fetch/axios calls, and the contract tests — sends fixed `Content-Length`
+JSON, never chunked transfer-encoding).
+
+Bounded hardening explicitly allowed by compatibility-contract.md §2
+("C version may add bounded limits... keep normal-size behaviour
+identical"): `MT_HTTPD_MAX_HEADER_BYTES` (8 KiB), `MT_HTTPD_MAX_BODY_BYTES`
+(1 MiB), `MT_HTTPD_MAX_CONNS` (64, matching the number originally proposed
+for D-06), and a 30 s per-connection idle timeout — none of which Go's
+zero-value `http.Server` has, and none of which any real request from the
+frontend or the differential contract tests come close to.
+
+One deliberate, documented behavioural broadening vs. chi (Go's router):
+a path pattern like `/api/v1/groups/{groupID}` matches both
+`/api/v1/groups/{groupID}` and a trailing-slash variant, because segment
+splitting ignores leading/trailing/duplicate slashes on both the pattern
+and the incoming path before comparing. Strict chi (no `RedirectSlashes`
+middleware configured in `api/v1/router.go`) would 404 a mismatched
+trailing slash where this server accepts it. This can only ever accept a
+request Go would reject, never the reverse, so no legitimate client can
+be broken by the difference — flagged here per the "no silent
+incompatible fix" rule rather than left undocumented.
+
+Verified with a real client/server integration test
+(`tests/unit/test_httpd.c`): runs the actual epoll loop on a background
+pthread while the test thread drives it with plain blocking sockets over
+both a TCP listener and a Unix socket listener, covering query-string
+parsing, path-param extraction, POST body round-trip, the not-found
+fallback, middleware short-circuiting (401), keep-alive across multiple
+requests on one connection, and Unix-socket routing parity — all under
+ASan/UBSan with zero findings.
