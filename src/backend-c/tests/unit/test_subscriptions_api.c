@@ -16,25 +16,58 @@
 #include "magitrickle/app.h"
 #include "magitrickle/dns_cache.h"
 #include "magitrickle/loop.h"
+#include "magitrickle/sub_fetch.h"
 #include "magitrickle/subscriptions_api.h"
 
 typedef struct harness {
     mt_loop_t *loop;
     mt_httpd_t *tcp;
+    pthread_t thread;
+
+    /* Stub subscription-list host, on its OWN loop/thread: the sync
+     * handler under test blocks the *subs API's* loop thread inside a
+     * synchronous libcurl fetch (see decisions.md D-33), so the stub
+     * server it fetches from must be serviced by a different thread --
+     * otherwise the one thread that would need to run epoll to accept
+     * the fetch's own incoming connection is the same thread stuck
+     * inside curl_easy_perform(), and the request just times out. */
+    mt_loop_t *stub_loop;
+    mt_httpd_t *stub;
+    pthread_t stub_thread;
+
     mt_config_t cfg;
     mt_cache_t *cache;
     mt_app_t *app;
     mt_subs_ctx_t ctx;
-    pthread_t thread;
 } harness_t;
 
 static void *loop_thread(void *ud) {
-    harness_t *h = ud;
-    mt_loop_run(h->loop);
+    mt_loop_t *loop = ud;
+    mt_loop_run(loop);
     return NULL;
 }
 
 #define TEST_PORT 18084
+#define STUB_PORT 18085
+
+static void h_stub_list(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    static const char body[] = "one.example\ntwo.example";
+    mt_http_res_write(res, 200, "text/plain", (const uint8_t *)body, sizeof(body) - 1);
+}
+
+static void h_stub_404(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    mt_http_res_write_error(res, 404, "nope");
+}
+
+static char g_stub_url[128];
+static const char *stub_url(const char *path) {
+    snprintf(g_stub_url, sizeof(g_stub_url), "http://127.0.0.1:%d%s", STUB_PORT, path);
+    return g_stub_url;
+}
 
 static harness_t *harness_start(void) {
     harness_t *h = calloc(1, sizeof(*h));
@@ -50,8 +83,16 @@ static harness_t *harness_start(void) {
     if (mt_httpd_create(h->loop, &h->tcp) != MT_OK) { return NULL; }
     mt_subs_register_routes(h->tcp, &h->ctx);
     if (mt_httpd_listen_tcp(h->tcp, "127.0.0.1", TEST_PORT) != MT_OK) { return NULL; }
+    pthread_create(&h->thread, NULL, loop_thread, h->loop);
 
-    pthread_create(&h->thread, NULL, loop_thread, h);
+    if (mt_loop_create(&h->stub_loop) != MT_OK) { return NULL; }
+    if (mt_httpd_create(h->stub_loop, &h->stub) != MT_OK) { return NULL; }
+    mt_httpd_route(h->stub, "GET", "/list", h_stub_list, NULL);
+    mt_httpd_route(h->stub, "GET", "/list2", h_stub_list, NULL);
+    mt_httpd_route(h->stub, "GET", "/404", h_stub_404, NULL);
+    if (mt_httpd_listen_tcp(h->stub, "127.0.0.1", STUB_PORT) != MT_OK) { return NULL; }
+    pthread_create(&h->stub_thread, NULL, loop_thread, h->stub_loop);
+
     return h;
 }
 
@@ -60,6 +101,12 @@ static void harness_stop(harness_t *h) {
     pthread_join(h->thread, NULL);
     mt_httpd_destroy(h->tcp);
     mt_loop_destroy(h->loop);
+
+    mt_loop_stop(h->stub_loop);
+    pthread_join(h->stub_thread, NULL);
+    mt_httpd_destroy(h->stub);
+    mt_loop_destroy(h->stub_loop);
+
     mt_app_destroy(h->app);
     mt_cache_destroy(h->cache);
     mt_config_clear(&h->cfg);
@@ -297,9 +344,115 @@ TEST put_subscriptions_bulk_replace_reuses_ids_and_seeds_last_update(void) {
     PASS();
 }
 
+/* ---- fetch-backed endpoints (Phase 7) ------------------------------------------ */
+
+TEST sync_unknown_subscription_is_404(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT_EQ(404, do_request("POST", "/api/v1/subscriptions/aabbccdd/sync", NULL, NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/subscriptions/nothex!/sync", NULL, NULL));
+    harness_stop(h);
+    PASS();
+}
+
+TEST sync_without_body_uses_subscription_url(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char body[256];
+    snprintf(body, sizeof(body), "{\"id\":\"aabbccdd\",\"url\":\"%s\"}", stub_url("/list"));
+    ASSERT_EQ(200, do_request("POST", "/api/v1/subscriptions", body, NULL));
+
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/subscriptions/aabbccdd/sync", NULL, &out));
+    cJSON *rules = cJSON_GetObjectItemCaseSensitive(out, "rules");
+    ASSERT_EQ(2, cJSON_GetArraySize(rules));
+    ASSERT_STR_EQ("one.example", jstr(cJSON_GetArrayItem(rules, 0), "rule"));
+    ASSERT_STR_EQ(stub_url("/list"), jstr(out, "url"));
+    cJSON_Delete(out);
+
+    cJSON *listed = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/subscriptions", NULL, &listed));
+    cJSON *sub = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(listed, "subscriptions"), 0);
+    ASSERT_EQ(2, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(sub, "rules")));
+    cJSON_Delete(listed);
+
+    harness_stop(h);
+    PASS();
+}
+
+TEST sync_with_body_url_overrides_and_updates_subscription(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char body[256];
+    snprintf(body, sizeof(body), "{\"id\":\"aabbccdd\",\"url\":\"%s\"}", stub_url("/list"));
+    ASSERT_EQ(200, do_request("POST", "/api/v1/subscriptions", body, NULL));
+
+    char sync_body[256];
+    snprintf(sync_body, sizeof(sync_body), "{\"url\":\"%s\"}", stub_url("/list2"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/subscriptions/aabbccdd/sync", sync_body, &out));
+    ASSERT_STR_EQ(stub_url("/list2"), jstr(out, "url"));
+    cJSON_Delete(out);
+
+    cJSON *listed = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/subscriptions", NULL, &listed));
+    cJSON *sub = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(listed, "subscriptions"), 0);
+    ASSERT_STR_EQ(stub_url("/list2"), jstr(sub, "url"));
+    cJSON_Delete(listed);
+
+    harness_stop(h);
+    PASS();
+}
+
+TEST sync_fetch_failure_is_502(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char body[256];
+    snprintf(body, sizeof(body), "{\"id\":\"aabbccdd\",\"url\":\"%s\"}", stub_url("/404"));
+    ASSERT_EQ(200, do_request("POST", "/api/v1/subscriptions", body, NULL));
+    ASSERT_EQ(502, do_request("POST", "/api/v1/subscriptions/aabbccdd/sync", NULL, NULL));
+    harness_stop(h);
+    PASS();
+}
+
+TEST get_subscription_rules_requires_url(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT_EQ(400, do_request("GET", "/api/v1/subscriptions/rules", NULL, NULL));
+    harness_stop(h);
+    PASS();
+}
+
+TEST get_subscription_rules_returns_parsed_rules(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char path[256];
+    snprintf(path, sizeof(path), "/api/v1/subscriptions/rules?url=%s", stub_url("/list"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", path, NULL, &out));
+    cJSON *rules = cJSON_GetObjectItemCaseSensitive(out, "rules");
+    ASSERT_EQ(2, cJSON_GetArraySize(rules));
+    ASSERT_STR_EQ("one.example", jstr(cJSON_GetArrayItem(rules, 0), "rule"));
+    ASSERT_STR_EQ("two.example", jstr(cJSON_GetArrayItem(rules, 1), "rule"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST get_subscription_rules_fetch_failure_is_502(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char path[256];
+    snprintf(path, sizeof(path), "/api/v1/subscriptions/rules?url=%s", stub_url("/404"));
+    ASSERT_EQ(502, do_request("GET", path, NULL, NULL));
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
+    mt_sub_fetch_global_init();
     GREATEST_MAIN_BEGIN();
     RUN_TEST(get_subscriptions_starts_empty);
     RUN_TEST(create_subscription_requires_url);
@@ -308,5 +461,12 @@ int main(int argc, char **argv) {
     RUN_TEST(delete_subscription_removes_it_and_404s_unknown);
     RUN_TEST(put_subscriptions_missing_key_and_missing_url);
     RUN_TEST(put_subscriptions_bulk_replace_reuses_ids_and_seeds_last_update);
+    RUN_TEST(sync_unknown_subscription_is_404);
+    RUN_TEST(sync_without_body_uses_subscription_url);
+    RUN_TEST(sync_with_body_url_overrides_and_updates_subscription);
+    RUN_TEST(sync_fetch_failure_is_502);
+    RUN_TEST(get_subscription_rules_requires_url);
+    RUN_TEST(get_subscription_rules_returns_parsed_rules);
+    RUN_TEST(get_subscription_rules_fetch_failure_is_502);
     GREATEST_MAIN_END();
 }

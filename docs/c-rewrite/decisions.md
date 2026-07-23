@@ -1191,3 +1191,89 @@ rollback code itself is structurally identical to
 pattern from D-32. Full suite (28 unit-test binaries), `static_analysis`
 (clang-tidy+cppcheck, 0 warnings), and `sanitize` (ASan+UBSan, 0
 findings) all clean.
+
+## D-34: Subscription sync/rules-preview HTTP endpoints (`POST /subscriptions/{id}/sync`, `GET /subscriptions/rules`)
+
+**Wires `mt_app_sync_subscription_by_id` (D-33) and `mt_sub_fetch_list`/
+`mt_sub_parse_rules` directly onto the two routes Phase 6/D-28 explicitly
+deferred**: `POST /api/v1/subscriptions/{subscriptionID}/sync`
+(`SyncSubscription`) and `GET /api/v1/subscriptions/rules?url=`
+(`GetSubscriptionRules`, a preview-only endpoint — parses but never
+persists). Error mapping mirrors Go's `switch { errors.Is(...) }` in
+`SyncSubscription` exactly: `MT_ERR_NOENT`→404, `MT_ERR_INVAL`→400,
+`MT_ERR_UPSTREAM`→502 (the new code from D-33, purpose-built for this
+mapping), anything else→500. The sync response is built by re-reading
+the subscription via `mt_app_find_subscription_by_id` immediately after
+a successful sync rather than threading a result struct through the
+API (see D-33's rationale — safe because nothing else runs between the
+two calls on this single-threaded event loop). `sub_rule_to_json`/
+`sub_rules_to_json_array` (already used by the non-fetch subscription
+handlers) are reused as-is for both new endpoints' `rules` arrays, since
+`SubscriptionRuleRes`'s JSON shape (`id`/`rule`/`type`/`enable`) is
+identical for a real subscription rule and a freshly-fetched, not-yet-
+saved preview rule.
+
+**The sync endpoint's save condition differs from every other
+subscriptions handler's `maybe_save()`**: Go's `SyncSubscription` only
+calls `SaveConfig()` when `changed && save != "false"`, whereas
+create/delete/put always save on success regardless of any "did
+anything actually change" concept (they have none). Reusing the
+existing `maybe_save()` helper unconditionally would have broken this
+exact gate, so `handle_sync_subscription` inlines the `save`-query-
+param check itself, guarded by `changed` from
+`mt_app_sync_subscription_by_id`'s out-param.
+
+**Found empirically, not just theoretically: writing
+`tests/unit/test_subscriptions_api.c`'s new sync tests hit the exact
+blocking-fetch hazard flagged in D-33.** The first attempt put the stub
+subscription-list server on the *same* `mt_loop`/thread as the
+subscriptions-API server under test (following `test_sub_fetch.c`'s
+single-loop pattern). Every sync-endpoint test then hung until the
+client socket's own 2-second read timeout: the sync handler blocks that
+shared loop thread inside `curl_easy_perform()`, so the same thread that
+would need to run `epoll_wait` to accept/service the stub server's
+incoming connection from libcurl is busy — the fetch can only ever
+un-block via its own `MT_SUB_FETCH_TIMEOUT_SECONDS` timeout, not by
+completing. Fixed by giving the stub server its own separate
+`mt_loop`/thread (matching `test_sub_fetch.c`'s and `test_sub_sync.c`'s
+*actual* client/server thread separation, where the fetch is always
+issued from a thread other than the one serving the stub). This is the
+same hazard D-33 already named for the real daemon (HTTP handlers and
+the future auto-update timer both running on the *one* production event
+loop) — this test failure is direct, reproducible evidence of it, not
+speculation.
+
+**Differential suite extended** (`tests/differential/http_contract/contract.py`):
+a small stdlib `http.server.HTTPServer` stub (`start_stub_sub_server`,
+port 18099) now runs for the duration of one `contract.py` invocation,
+serving a fixed subscription list reachable identically by the real Go
+daemon and `magitrickled-c`. New steps: `GET /subscriptions/rules`
+(missing url → 400; a real fetch+parse; a connection-refused → 502) and
+`POST /subscriptions/{id}/sync` (unknown id → 404; a real sync via
+`url` override; a re-sync of unchanged content). Two new redaction
+concerns this introduced, both handled the same way the suite already
+redacts learned dynamic IDs and error text (module docstring): (1) the
+freshly-fetched rules' random per-backend IDs are learned and redacted
+via the existing `learn=` callback mechanism (`<SUBRULE-N>`/
+`<PREVIEWRULE-N>` placeholders); (2) `lastUpdate` now genuinely reaches
+the live wall-clock time on a real sync (previously always 0, since no
+prior step ever triggered an actual sync) — the Go run and the C run
+happen minutes apart (separate process spawns), so a literal timestamp
+comparison would spuriously fail on real time skew having nothing to do
+with behavior. Added a recursive `_redact_live_timestamps` pass
+(applied in `Trace._canonical` alongside the existing error-body
+redaction) that replaces any non-zero `lastUpdate` value with a stable
+placeholder, while leaving a literal `0` alone — so the suite still
+verifies the "unsynced vs. synced" transition point, just not the exact
+epoch value. Ran `run_http_diff.sh` end-to-end in this sandbox (root +
+real iptables available): 44 steps, byte-identical trace, `HTTP
+contract: OK`. Also updated the stale Phase-6-era comment explaining why
+subscriptions stay `enable:false` in this suite — no longer "the C
+port has no subscription-ruleset runtime" (Phase 7/D-32 built that);
+now it's "avoid an `eth0`-dependent real-netfilter side effect
+unrelated to what this suite checks."
+
+Verified: full suite (28 unit-test binaries, including 7 new HTTP-level
+tests in `test_subscriptions_api.c` against a real two-loop harness),
+`static_analysis` (0 warnings), `sanitize` (0 findings), and the
+extended `run_http_diff.sh` (44/44 steps identical, Go vs C) all clean.

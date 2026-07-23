@@ -1,14 +1,11 @@
-/* GET/PUT/POST /api/v1/subscriptions and DELETE
- * /api/v1/subscriptions/{subscriptionID} — port of the pure config-
- * mutation slice of api/v1/subscription_handlers.go and
- * subscription_converters.go (compatibility-contract.md §2's
- * subscriptions row).
- *
- * Deliberately NOT implemented here (need libcurl, Phase 7 scope, see
- * decisions.md): POST /api/v1/subscriptions/{id}/sync (fetch+parse the
- * remote list) and GET /api/v1/subscriptions/rules?url= (fetch+parse
- * without persisting). Neither route is registered, so a request to
- * either 404s via the normal not-found path rather than being faked.
+/* GET/PUT/POST /api/v1/subscriptions, DELETE
+ * /api/v1/subscriptions/{subscriptionID}, POST
+ * /api/v1/subscriptions/{subscriptionID}/sync, and GET
+ * /api/v1/subscriptions/rules — port of api/v1/subscription_handlers.go
+ * and subscription_converters.go (compatibility-contract.md §2's
+ * subscriptions row). The sync/rules routes (Phase 7) are fetch-backed:
+ * see mt_app_sync_subscription_by_id (app.h) and mt_sub_fetch_list/
+ * mt_sub_parse_rules (sub_fetch.h/subparse.h).
  */
 #ifndef MAGITRICKLE_SUBSCRIPTIONS_API_H
 #define MAGITRICKLE_SUBSCRIPTIONS_API_H

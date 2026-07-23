@@ -4,11 +4,14 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <cjson/cJSON.h>
 
 #include "magitrickle/id.h"
 #include "magitrickle/log.h"
+#include "magitrickle/sub_fetch.h"
+#include "magitrickle/subparse.h"
 
 /* ---- small JSON request-parsing helpers (see groups.c for the same
  * pattern; duplicated rather than shared, matching how converters.go's
@@ -390,9 +393,115 @@ static void handle_delete_subscription(mt_http_req_t *req, mt_http_res_t *res, v
     maybe_save(ctx, req);
 }
 
+/* POST /api/v1/subscriptions/{subscriptionID}/sync -- fetch+refresh a
+ * single subscription's rules (SyncSubscription). Body is an optional
+ * {"url": "..."} override; matches Go's json.Decoder-ignoring-EOF
+ * behavior for a missing/empty body (no override, sub->url used as-is).
+ * Saves only when the sync actually changed something AND ?save!=false
+ * -- unlike maybe_save()'s unconditional-on-success save used by the
+ * other handlers, matching SyncSubscription's `if changed && save !=
+ * "false"` gate exactly. */
+static void handle_sync_subscription(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
+    mt_subs_ctx_t *ctx = ud;
+    const char *id_str = mt_http_req_param(req, "subscriptionID");
+    mt_id_t id;
+    if (!id_str || mt_id_parse(id_str, &id) != MT_OK) {
+        mt_http_res_write_error(res, 400, "invalid subscription id");
+        return;
+    }
+
+    const char *url_override = NULL;
+    cJSON *json = NULL;
+    size_t body_len;
+    const uint8_t *body = mt_http_req_body(req, &body_len);
+    if (body_len > 0) {
+        json = cJSON_ParseWithLength((const char *)body, body_len);
+        if (!json) {
+            mt_http_res_write_error(res, 400, "failed to parse request");
+            return;
+        }
+        const char *url = get_string(json, "url");
+        if (url[0] != '\0') { url_override = url; }
+    }
+
+    bool changed = false;
+    mt_err_t err = mt_app_sync_subscription_by_id(ctx->app, id, (int64_t)time(NULL), url_override, &changed);
+    cJSON_Delete(json);
+    if (err != MT_OK) {
+        int status = 500;
+        const char *msg = mt_err_str(err);
+        if (err == MT_ERR_NOENT) {
+            status = 404;
+            msg = "subscription not found";
+        } else if (err == MT_ERR_INVAL) {
+            status = 400;
+            msg = "subscription invalid";
+        } else if (err == MT_ERR_UPSTREAM) {
+            status = 502;
+            msg = "subscription fetch failed";
+        }
+        mt_http_res_write_error(res, status, msg);
+        return;
+    }
+
+    const mt_subscription_t *sub = mt_app_find_subscription_by_id(ctx->app, id);
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddItemToObject(out, "rules", sub_rules_to_json_array(sub->rules, sub->n_rules));
+    cJSON_AddNumberToObject(out, "lastUpdate", sub->last_update);
+    cJSON_AddStringToObject(out, "url", sub->url ? sub->url : "");
+    mt_http_res_write_json(res, 200, out);
+
+    const char *save = mt_http_req_query(req, "save");
+    bool want_save = !(save && strcmp(save, "false") == 0);
+    if (changed && want_save && ctx->config_path) {
+        mt_err_t serr =
+            mt_app_save_config(ctx->app, ctx->config_path, ctx->config_version ? ctx->config_version : "");
+        if (serr != MT_OK) { MT_ERROR("failed to save config file: %s", mt_err_str(serr)); }
+    }
+}
+
+/* GET /api/v1/subscriptions/rules?url= -- fetch+parse a list without
+ * persisting anything (GetSubscriptionRules): a preview endpoint for the
+ * frontend's "add subscription" flow. */
+static void handle_get_subscription_rules(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
+    (void)ud;
+    const char *url = mt_http_req_query(req, "url");
+    if (!url || url[0] == '\0') {
+        mt_http_res_write_error(res, 400, "subscription url is required");
+        return;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    mt_err_t ferr = mt_sub_fetch_list(url, &body, &body_len);
+    if (ferr != MT_OK) {
+        MT_ERROR("failed to fetch subscription list: %s", mt_err_str(ferr));
+        mt_http_res_write_error(res, 502, "subscription fetch failed");
+        return;
+    }
+
+    mt_sub_rule_t **rules = NULL;
+    size_t n_rules = 0;
+    mt_err_t perr = mt_sub_parse_rules(body, &rules, &n_rules);
+    free(body);
+    if (perr != MT_OK) {
+        mt_http_res_write_error(res, 500, mt_err_str(perr));
+        return;
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddItemToObject(out, "rules", sub_rules_to_json_array(rules, n_rules));
+    mt_http_res_write_json(res, 200, out);
+
+    for (size_t i = 0; i < n_rules; i++) { mt_sub_rule_free(rules[i]); }
+    free(rules);
+}
+
 void mt_subs_register_routes(mt_httpd_t *h, mt_subs_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/subscriptions", handle_get_subscriptions, ctx);
     must_route(h, "PUT", "/api/v1/subscriptions", handle_put_subscriptions, ctx);
     must_route(h, "POST", "/api/v1/subscriptions", handle_create_subscription, ctx);
+    must_route(h, "GET", "/api/v1/subscriptions/rules", handle_get_subscription_rules, ctx);
     must_route(h, "DELETE", "/api/v1/subscriptions/{subscriptionID}", handle_delete_subscription, ctx);
+    must_route(h, "POST", "/api/v1/subscriptions/{subscriptionID}/sync", handle_sync_subscription, ctx);
 }

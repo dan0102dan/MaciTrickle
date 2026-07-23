@@ -36,9 +36,59 @@ serialization -- and by extension exact wording -- is not a goal;
 status codes and shape are what the contract actually promises.
 """
 import http.client
+import http.server
 import json
 import socket
 import sys
+import threading
+
+STUB_SUB_PORT = 18099
+STUB_SUB_URL = "http://127.0.0.1:%d/list.txt" % STUB_SUB_PORT
+
+
+class _StubSubListHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a fixed subscription list -- reachable identically from
+    both the Go daemon and magitrickled-c, so the Phase 7 sync/rules
+    steps below (which actually fetch over the network) produce
+    byte-identical traces on both sides."""
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/list.txt":
+            body = b"one.example\ntwo.example"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def start_stub_sub_server():
+    server = http.server.HTTPServer(("127.0.0.1", STUB_SUB_PORT), _StubSubListHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def _redact_live_timestamps(obj):
+    """Recursively replaces any non-zero "lastUpdate" value with a stable
+    placeholder (see Trace._canonical)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == "lastUpdate" and isinstance(v, (int, float)) and v != 0:
+                out[k] = "<TS>"
+            else:
+                out[k] = _redact_live_timestamps(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_live_timestamps(x) for x in obj]
+    return obj
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -88,6 +138,13 @@ class Trace:
             return "<empty>"
         if isinstance(obj, dict) and set(obj.keys()) == {"error"}:
             obj = {"error": "<ERR>"}
+        # A fetch-backed sync (Phase 7) stamps "lastUpdate" with the live
+        # wall-clock time, which genuinely differs between the Go run and
+        # the (separately started, minutes-later) C run -- not a real
+        # behavioral divergence, so it's redacted like error text above.
+        # 0 (never synced) is left alone: that's still meaningful signal
+        # (confirms neither backend synced when it shouldn't have).
+        obj = _redact_live_timestamps(obj)
         return self._redact(json.dumps(obj, sort_keys=True, separators=(",", ":")))
 
     def step(self, method, path, body=None, learn=None):
@@ -199,13 +256,14 @@ def run_tcp_sequence(base_host, base_port, out):
     t.step("POST", "/api/v1/system/config/save")
 
     t.step("GET", "/api/v1/subscriptions")
-    # enable:false -- avoids the (separately documented, decisions.md
-    # D-28) real-netfilter divergence: Go's subscription rule sets ARE
-    # netfilter-backed and would attempt a real ipset-to-link against
-    # "eth0" (failing in this sandbox), while the C port has no
-    # subscription-ruleset runtime yet at all. With enable:false neither
-    # side attempts real netfilter work, so this suite stays focused on
-    # the config-mutation contract it's actually meant to verify.
+    # enable:false -- avoids a real-netfilter divergence unrelated to what
+    # this suite verifies: both backends now build a real netfilter-
+    # backed subscription ruleset when enable=true (Phase 7, decisions.md
+    # D-32), which would attempt a real ipset-to-link against "eth0" (not
+    # guaranteed to exist identically in every CI sandbox). With
+    # enable:false neither side attempts real netfilter work, so this
+    # suite stays focused on the config-mutation and fetch-backed-sync
+    # contract it's actually meant to verify.
     sub_body = json.dumps(
         {"id": "40404040", "name": "s1", "interface": "eth0", "url": "https://example.com/list.txt", "enable": False}
     )
@@ -224,6 +282,29 @@ def run_tcp_sequence(base_host, base_port, out):
     t.step("PUT", "/api/v1/subscriptions", put_sub_body)
     t.step("GET", "/api/v1/subscriptions")
     t.step("PUT", "/api/v1/subscriptions", "{}")  # missing key -> 400
+
+    # Phase 7: fetch-backed sync/rules-preview endpoints, against a real
+    # local stub subscription-list server reachable identically by both
+    # backends (see start_stub_sub_server above).
+    def learn_preview_rule_ids(resp):
+        if not resp:
+            return []
+        return [(r["id"], "<PREVIEWRULE-%d>" % i) for i, r in enumerate(resp.get("rules") or [])]
+
+    t.step("GET", "/api/v1/subscriptions/rules")  # missing url -> 400
+    t.step("GET", "/api/v1/subscriptions/rules?url=" + STUB_SUB_URL, learn=learn_preview_rule_ids)
+    t.step("GET", "/api/v1/subscriptions/rules?url=http://127.0.0.1:1/nope")  # connection refused -> 502
+
+    def learn_sync_rule_ids(resp):
+        if not resp:
+            return []
+        return [(r["id"], "<SUBRULE-%d>" % i) for i, r in enumerate(resp.get("rules") or [])]
+
+    t.step("POST", "/api/v1/subscriptions/deadbeef/sync")  # unknown id -> 404
+    t.step("POST", "/api/v1/subscriptions/40404040/sync", json.dumps({"url": STUB_SUB_URL}),
+          learn=learn_sync_rule_ids)
+    t.step("GET", "/api/v1/subscriptions")
+    t.step("POST", "/api/v1/subscriptions/40404040/sync")  # re-sync, same content -> unchanged
 
     t.step("DELETE", "/api/v1/subscriptions/40404040")
     t.step("DELETE", "/api/v1/subscriptions/40404040")  # already gone -> 404
@@ -246,9 +327,14 @@ def main():
         sys.stderr.write("usage: contract.py <host> <port> [unix_socket_path]\n")
         return 2
     host, port = sys.argv[1], int(sys.argv[2])
-    run_tcp_sequence(host, port, sys.stdout)
-    if len(sys.argv) > 3:
-        run_unix_spotcheck(sys.argv[3], sys.stdout)
+    stub = start_stub_sub_server()
+    try:
+        run_tcp_sequence(host, port, sys.stdout)
+        if len(sys.argv) > 3:
+            run_unix_spotcheck(sys.argv[3], sys.stdout)
+    finally:
+        stub.shutdown()
+        stub.server_close()
     return 0
 
 
