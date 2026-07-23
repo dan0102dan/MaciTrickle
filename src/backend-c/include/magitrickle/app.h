@@ -261,10 +261,16 @@ typedef struct mt_iface_info {
 
 /* Enumerates system network interfaces (getifaddrs, deduped by name),
  * matching Go's interfaces.List: when cfg->app.show_all_interfaces is
- * false, keeps only interfaces with IFF_POINTOPOINT set (and not in the
- * platform's ignored-interfaces list -- empty on the default/non-
- * entware_kn platform, so a no-op here today). Caller frees *out. */
+ * false, keeps only interfaces with IFF_POINTOPOINT set and not in the
+ * platform's ignored-interfaces list (empty unless built with
+ * -DMT_ENTWARE_KN, which enables the Keenetic virtual-interface list --
+ * see app.c). Caller frees *out. */
 mt_err_t mt_app_list_interfaces(const mt_app_t *app, mt_iface_info_t **out, size_t *out_n);
+
+/* Exposed for unit tests only (see test_system.c): true iff `name` is on
+ * the platform's ignored-interfaces list (see app.c) -- always false
+ * unless built with -DMT_ENTWARE_KN. */
+bool mt_iface_is_ignored_for_test(const char *name);
 
 /* Writes the current config (cfg, already kept live-authoritative for
  * groups per the header comment above) to its file path. */

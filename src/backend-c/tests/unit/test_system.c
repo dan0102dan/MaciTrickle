@@ -206,6 +206,28 @@ TEST netfilterd_hook_ok_and_bad_json(void) {
     PASS();
 }
 
+/* Mirrors Go's constant.IgnoredInterfaces (empty by default, a fixed
+ * Keenetic virtual-interface list under the entware_kn build tag --
+ * src/backend/constant/iface-ignore_entware_kn.go). Go's own dedicated
+ * entware_kn test (keenetic_router_specific_test.go) only covers the RCI
+ * alias lookup, not this list, so there is no Go test to differentially
+ * match here either -- this asserts the C side's behavior is correct for
+ * whichever mode it was built in. */
+TEST ignored_interfaces_list(void) {
+#ifdef MT_ENTWARE_KN
+    ASSERT(mt_iface_is_ignored_for_test("ra0"));
+    ASSERT(mt_iface_is_ignored_for_test("ra15"));
+    ASSERT(mt_iface_is_ignored_for_test("ezcfg0"));
+    ASSERT(!mt_iface_is_ignored_for_test("br0"));
+    ASSERT(!mt_iface_is_ignored_for_test("ra16"));
+#else
+    ASSERT(!mt_iface_is_ignored_for_test("ra0"));
+    ASSERT(!mt_iface_is_ignored_for_test("ezcfg0"));
+    ASSERT(!mt_iface_is_ignored_for_test("br0"));
+#endif
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -214,5 +236,6 @@ int main(int argc, char **argv) {
     RUN_TEST(save_config_writes_file);
     RUN_TEST(save_config_noop_without_path);
     RUN_TEST(netfilterd_hook_ok_and_bad_json);
+    RUN_TEST(ignored_interfaces_list);
     GREATEST_MAIN_END();
 }

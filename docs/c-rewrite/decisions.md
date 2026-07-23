@@ -1787,3 +1787,72 @@ All three: real ARM64/ARM32/RISC-V64 machine code (confirmed via `file`), dynami
 **What could not be tested here: netfilter-state (iptables chains + ipset) cleanup/rebuild continuity across the backend swap.** This sandbox's `ipset` is non-functional at the kernel level — `ipset create test hash:ip` fails with `Kernel error received: Invalid argument` even as root, and there's no `modprobe` available to attempt loading `ip_set` (the binary doesn't exist in this container). This blocks *either* backend from successfully enabling a group at all (both backends' enable-path calls ipset init before touching iptables, so nothing gets left behind to test cleanup against) — not a Go-vs-C difference, a sandbox environment gap in the same category Phase 5's own report already hedged ("netns integration tests ... in CI where kernel allows"). What *is* covered, at the code level, for this exact scenario: Phase 5's iptables engine has full transcript-parity differential tests against the real Go fake-executable corpus (chain patch/override/delete semantics identical byte-for-byte), the `netfilter/cleaner.c` startup-cleanup module was purpose-built for "stale state from a prior run" (exactly the shape of an upgrade/downgrade transition, just not specifically tested as "prior run was the *other* implementation"), and both backends use identical `MT_`/`mt_` chain/ipset naming conventions by construction (confirmed in this task's own test config and every prior phase's fixtures) — so the cleaner's logic has no way to distinguish "stale state from my own prior run" from "stale state from the other backend's prior run." That said, this specific live cross-backend netfilter transition was not exercised end-to-end here, and remains a gap for real on-device or emulated-image verification (same gap D-40 already named for install/upgrade verification generally).
 
 **Verification performed**: real daemon processes (not mocks), real HTTP requests (`curl`), real file `md5sum`/`diff` comparisons of `config.yaml`/`auth_secret` at every transition, real process signals (`SIGTERM`) for clean shutdown. All test state (`config.yaml`, `auth_secret`, both scratch binaries) was removed from `/var/lib/magitrickle` and `/tmp` after the test — nothing left behind in the sandbox's real state directory.
+
+## D-43: Phase 9 profiling (task #53) — no hotspot needed fixing, and why
+
+**Profiled a real, non-trivial DNS+cache+matching workload** (host
+`magitrickled-c`, 1000 namespace rules, `valgrind --tool=callgrind`,
+63,164 real UDP queries against a real `dnsstub` upstream — chosen over
+`perf` because this sandbox's kernel (6.18.5) has no matching
+`linux-tools` package, so hardware perf counters aren't available;
+`callgrind`'s instruction-count profiling doesn't need them).
+
+**Instruction-count breakdown**: malloc/free family combined
+(`_int_malloc`/`_int_free`/`calloc`/`free`/`malloc`/`malloc_consolidate`/
+`unlink_chunk`/`realloc`/...) accounts for **~44% of instructions** —
+the single largest category, expected for a workload that builds
+per-query name strings and RR structures on the heap rather than
+reusing fixed buffers. DNS-specific hot functions (`rd_name`
+7.06%, `mt_dns_name_to_string` 4.47%, `wr_bytes` 3.85%,
+`mt_dns_msg_parse` 2.67%, `parse_rr_section` 2.40%, `dom_find`/
+`rev_find` — cache lookups — 1.68%/1.63% combined) are all real,
+expected DNS-pipeline work, not a surprise. `yaml_parser_*`/
+`mt_config_load_buffer` (~2.3% combined) is one-time startup config
+load, diluted into the whole-run total, not a per-query recurring cost.
+**No pathological scaling, no lock contention (single event-loop
+thread, D-17), no busy-loop, no O(n) scan standing out** — matches the
+benchmark's own evidence (task #54): throughput is flat across
+100/1000/10000 rules (namespace reverse-trie, D-18), confirming the
+matcher is not the bottleneck at any rule count tested.
+
+**Decision: no code change.** The malloc-heavy profile is architecturally
+expected, not a defect, and the real wall-clock numbers already measured
+(task #54) settle whether it matters in practice: at the same 1000-rule
+cell, the C daemon sustains **~2x Go's UDP throughput at less than half
+Go's CPU usage** (e.g. concurrency=10: C ~42k rps at ~66% CPU vs Go's
+~20k rps at ~148% CPU) and uses roughly half Go's RSS. Whatever the
+per-query allocator overhead costs in absolute instruction count, it does
+not prevent the C rewrite from substantially outperforming the reference
+implementation it must match — "fixing" it (e.g. a per-request arena
+allocator) would add real complexity (allocator lifetime, use-after-free
+risk surface) for a gain that the numbers don't show is needed, which is
+exactly the kind of premature optimization the project's own ground
+rules (§4/§23: no complexity without a shown need) argue against. Noted
+here as a legitimate future optimization candidate *if* a real
+performance requirement ever demands it — not acted on speculatively.
+
+## D-44: Phase 9 long soak + final sanitizer/fuzz reruns (task #55)
+
+**Soak** (`docs/c-rewrite/soak-c-phase9/summary.txt`): 180 s bounded soak
+(host-limited substitute for a real 24 h run, same disclosure pattern as
+D-36's 90 s fault-injection soak) — 500 namespace rules, group disabled
+(this sandbox's `ipset` is non-functional, D-42/D-43; not a Go-vs-C
+difference), sustained real load: **3,023,131 UDP + 389,421 TCP queries,
+zero errors, zero timeouts**. RSS sampled every 15 s for the full
+duration: **flat at exactly 31,928 KB across all 13 samples and the
+final read** — not just "no leak," genuinely zero measured growth despite
+3.4M+ queries touching the bounded records cache (100,000-domain rotating
+pattern, well above the cache's 65,536-domain default cap, so both the
+cap-rejection path and the 30 s expiry sweep were exercised, not just the
+common case). `VmHWM` (peak RSS) equals steady-state RSS — no transient
+spike either.
+
+**Final full-suite reruns** (after the soak, on a freshly cleaned build —
+sequenced this way specifically to avoid repeating the concurrent-rebuild
+mistake that corrupted this same phase's first benchmark attempt, see
+task #54's history): `make test` (28/28 unit binaries pass), `make
+sanitize` (0 ASan/UBSan findings), `make fuzz FUZZ_RUNS=200000` (2
+targets, 400,000 total runs, 0 crashes), `tests/differential/run_diff.sh`
+(all suites OK, including the 44-step HTTP contract) — all clean, no
+regressions from anything landed earlier in Phase 9 (the interfaces fix,
+D-43).

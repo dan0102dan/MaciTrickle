@@ -704,6 +704,36 @@ mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *ou
 
 /* ---- interfaces -------------------------------------------------------------- */
 
+/* Mirrors Go's constant.IgnoredInterfaces: empty on the default/OpenWrt
+ * platform, a fixed Keenetic virtual-interface list under entware_kn (see
+ * src/backend/constant/iface-ignore_entware_kn.go) -- only applied when
+ * !show_all_interfaces, exactly like Go's filterManaged. This was
+ * scaffolded but never wired in Phase 6 (app.h's mt_app_list_interfaces
+ * comment deferred it to "Phase 8", which never circled back); found and
+ * fixed during Phase 9's parity checklist review. */
+#ifdef MT_ENTWARE_KN
+static const char *const MT_IGNORED_INTERFACES[] = {
+    "ezcfg0",
+    "ra0", "ra1", "ra2", "ra3", "ra4", "ra5", "ra6", "ra7",
+    "ra8", "ra9", "ra10", "ra11", "ra12", "ra13", "ra14", "ra15",
+};
+#define MT_IGNORED_INTERFACES_N (sizeof(MT_IGNORED_INTERFACES) / sizeof(MT_IGNORED_INTERFACES[0]))
+
+static bool iface_is_ignored(const char *name) {
+    for (size_t i = 0; i < MT_IGNORED_INTERFACES_N; i++) {
+        if (strcmp(MT_IGNORED_INTERFACES[i], name) == 0) { return true; }
+    }
+    return false;
+}
+#else
+static bool iface_is_ignored(const char *name) {
+    (void)name;
+    return false;
+}
+#endif
+
+bool mt_iface_is_ignored_for_test(const char *name) { return iface_is_ignored(name); }
+
 mt_err_t mt_app_list_interfaces(const mt_app_t *app, mt_iface_info_t **out, size_t *out_n) {
     *out = NULL;
     *out_n = 0;
@@ -726,7 +756,7 @@ mt_err_t mt_app_list_interfaces(const mt_app_t *app, mt_iface_info_t **out, size
         }
         if (already) { continue; }
 
-        if (!show_all && (p->ifa_flags & IFF_POINTOPOINT) == 0) { continue; }
+        if (!show_all && ((p->ifa_flags & IFF_POINTOPOINT) == 0 || iface_is_ignored(p->ifa_name))) { continue; }
 
         if (n == cap) {
             size_t new_cap = cap ? cap * 2 : 8;

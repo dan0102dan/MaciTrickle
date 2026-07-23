@@ -3,12 +3,12 @@
 # same dnsload, same cells) so the numbers line up against the Go baseline in
 # docs/c-rewrite/baseline-raw/. Results -> docs/c-rewrite/baseline-raw-c/.
 #
-# IMPORTANT caveat recorded in the report: the Phase 3 C daemon does the
-# transport + DNS parse + hooks, but NOT yet rule matching / cache / ipset
-# (Phase 4/5). The Go baseline's group is disabled so it also skips ipset
-# writes, but it DOES run rule matching per query. So the throughput gap
-# partly reflects work the C side has not implemented yet — this is a
-# transport-layer comparison, not a full-pipeline one.
+# As of Phase 9 this is a full-pipeline comparison: transport + DNS parse +
+# hooks + rule matching + cache (Phase 4) all run on every query, same as
+# the Go baseline (whose group is also disabled here, so both sides skip
+# ipset writes but both run real rule matching). The Phase 3-era "transport
+# only" caveat that used to live here no longer applies — see
+# docs/c-rewrite/phase-9-report.md for the current numbers.
 set -u
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$REPO/.build/bench"
@@ -34,7 +34,7 @@ RESULTS="$RESULTS_DIR/results.jsonl"
   echo "libc: $(ldd --version 2>/dev/null | head -1)"
   echo "git_commit: $(cd "$REPO" && git rev-parse HEAD)"
   echo "binary_size_bytes: $(stat -c %s "$DAEMON")"
-  echo "note: transport-only (no rule matching/cache/ipset yet — Phase 4/5)"
+  echo "note: full pipeline (transport+parse+hooks+rule matching+cache; group disabled so ipset writes are skipped, same as the Go baseline)"
 } > "$RESULTS_DIR/environment.txt"
 
 rss_kb()   { awk '/VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null; }

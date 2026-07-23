@@ -22,6 +22,13 @@ BUILD    ?= $(if $(CROSS_COMPILE),cross-$(patsubst %-,%,$(CROSS_COMPILE)),host)
 BUILDDIR := build/$(BUILD)
 MT_VERSION ?= unattached
 
+# Set to any non-empty value to enable Keenetic (Entware `_kn`) platform
+# behavior -- currently just the ignored-interfaces list in api/app.c
+# (mirrors Go's constant.IgnoredInterfaces under its entware_kn build
+# tag). Root Makefile derives this from PLATFORM/TARGET the same way it
+# derives GO_TAGS' entware_kn tag.
+ENTWARE_KN ?=
+
 WARNINGS := -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 \
             -Wundef -Wstrict-prototypes -Wmissing-prototypes
 # NOTE: -Werror is enabled in CI only (see .github/workflows), not forced
@@ -33,7 +40,8 @@ CFLAGS   ?=
 # src/platform/ (which defines _GNU_SOURCE itself).
 CFLAGS   += $(CSTD) $(OPT) $(WARNINGS) -Iinclude -MMD -MP \
             -D_POSIX_C_SOURCE=200809L \
-            -DMT_VERSION=\"$(MT_VERSION)\" -fno-common
+            -DMT_VERSION=\"$(MT_VERSION)\" -fno-common \
+            $(if $(ENTWARE_KN),-DMT_ENTWARE_KN)
 # CI passes CFLAGS_EXTRA=-Werror; local builds stay warning-tolerant.
 CFLAGS_EXTRA ?=
 CFLAGS   += $(CFLAGS_EXTRA)

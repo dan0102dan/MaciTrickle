@@ -225,7 +225,8 @@ endif
 else
 	$(MAKE) -C ./src/backend-c BUILD="$(UNIQUE_NAME)" MT_VERSION="$(PKG_VERSION)" \
 	    $(if $(C_CROSS_COMPILE),CROSS_COMPILE="$(C_CROSS_COMPILE)") \
-	    $(if $(C_SYSROOT),SYSROOT="$(C_SYSROOT)")
+	    $(if $(C_SYSROOT),SYSROOT="$(C_SYSROOT)") \
+	    $(if $(filter entware,$(PLATFORM)), $(if $(filter %_kn,$(TARGET)), ENTWARE_KN=1))
 	cp "./src/backend-c/build/$(UNIQUE_NAME)/magitrickled-c" "$(COMPILE_DIR)/magitrickled"
 endif
 
