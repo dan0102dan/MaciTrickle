@@ -845,3 +845,59 @@ leftover iptables `MT_`-prefixed chains or stray socket/PID files
 between or after runs, confirmed via `iptables -L`/`-t nat -L`) and as
 part of a complete `run_diff.sh` invocation covering every earlier
 phase's differential suite alongside this one, all green.
+
+## D-30: Frontend Playwright e2e suite against magitrickled-c
+
+Adds `tests/differential/run_e2e_diff.sh` (Phase 6, task #38): builds
+the production frontend (`npm run build`), serves it as the `default`
+skin from a real `magitrickled-c`, and runs the *actual*
+`tests/e2e/*.spec.ts` suite (45 tests, unmodified) against it via a new
+`playwright.c-backend.config.ts`. All 45 pass, run twice in a row from a
+clean state with no leftover `/usr/share/magitrickle`, socket/PID
+files, or iptables `MT_` chains afterward.
+
+**Why this mostly exercises `staticfiles.c`, not the HTTP API.** Nearly
+every spec in `tests/e2e/` intercepts its own API calls via Playwright's
+`page.route()` (see e.g. `groups.spec.ts`'s `beforeEach`), which takes
+priority over whatever a real server would return — so which backend is
+actually running underneath barely matters for those assertions. What
+*does* matter, and what this suite genuinely exercises for the first
+time against a real, unmodified, production Svelte build (rather than
+the hand-written HTML/CSS/JS fixtures in `tests/unit/test_staticfiles.c`,
+D-27), is: does `magitrickled-c` serve `index.html` at `/`, the JS
+bundle and CSS with correct content-types, and font/image assets
+correctly enough for the app to actually boot and become interactive in
+a real browser. The HTTP *API* contract itself is D-29's job
+(`run_http_diff.sh`), not this suite's.
+
+**Two environment-specific fixes were needed, neither of which touched
+`tests/e2e/*.spec.ts` itself:**
+- **Chromium executable path.** This environment pre-installs a fixed
+  Chromium revision at `/opt/pw-browsers/chromium-1194/...`, but
+  `@playwright/test`'s installed version expects a different
+  auto-downloaded revision path (`chromium_headless_shell-1223/...`,
+  which doesn't exist here and mustn't be fetched — see the session's
+  own environment notes). `playwright.c-backend.config.ts` sets
+  `launchOptions.executablePath` explicitly rather than modifying
+  `playwright.config.ts` (the existing dev-server config, left alone).
+- **Origin-locked clipboard permission grant.** `groups.spec.ts`'s two
+  clipboard tests call `context.grantPermissions([...], { origin:
+  "http://localhost:5173" })` — a literal, pre-existing hardcoded origin
+  in the test file. A permission grant's origin must match the page's
+  actual origin exactly, so `run_e2e_diff.sh` serves the C daemon on
+  `localhost:5173` (not `127.0.0.1:18099`, tried first and found to fail
+  exactly these two tests) purely to land on the same origin the test
+  already assumes — again, no edits to the spec itself.
+
+Both fixes were necessary to get a correct, unmodified upstream test
+suite running against a new backend in a specific sandbox, not
+adaptations of the tests to the C port's behavior — no C-port-specific
+behavior difference was found or needed accommodating.
+
+**Backup/restore for the real `/usr/share/magitrickle/skins`
+directory**, mirroring D-29's `/var/lib/magitrickle/config.yaml`
+backup/restore pattern for the same reason: `MT_APP_SHARE_DIR` is a
+compile-time default in `paths.h` (real per-platform overrides are
+Phase 8 packaging work), so this suite writes to the real path rather
+than a build flag, and must not clobber anything already installed
+there.
