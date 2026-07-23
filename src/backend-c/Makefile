@@ -39,16 +39,25 @@ endif
 
 # Core: no external library dependencies (cross-buildable everywhere),
 # includes the DNS wire codec, the epoll proxy transport, and the records
-# cache (no deps of its own).
+# cache (no deps of its own). The iptables save/restore engine is also
+# dependency-free (POSIX: posix_spawn/poll/fcntl only), so it lives here
+# too, not in CONFIG_SRCS.
 CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
+    src/util/bytebuf.c \
     src/core/lifecycle.c \
     src/logging/log.c \
     src/platform/loop.c \
     src/dns/wire.c \
     src/dns/proxy.c \
-    src/dns_cache/cache.c
+    src/dns_cache/cache.c \
+    src/iptables/rule.c \
+    src/iptables/chain_patch.c \
+    src/iptables/chain_override.c \
+    src/iptables/chain_delete.c \
+    src/iptables/engine.c \
+    src/iptables/executable_real.c
 
 # Config/rules/subscriptions: need libyaml + libpcre2-8 (host + feed
 # sysroots; the cross skeleton target builds core only until Phase 8
@@ -66,7 +75,20 @@ CONFIG_SRCS := \
     src/subscriptions/subparse.c \
     src/dns/pipeline.c
 
-LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS)
+# Netfilter: ipset via libmnl (NFNETLINK/NFNL_SUBSYS_IPSET). Needs libmnl
+# (host + feed sysroots; same cross-build caveat as CONFIG_SRCS -- Phase 8
+# provides the feed sysroots for the full cross daemon build).
+NETFILTER_SRCS := \
+    src/netfilter/ipset.c \
+    src/netfilter/ipset_nl_real.c \
+    src/netfilter/ipset_to_link.c \
+    src/netfilter/port_remap.c \
+    src/netfilter/cleaner.c \
+    src/netfilter/ruleset.c \
+    src/netlink/rtnl.c \
+    src/netlink/watcher.c
+
+LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
@@ -75,15 +97,24 @@ CACHETOOL_SRC := src/tools/cachetool.c
 
 CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
 CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
-LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS)
+NETFILTER_OBJS := $(NETFILTER_SRCS:%.c=$(BUILDDIR)/%.o)
+LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 CACHETOOL_OBJ := $(CACHETOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
-DEP_LIBS := -lyaml -lpcre2-8
+DEP_LIBS := -lyaml -lpcre2-8 -lmnl
 
-TEST_SRCS := $(wildcard tests/unit/*.c)
+# fake_iptables.c/fake_ipset_nl.c are test *support* (the former a port of
+# executable-fake.go, gated behind Go's `testing` build tag there; the
+# latter a mock ipset transport standing in for the untestable-here real
+# libmnl backend) -- not test binaries of their own, linked into whichever
+# test binaries need them (see TEST_SUPPORT_OBJS).
+TEST_SUPPORT_SRCS := tests/unit/fake_iptables.c tests/unit/fake_ipset_nl.c
+TEST_SUPPORT_OBJS := $(TEST_SUPPORT_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/support/%.o)
+
+TEST_SRCS := $(filter-out $(TEST_SUPPORT_SRCS), $(wildcard tests/unit/*.c))
 TEST_BINS := $(TEST_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/%)
 
 FUZZ_SRCS := $(wildcard tests/fuzz/*.c)
@@ -124,9 +155,18 @@ $(BUILDDIR)/%.o: %.c
 
 # ---- tests ------------------------------------------------------------
 
-$(BUILDDIR)/tests/%: tests/unit/%.c $(LIB_OBJS)
+# Without this, make treats tests/support/%.o as an intermediate of the
+# tests/% chain (built only to satisfy another pattern rule) and deletes
+# it after each run, forcing a needless rebuild for every test binary.
+.PRECIOUS: $(BUILDDIR)/tests/support/%.o
+
+$(BUILDDIR)/tests/support/%.o: tests/unit/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Itests/vendor $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(LDLIBS) $(DEP_LIBS)
+	$(CC) $(CFLAGS) -Itests/unit -c -o $@ $<
+
+$(BUILDDIR)/tests/%: tests/unit/%.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t"; $$t; done
@@ -162,14 +202,14 @@ fuzz: $(FUZZ_BINS)
 
 static_analysis:
 	@if command -v clang-tidy >/dev/null; then \
-	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC) -- $(CSTD) -Iinclude \
+	    clang-tidy --quiet $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC) $(TEST_SUPPORT_SRCS) -- $(CSTD) -Iinclude -Itests/unit \
 	        -D_POSIX_C_SOURCE=200809L -DMT_VERSION=\"$(MT_VERSION)\"; \
 	else echo "clang-tidy not found (skipped)"; fi
 	@if command -v cppcheck >/dev/null; then \
 	    cppcheck --std=c11 --enable=warning,performance,portability \
-	        --error-exitcode=1 --inline-suppr -Iinclude \
+	        --error-exitcode=1 --inline-suppr -Iinclude -Itests/unit \
 	        -D_POSIX_C_SOURCE=200809L \
-	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC); \
+	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(CACHETOOL_SRC) $(TEST_SUPPORT_SRCS); \
 	else echo "cppcheck not found (skipped)"; fi
 
 clean:

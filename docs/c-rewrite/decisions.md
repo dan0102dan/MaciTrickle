@@ -180,3 +180,116 @@ there is nothing to gain from building or querying an index for it.
 Subscription-derived synthetic groups are not part of the snapshot yet
 (subscription sync lands in Phase 7); only `mt_config_t.groups` (user
 groups) participate today.
+
+## D-19 — Netfilter mutation is single-threaded; no per-object locking; insertion-ordered iteration
+
+Status: accepted (Phase 5). Go's `iptables.IPTables`, `netfilterTools.IPSet`
+and `IPSetToLink` each guard every method with `sync.Mutex` (some also
+`atomic.Bool`) because multiple goroutines can share one instance
+(HTTP API handlers, the DNS hot path, and `start.go`'s init loop all call
+into the same objects concurrently in Go). The C backend instead commits
+to running all netfilter mutation — iptables engine commits, ipset
+create/add/del, ipset-to-link enable/disable, rtnetlink rule/route calls
+— on the single event-loop thread (extending D-17's DNS-hot-path
+reasoning to the whole netfilter layer); `mt_ipt_t`, `mt_ipset_t`,
+`mt_ipset_to_link_t`, `mt_ruleset_t` and `mt_rtnl_t` therefore carry no
+internal lock. Callers must not share one instance across threads without
+external synchronization; when a future phase adds worker threads (e.g.
+Phase 7's subscription fetch), calls into these objects must be
+marshalled onto the loop thread via `mt_loop_post`, not called directly
+from the worker.
+
+A related, purely representational difference: Go stores per-table
+per-chain registrations in `map[string]map[string]chain`, whose iteration
+order is randomized by the Go runtime on every `Commit()`; `mt_ipt_t`
+(engine.c) uses insertion-ordered arrays instead. This is not an
+observable behavioural difference — within one priority bucket a given
+chain's own compiled commands stay contiguous, and the relative order
+between *different* chains/tables in the iptables-restore transcript is
+insignificant to iptables-restore (distinct named chains/tables are
+independent) — but it is called out here per the "no silent incompatible
+fix" rule, matching the pattern of D-18.
+
+## D-20 — ipset: dedicated per-group netlink socket; wire protocol pinned to version 6
+
+Status: accepted (Phase 5). Two related choices in `netfilter/ipset.c` /
+`ipset_nl_real.c`:
+
+1. Go's `netfilterTools.Helper` hands every `IPSet` the same package-level
+   netlink handle (`vishvananda/netlink`'s internal `pkgHandle`), so all
+   groups share one socket. The C port instead gives each `mt_ipset_t`
+   its own dedicated socket via `mt_ipset_nl_real_new()` (one per
+   enabled group, since `mt_ruleset_t` owns its `mt_ipset_t`). This keeps
+   `mt_ipset_t`'s existing (already-tested) ownership contract simple —
+   `mt_ipset_free` owns and closes exactly the transport it was
+   constructed with — at the cost of one extra file descriptor per group
+   versus Go. On any device this backend targets, group counts are small
+   (tens, not thousands), so the extra fd count is not expected to be
+   material; this is an accepted, documented inefficiency rather than a
+   behavioural divergence.
+2. The NFNETLINK wire format (attribute set, flag bits, `hash:net`
+   revision 0) is ported from what `github.com/vishvananda/netlink`
+   actually emits, which pins `IPSET_PROTOCOL` to `6` — not the current
+   kernel UAPI header's default of `7`. This is deliberate: the C backend
+   must speak the same wire protocol the Go binary already sends in
+   production, not whatever a newer kernel header advertises as current.
+
+Both choices are untestable against a real kernel in the CI/dev sandbox
+(no `ip_set` module available, confirmed Phase 0 and reconfirmed Phase 5);
+only the fake in-memory transport (`tests/unit/fake_ipset_nl.c`) exercises
+`mt_ipset_t`'s logic today. On-device validation remains a prerequisite
+before this is trusted on a real router (see phase-5-report.md).
+
+## D-21 — rtnetlink: verify functional equivalence on real kernel state, not byte-mirroring
+
+Status: accepted (Phase 5). Unlike ipset (kernel module unavailable in
+every sandbox tried so far) and iptables (fully differential-tested
+against Go's fake-executable transcripts), plain rtnetlink — `ip rule`,
+`ip route`, `ip link`, `ip addr` — works in this sandbox once `iproute2`
+is installed. `rtnl.c` (rule add/del, blackhole route add/del, interface
+route add/del with gateway diffing, link-by-name, gateway-for-iface,
+mark/table allocation) is therefore built as idiomatic, standard
+rtnetlink requests rather than byte-for-byte mirroring every attribute
+`vishvananda/netlink` happens to send — including some that look like
+incidental zero-values (e.g. an always-present `RTA_OIF=0` attribute on
+non-interface routes) that reflect library internals more than protocol
+requirements. Correctness was instead verified by exercising the real
+kernel: creating rules/routes/links via the C code and independently
+inspecting the resulting state with `ip rule show` / `ip route show
+table N` / `ip link show`, confirming it matches what the equivalent `ip
+rule add` / `ip route add` commands would produce. This is a narrower
+compatibility claim than byte-mirroring (spec: "не заявляй о
+совместимости только на основании визуального сходства кода") — it is a
+claim about observed kernel state, backed by the real-kernel runs
+recorded in phase-5-report.md, not about wire-format identity with Go's
+netlink library.
+
+One genuine behavioural gotcha found this way (not a Go-compatibility
+issue, a C-side bug caught by this testing approach): a single-reply
+`RTM_GETLINK` "get" request must use `NLM_F_REQUEST` only. Adding
+`NLM_F_ACK` (as an early draft did) makes the kernel send an extra
+trailing `NLMSG_ERROR` ack that a non-dump "read one reply, stop" loop
+never consumes, permanently desynchronizing every subsequent read on that
+socket. Fixed in `rtnl.c`'s `mt_rtnl_link_by_name()`; `NLM_F_ACK` stays
+reserved for mutating (add/del) and dump requests.
+
+## D-22 — Ruleset sync(): linear-scan subnet sets instead of a hash map
+
+Status: accepted (Phase 5). Go's `RuleSet.sync()` (rule_set.go) builds
+`map[IPv4Subnet]IPSetTimeout` / `map[IPv6Subnet]IPSetTimeout` to
+dedupe/diff the desired ipset contents against the current one, giving
+O(1) average lookup. `mt_ruleset_sync()` (netfilter/ruleset.c) uses a
+plain growable array with linear-scan lookup for both the "new desired
+subnets" list and the diff against the current ipset listing, making a
+full sync O(n²) in the number of distinct subnets touched (config
+subnet/subnet6 rules plus resolved domain addresses in the records
+cache). This is an accepted scalability tradeoff, not a claimed
+improvement (spec: "не заявляй об улучшении производительности без
+измерений") — `sync()` only runs at daemon startup and after API-driven
+group/rule mutations (Phase 6), never per-DNS-response, and expected
+group/domain counts on the router hardware this backend targets are
+small (tens to low hundreds), so the quadratic factor is not expected to
+be material in practice. It has not been benchmarked at scale; if a
+future phase needs `sync()` to handle large domain counts (e.g. a
+subscription-derived group with thousands of rules, Phase 7), this
+should be revisited with a real hash table rather than assumed fine.
