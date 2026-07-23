@@ -17,7 +17,7 @@ with tests green, cross-build green, docs updated, report delivered.
 | 5 — netfilter/netlink | **done (this branch)** — see phase-5-report.md |
 | 6 — API/WebUI | **done (this branch)** — see phase-6-report.md |
 | 7 — subscriptions/integration | **done (this branch)** — see phase-7-report.md |
-| 8 — packaging | not started |
+| 8 — packaging | **done (this branch)** — see phase-8-report.md |
 | 9 — optimization & Go removal | not started |
 
 ## Phase 1 — foundation
