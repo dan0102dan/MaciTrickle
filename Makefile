@@ -125,6 +125,20 @@ BACKEND ?= go
 C_CROSS_COMPILE ?=
 C_SYSROOT ?=
 
+# Runtime library deps the C backend needs that the Go binary doesn't
+# (libyaml, cJSON, PCRE2, libmnl, libcurl -- see
+# docs/c-rewrite/dependencies.md, confirmed available in both feeds during
+# the Phase 0 audit). Package NAMES below are this project's best-effort
+# reading of each feed's naming convention (lib-prefixed, unversioned,
+# matching the existing Depends entries below) -- NOT verified against a
+# live Entware/OpenWrt feed index from this sandbox (same egress block as
+# decisions.md D-37/D-38). Confirm against a real feed index (or a real
+# device's `opkg`/`apk` search) before shipping a BACKEND=c package.
+# ipk Depends: fields are comma-separated (both platforms); apk's
+# `-I "depends:..."` is space-separated -- same 5 packages, two formats.
+C_DEPS_IPK := libyaml, libpcre2, libmnl, libcurl, libcjson
+C_DEPS_APK := libyaml libpcre2 libmnl libcurl libcjson
+
 # Incremental data
 
 ifeq ($(BACKEND),go)
@@ -320,10 +334,17 @@ ifeq ($(PLATFORM),entware)
 	if echo "$(TARGET)" | grep -q '_kn$$'; then \
 		DEPS="$$DEPS, socat"; \
 	fi; \
+	if [ "$(BACKEND)" = "c" ]; then \
+		DEPS="$$DEPS, $(C_DEPS_IPK)"; \
+	fi; \
 	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
 endif
 ifeq ($(PLATFORM),openwrt)
-	echo "Depends: libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft" >> $(IPK_CONTROL_DIR)/control
+	@DEPS="libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft"; \
+	if [ "$(BACKEND)" = "c" ]; then \
+		DEPS="$$DEPS, $(C_DEPS_IPK)"; \
+	fi; \
+	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
 endif
 
 	tar -C "$(IPK_CONTROL_DIR)" -czvf "$(IPK_DIR)/control.tar.gz" --owner=0 --group=0 .
@@ -356,7 +377,7 @@ package_apk: prepare_files $(BUILD_KEY_APK_SEC)
 		-I "maintainer:$(PKG_MAINTAINER)" \
 		-I "url:$(PKG_URL)" \
 		-I "provider-priority:100" \
-		-I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft" \
+		-I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft$(if $(filter c,$(BACKEND)), $(C_DEPS_APK))" \
 		-s "post-install:$(APK_DIR)/post-install.sh" \
 		-s "pre-deinstall:$(APK_DIR)/pre-deinstall.sh" \
 		-s "post-upgrade:$(APK_DIR)/post-upgrade.sh" \

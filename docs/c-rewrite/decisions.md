@@ -1682,3 +1682,49 @@ same egress-policy constraint noted throughout this entry and D-37 — so
 these two fixes address the exact two failures the live CI log showed,
 in the order CI hit them, but a third, later failure in the same job
 remains possible and unverified until the next live run.
+
+## D-39: Packaging — ipk/apk Depends for the C backend (task #48)
+
+**`prepare_files` needed zero changes.** It already copies whatever
+landed at `$(COMPILE_DIR)/magitrickled` (D-37 made both backends produce
+exactly that path), and copies the frontend `dist/` and `files/{common,
+entware,entware_kn,openwrt}` the same way regardless of `BACKEND` — so
+the only real packaging gap was that `Depends:`/apk `depends:` never
+listed the 5 libraries the C binary links against (libyaml, cJSON,
+PCRE2, libmnl, libcurl) but the Go binary doesn't need.
+
+**Two new root-Makefile variables, `C_DEPS_IPK` (comma-separated, for
+both ipk `Depends:` branches) and `C_DEPS_APK` (space-separated, for
+apk's `-I "depends:..."`)**, both listed next to `C_CROSS_COMPILE`/
+`C_SYSROOT`. Package **names** (`libyaml`, `libpcre2`, `libmnl`,
+`libcurl`, `libcjson`) are this project's best-effort reading of each
+feed's lib-prefixed, unversioned naming convention (matching the style
+of the existing `iptables-nft`/`kmod-ipt-*` entries already in this
+file) — **not verified against a live Entware or OpenWrt feed index**
+from this sandbox, same egress block as D-37/D-38's OpenWrt-download
+denial. Flagged in both the Makefile comment and here; must be confirmed
+against a real feed index (or `opkg`/`apk` search on a real device)
+before a `BACKEND=c` package ships to users.
+
+**`package_ipk`'s Entware branch** appends `, $(C_DEPS_IPK)` to its
+existing shell-built `$DEPS` when `BACKEND=c` (same pattern already used
+there for the `_kn`→`socat` conditional). **The OpenWrt branch** was a
+single static `echo` before this — converted to the same shell-variable
+style so it could gain the same conditional without duplicating the
+whole dependency list per backend. **`package_apk`'s `-I "depends:..."`**
+uses a `$(if $(filter c,$(BACKEND)),...)` Make-level conditional instead
+(no per-target shell logic needed there), appending `$(C_DEPS_APK)`.
+
+**Verified by building real packages, not just reading the diff**: ran
+`make package_ipk` for both an Entware target (`mipsel-3.4_kn`) and an
+OpenWrt target (`aarch64_cortex-a53`), each under `BACKEND=go` (default)
+and `BACKEND=c`, and inspected the extracted `control` file from the
+resulting `.ipk` in every case — `BACKEND=go` Depends lines are
+byte-identical to before this change (zero regression); `BACKEND=c`
+correctly appends the 5 new deps in each platform's existing format
+(comma-separated). `apk mkpkg` itself isn't installed in this sandbox,
+so `package_apk` was checked with `make -n` (recipe expansion only,
+which is where the `$(if ...)` conditional resolves) for both `BACKEND`
+values — `BACKEND=go`'s `-I "depends:..."` line is unchanged from
+before; `BACKEND=c`'s correctly appends `libyaml libpcre2 libmnl libcurl
+libcjson`.
