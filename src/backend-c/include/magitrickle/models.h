@@ -148,6 +148,12 @@ void mt_config_remove_group_by_index(mt_config_t *c, size_t idx);
  * or app config, unlike mt_config_clear). */
 void mt_config_clear_groups(mt_config_t *c);
 mt_err_t mt_config_add_subscription(mt_config_t *c, mt_subscription_t *s);
+/* Frees c->subscriptions[idx] and shifts the remaining pointers down (idx
+ * must be < c->n_subscriptions). */
+void mt_config_remove_subscription_by_index(mt_config_t *c, size_t idx);
+/* Frees every subscription and empties c->subscriptions (does not touch
+ * groups or app config). */
+void mt_config_clear_subscriptions(mt_config_t *c);
 
 /* Group color normalization: valid #rrggbb (case-insensitive) is lowercased
  * in place; anything else becomes "#ffffff". Matches Go LoadConfig. */

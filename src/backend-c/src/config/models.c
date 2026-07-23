@@ -263,6 +263,25 @@ mt_err_t mt_config_add_subscription(mt_config_t *c, mt_subscription_t *s)
     return MT_OK;
 }
 
+void mt_config_remove_subscription_by_index(mt_config_t *c, size_t idx)
+{
+    mt_subscription_free(c->subscriptions[idx]);
+    for (size_t i = idx; i + 1 < c->n_subscriptions; i++) {
+        c->subscriptions[i] = c->subscriptions[i + 1];
+    }
+    c->n_subscriptions--;
+}
+
+void mt_config_clear_subscriptions(mt_config_t *c)
+{
+    for (size_t i = 0; i < c->n_subscriptions; i++) {
+        mt_subscription_free(c->subscriptions[i]);
+    }
+    free(c->subscriptions);
+    c->subscriptions = NULL;
+    c->n_subscriptions = 0;
+}
+
 /* ---- color normalization (Go: regexp2 `^#[0-9a-f]{6}$` IgnoreCase) ---- */
 
 static bool is_hex_lower_or_upper(char ch)

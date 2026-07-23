@@ -186,6 +186,61 @@ bool mt_app_remove_group_by_id(mt_app_t *app, mt_id_t id) {
     return false;
 }
 
+/* ---- subscriptions ------------------------------------------------------------ */
+
+size_t mt_app_subscription_count(const mt_app_t *app) {
+    return app->cfg->n_subscriptions;
+}
+
+const mt_subscription_t *mt_app_subscription_at(const mt_app_t *app, size_t idx) {
+    return idx < app->cfg->n_subscriptions ? app->cfg->subscriptions[idx] : NULL;
+}
+
+const mt_subscription_t *mt_app_find_subscription_by_id(const mt_app_t *app, mt_id_t id) {
+    for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
+        if (mt_id_equal(app->cfg->subscriptions[i]->id, id)) { return app->cfg->subscriptions[i]; }
+    }
+    return NULL;
+}
+
+mt_err_t mt_app_add_subscription(mt_app_t *app, mt_subscription_t *sub) {
+    for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
+        if (mt_id_equal(app->cfg->subscriptions[i]->id, sub->id)) {
+            mt_subscription_free(sub);
+            return MT_ERR_EXIST;
+        }
+    }
+    mt_err_t err = mt_config_add_subscription(app->cfg, sub);
+    if (err != MT_OK) { mt_subscription_free(sub); }
+    return err;
+}
+
+mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, size_t n) {
+    mt_config_clear_subscriptions(app->cfg);
+    mt_err_t err = MT_OK;
+    size_t i = 0;
+    for (; i < n; i++) {
+        err = mt_config_add_subscription(app->cfg, subs[i]);
+        if (err != MT_OK) { break; }
+    }
+    /* On an append failure (OOM), subs[i] and everything after it were
+     * never absorbed into cfg->subscriptions -- free them here so nothing
+     * leaks. */
+    for (size_t j = err == MT_OK ? n : i; j < n; j++) { mt_subscription_free(subs[j]); }
+    free(subs);
+    return err;
+}
+
+bool mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id) {
+    for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
+        if (mt_id_equal(app->cfg->subscriptions[i]->id, id)) {
+            mt_config_remove_subscription_by_index(app->cfg, i);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ---- interfaces -------------------------------------------------------------- */
 
 mt_err_t mt_app_list_interfaces(const mt_app_t *app, mt_iface_info_t **out, size_t *out_n) {

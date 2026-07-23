@@ -101,6 +101,35 @@ void mt_app_clear_groups(mt_app_t *app);
 void mt_app_remove_group_by_index(mt_app_t *app, size_t idx);
 bool mt_app_remove_group_by_id(mt_app_t *app, mt_id_t id);
 
+/* ---- subscriptions -------------------------------------------------------------
+ *
+ * Unlike groups, subscriptions have no runtime mt_ruleset_t/netfilter
+ * counterpart yet in the C port (subscription-derived rule sets --
+ * groupruntime.BuildRuntimeRuleSet's subscription-side use in Go -- are
+ * out of scope until subscription fetch/sync lands, see decisions.md);
+ * these are therefore plain mutations of cfg->subscriptions, with no
+ * enable/sync choreography and no rollback-on-failure path to speak of. */
+
+size_t mt_app_subscription_count(const mt_app_t *app);
+const mt_subscription_t *mt_app_subscription_at(const mt_app_t *app, size_t idx);
+/* Linear search; NULL if not found. */
+const mt_subscription_t *mt_app_find_subscription_by_id(const mt_app_t *app, mt_id_t id);
+
+/* Takes ownership of `sub` on any outcome: appends to cfg->subscriptions
+ * on success; frees it and returns MT_ERR_EXIST on an ID conflict
+ * (matches Go's app.ErrSubscriptionConflict -> HTTP 409). */
+mt_err_t mt_app_add_subscription(mt_app_t *app, mt_subscription_t *sub);
+
+/* Wholesale replace: takes ownership of `subs` (the array and every
+ * element) on any outcome, discarding the previous cfg->subscriptions
+ * entirely -- matches Go's ReplaceSubscriptions, except there is no
+ * subscription rule-set rebuild to roll back yet (see the module note
+ * above), so the only possible failure is MT_ERR_NOMEM appending an
+ * element, which Go's version cannot hit the same way. */
+mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, size_t n);
+
+bool mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id);
+
 typedef struct mt_iface_info {
     char id[16];   /* IFNAMSIZ */
     char name[64]; /* friendly alias; empty unless a router-specific API

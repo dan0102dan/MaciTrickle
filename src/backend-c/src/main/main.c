@@ -44,6 +44,7 @@
 #include "magitrickle/rulesnap.h"
 #include "magitrickle/ruleset.h"
 #include "magitrickle/staticfiles.h"
+#include "magitrickle/subscriptions_api.h"
 #include "magitrickle/system.h"
 #include "magitrickle/version.h"
 #include "magitrickle/yamlio.h"
@@ -602,6 +603,11 @@ int main(int argc, char **argv)
         .config_path = config_path,
         .config_version = MT_VERSION,
     };
+    mt_subs_ctx_t subs_ctx = {
+        .app = d.app,
+        .config_path = config_path,
+        .config_version = MT_VERSION,
+    };
     mt_auth_ctx_t auth_ctx = {
         .enabled = auth_enabled_fn,
         .state_dir = auth_state_dir_fn,
@@ -616,6 +622,7 @@ int main(int argc, char **argv)
     }
     mt_groups_register_routes(d.http_unix, &groups_ctx);
     mt_system_register_routes(d.http_unix, &system_ctx);
+    mt_subs_register_routes(d.http_unix, &subs_ctx);
     mt_httpd_route(d.http_unix, "GET", "/api/v1/auth", mt_auth_status_handler, &auth_ctx);
     mt_httpd_route(d.http_unix, "POST", "/api/v1/auth", mt_auth_login_handler, &auth_ctx);
     err = mt_httpd_listen_unix(d.http_unix, MT_SOCK_PATH);
@@ -641,6 +648,7 @@ int main(int argc, char **argv)
         }
         mt_groups_register_routes(d.http_tcp, &groups_ctx);
         mt_system_register_routes(d.http_tcp, &system_ctx);
+        mt_subs_register_routes(d.http_tcp, &subs_ctx);
         mt_httpd_route(d.http_tcp, "GET", "/api/v1/auth", mt_auth_status_handler, &auth_ctx);
         mt_httpd_route(d.http_tcp, "POST", "/api/v1/auth", mt_auth_login_handler, &auth_ctx);
         mt_httpd_set_middleware(d.http_tcp, mt_auth_middleware, &auth_ctx);

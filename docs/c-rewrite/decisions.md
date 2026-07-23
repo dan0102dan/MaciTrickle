@@ -673,3 +673,91 @@ log and left no `MT__`-prefixed iptables chains behind afterward.
 Full suite (24 unit-test binaries, up from 22), `make static_analysis`
 (clang-tidy + cppcheck), and `make sanitize` (ASan+UBSan) all clean
 after these changes.
+
+## D-28: Subscriptions CRUD endpoints (non-fetch)
+
+Ports the pure config-mutation slice of `api/v1/subscription_handlers.go`
+and `subscription_converters.go`: `GET`/`PUT`/`POST
+/api/v1/subscriptions` and `DELETE /api/v1/subscriptions/{id}`
+(`subscriptions_api.h`/`subscriptions_api.c`), plus `mt_app_t` additions
+(`mt_app_subscription_count`/`_at`/`find_by_id`,
+`mt_app_add_subscription`, `mt_app_replace_subscriptions`,
+`mt_app_remove_subscription_by_id`) and two `mt_config_t` helpers
+(`mt_config_remove_subscription_by_index`, `mt_config_clear_subscriptions`
+— the subscription-side mirrors of D-25's group equivalents).
+
+**Deliberately not implemented (need libcurl, Phase 7 scope): `POST
+/api/v1/subscriptions/{id}/sync` and `GET /api/v1/subscriptions/rules?url=`.**
+Both call Go's `subscriptions.FetchList` over HTTP(S), which this C port
+has no dependency for yet. Neither route is registered, so a request to
+either falls through to the normal 404 path rather than being faked or
+stubbed with a fake success. This was the plan's own instruction for
+this task, called out again here for the historical record.
+
+**Much simpler than group CRUD, for a real reason: subscriptions have no
+runtime `mt_ruleset_t`/netfilter counterpart in the C port yet.** Go's
+`App.AddSubscription`/`ReplaceSubscriptions`/`RemoveSubscriptionByID`
+each rebuild `a.subscriptionRuleSets` (via
+`syncSubscriptionRuleSetsLocked`) and can fail/roll back if that rebuild
+fails — subscription-derived rule sets are matched during DNS resolution
+exactly like user groups (`app.ruleSetSnapshot` concatenates both), and
+subscriptions get real ipset/iptables state through the same
+`groupruntime.BuildRuntimeRuleSet` path groups use. None of that exists
+on the C side yet (only the subscription *config model* and the
+subscription-list-parsing logic from Phase 2's `subparse.c` do), so
+`mt_app_add_subscription`/`mt_app_replace_subscriptions`/
+`mt_app_remove_subscription_by_id` are plain, unconditionally-successful
+`cfg->subscriptions` array mutations with no rollback path to speak of —
+a real, load-bearing gap (not yet DNS-matchable or netfilter-backed),
+documented here so it isn't mistaken for parity with groups.
+
+**No per-subscription GET/PUT and no in-place mutation, unlike
+groups — because Go doesn't have them either.** `router.go`'s
+`/subscriptions` route tree has no `GET`/`PUT /{subscriptionID}`; only
+bulk `GET`/`PUT`, single-create `POST`, single-delete `DELETE`, plus the
+two fetch-requiring routes above. Every subscription mutation in Go goes
+through `SubscriptionFromReq`, which always builds a *new*
+`models.Subscription` (Go's `App` doesn't expose anything like
+`RuleSet.Model()` for subscriptions to mutate in place) — so unlike
+`mt_ruleset_group_mut` (D-26), no mutable-accessor equivalent was needed
+here at all.
+
+**Two faithfully-preserved Go quirks, kept rather than "fixed":**
+- **`?save=` defaults are the *opposite* of the groups handlers.**
+  Groups: `r.URL.Query().Get("save") == "true"` (opt-in, defaults to not
+  saving). Subscriptions: `r.URL.Query().Get("save") != "false"`
+  (opt-out, defaults to saving). This is a real asymmetry already
+  present in the Go handlers, not something introduced by this port —
+  `maybe_save` in `subscriptions_api.c` implements the opt-out form
+  exactly, and the header doc on `mt_subs_ctx_t` calls it out explicitly
+  so a future reader doesn't "fix" it into consistency with groups.
+- **`ensureUniqueSubscriptionIDs`/`ensureUniqueSubscriptionRuleIDs` are
+  silent fixups, not validation.** Despite returning `error` in Go,
+  neither function can actually produce one — a zero or duplicate ID
+  (checked only against entries processed so far, matching Go's
+  incrementally-built `dup` map) is silently replaced with a fresh random
+  ID. Ported as `void`-returning fixup functions in
+  `subscriptions_api.c` for the same reason. Also preserved: `Interval`
+  is *never* seeded from an existing subscription during
+  `SubscriptionFromReq`/`subscription_from_req` (only ever taken from the
+  request body, defaulting to 0) — asymmetric next to
+  `LastUpdate`/`LastCheck`, which *are* seeded from `existing`, but that
+  asymmetry is genuinely how Go's converter reads, so it's kept rather
+  than "corrected."
+
+Verified in `tests/unit/test_subscriptions_api.c` (7 tests: empty list,
+create requires a URL, create defaults (`enable` true, empty `rules`),
+duplicate-ID create → 409, delete + 404-on-unknown + 400-on-malformed-id,
+`PUT` missing-key/missing-URL → 400, and a bulk-replace test that
+captures a real server-assigned rule ID from a prior `GET` -- confirming
+along the way that a client-supplied nested-rule ID is silently
+discarded on *creation* (no baseline to match against), exactly like
+`RuleFromReq` for groups -- then reuses that captured ID plus the
+subscription's own ID across the `PUT`, checks `lastUpdate` was seeded
+from the pre-existing record, and confirms an unreferenced subscription
+is dropped). Also smoke-tested end-to-end against the real
+`magitrickled-c` binary (create, list, missing-URL 400) alongside the
+groups/system smoke test from D-27.
+
+25 unit-test binaries (up from 24), static analysis, and sanitizers all
+clean.

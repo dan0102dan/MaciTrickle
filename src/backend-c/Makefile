@@ -107,6 +107,7 @@ API_SRCS := \
     src/api/groups.c \
     src/api/system.c \
     src/api/staticfiles.c \
+    src/api/subscriptions_api.c \
     src/crypto/jwt.c
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS)
