@@ -1643,15 +1643,42 @@ targeted fixes rather than another docs-only note:
    `node_modules`" behavior and has always been accepted, so it parses
    correctly regardless of which Deno 1.x patch is actually installed.
 
+   **Follow-up, same job, next real CI run**: past config parsing, `deno
+   test` then failed with `Module not found ".../tests/mocks/
+   setup-svelte-runes". Maybe add a '.ts' extension or run with
+   --unstable-sloppy-imports` — `change-tracker.test.ts` and
+   `groups-store-mutations.test.ts` import
+   `"../mocks/setup-svelte-runes"` with no extension, and three more unit
+   test files import from `src/` the same way. This is an established,
+   deliberate convention here, not an oversight: `deno.json`'s lint
+   config already excludes the `no-sloppy-imports` rule repo-wide (i.e.
+   someone already turned off the *lint warning* for exactly this
+   pattern), it just never turned on the matching *runtime* resolution
+   behavior, and nothing had exercised `deno test` far enough to notice
+   before this task's fixes got past the `nodeModulesDir` failure.
+   Fixed by adding `--unstable-sloppy-imports` to the `test:unit` script
+   in `package.json` (the flag Deno's own error message names) rather
+   than editing `deno.json`'s `unstable` array, since the CLI flag has an
+   unambiguous 1:1 meaning across Deno versions and avoids relying on
+   this sandbox being able to confirm the exact accepted string for that
+   array (same unverifiable-Deno-version situation as above). Confirmed
+   every extensionless import in `tests/unit/` and `tests/mocks/`
+   resolves to a real, existing `.ts` file, so sloppy-imports resolution
+   has a legitimate target in every case, not just the one the CI log
+   happened to hit first.
+
 **Verification**: host build (`make CFLAGS_EXTRA=-Werror`), `make test`
 (28/28 binaries pass), `make sanitize` (0 ASan/UBSan findings), `make
 static_analysis` (0 warnings), and `tests/differential/run_diff.sh`
 (all suites OK, including the 44-step HTTP contract) all re-run clean
 after these fixes. The mipsel `cross_build` job's exact commands
 reproduced locally end to end: compiles, links `mt-dnstool`, and `file`
-confirms real MIPS object code. `deno.json` re-validated as parseable
-JSON with the corrected field. Frontend Deno test *execution* itself
-(beyond config parsing) and Playwright e2e were not re-run in this
-sandbox (no Deno binary available here — same reachability constraint);
-the config fix specifically targets the reported deserialization error,
-which occurs before any test logic runs.
+confirms real MIPS object code. `deno.json`/`package.json` re-validated
+as parseable JSON, and every extensionless test import was confirmed to
+resolve to a real file by hand (see above). Frontend Deno test
+*execution* itself (beyond config/import resolution) and Playwright e2e
+were not re-run in this sandbox — no Deno binary reachable here, the
+same egress-policy constraint noted throughout this entry and D-37 — so
+these two fixes address the exact two failures the live CI log showed,
+in the order CI hit them, but a third, later failure in the same job
+remains possible and unverified until the next live run.

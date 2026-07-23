@@ -16,7 +16,7 @@
     "dev:backend": "deno -A ./dev/backend-mock.ts",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
-    "test:unit": "deno test --no-check --ignore=tests/e2e tests/"
+    "test:unit": "deno test --no-check --unstable-sloppy-imports --ignore=tests/e2e tests/"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",
