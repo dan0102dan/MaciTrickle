@@ -25,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "magitrickle/dns_cache.h"
 #include "magitrickle/dnspipeline.h"
@@ -188,6 +189,67 @@ mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, s
  * restored state; the function still returns true (the removal was
  * requested and is what the caller should report) alongside the error. */
 mt_err_t mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id, bool *out_found);
+
+/* ---- subscription sync (fetch-backed) --------------------------------------
+ *
+ * Ports of subscriptions.go's SyncSubscriptionByID/SyncDueSubscriptions:
+ * fetch the list over the network (mt_sub_fetch_list), diff it against the
+ * subscription's current rules (mt_sub_refresh_rules/mt_sub_same_rules),
+ * and -- only if the rules actually changed -- rebuild the subscription
+ * ruleset array (rollback to the pre-sync state on failure, exactly like
+ * the other subscription mutators above).
+ *
+ * Both perform a *blocking* network fetch on the calling thread. In this
+ * port that thread is always the single event-loop thread (HTTP handlers
+ * and the auto-update timer both run there -- see decisions.md D-33): a
+ * slow or hanging upstream server stalls DNS resolution and HTTP serving
+ * for up to MT_SUB_FETCH_TIMEOUT_SECONDS. D-02/D-17 already flagged a
+ * worker-thread + mt_loop_post redesign as future work; scoped out here
+ * given the size of the httpd.c refactor (deferred responses) it would
+ * require. */
+
+/* Looks up the subscription, fetches url_override (or the subscription's
+ * own URL if url_override is NULL/empty), refreshes its rules, and
+ * rebuilds the subscription-ruleset array + republishes the DNS snapshot
+ * if the rules changed. On MT_OK, *out_changed reports whether the URL
+ * and/or rules actually changed (matches Go's returned bool); the caller
+ * should re-fetch the subscription via mt_app_find_subscription_by_id to
+ * read its post-sync url/rules/last_update (no separate copy is handed
+ * back -- safe because nothing else can run between this call returning
+ * and the caller's next statement in this single-threaded model).
+ *
+ * Errors: MT_ERR_NOENT (no such subscription id), MT_ERR_INVAL (no URL
+ * available -- empty override and empty subscription URL), MT_ERR_UPSTREAM
+ * (the fetch failed -- any reason; see the log for detail), or whatever
+ * the ruleset rebuild returned (rollback already attempted; a rollback
+ * failure is logged, not returned separately -- matches
+ * mt_app_add_subscription's pattern). On any failure after a successful
+ * fetch where rules had changed, *out_changed is still set to true
+ * (matches Go's literal `true` return in that branch -- "a change was
+ * attempted", even though it was rolled back). */
+mt_err_t mt_app_sync_subscription_by_id(mt_app_t *app, mt_id_t id, int64_t now_unix,
+                                        const char *url_override, bool *out_changed);
+
+/* Fetches every subscription for which mt_sub_is_due() is true (matches
+ * IsDue's own semantics), applies PlanRefresh to each, and -- if at least
+ * one subscription's rules actually changed -- rebuilds the subscription-
+ * ruleset array once for the whole batch and republishes the DNS
+ * snapshot (matches Go: LastCheck is bumped for every subscription that
+ * was successfully fetched, even if unchanged, but a rebuild only
+ * happens when something changed). A fetch failure for one subscription
+ * is logged and that subscription is skipped -- it does not fail the
+ * whole call (matches Go's continue-on-fetch-error loop). On a rebuild
+ * failure, every subscription touched by this call is rolled back to its
+ * pre-call state and the rulesets rebuilt again from that (rollback
+ * failure logged, not returned). *out_any_changed mirrors Go's returned
+ * bool, including staying true on a rolled-back failure (see above).
+ * Unlike mt_app_sync_subscription_by_id, this does NOT call
+ * mt_app_save_config itself (it doesn't have a path/version) -- matches
+ * Go structurally in spirit only; the caller (main.c's auto-update timer,
+ * wired in a later Phase 7 task) must save on *out_any_changed == true,
+ * exactly like the maybe_save() pattern already used by the HTTP
+ * handlers. */
+mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *out_any_changed);
 
 typedef struct mt_iface_info {
     char id[16];   /* IFNAMSIZ */

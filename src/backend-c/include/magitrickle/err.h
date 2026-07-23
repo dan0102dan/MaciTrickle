@@ -22,6 +22,11 @@ typedef enum mt_err {
     MT_ERR_PROTO,   /* protocol violation (DNS/HTTP/netlink parse) */
     MT_ERR_STATE,   /* operation invalid in current lifecycle state */
     MT_ERR_SYS,     /* unclassified system error */
+    MT_ERR_UPSTREAM, /* a remote/upstream fetch failed (e.g. subscription
+                      * list fetch) -- kept distinct from MT_ERR_IO/PROTO/
+                      * LIMIT so callers can map it to a single HTTP status
+                      * (502) regardless of the underlying fetch failure
+                      * mode, matching Go's app.ErrSubscriptionFetch */
 } mt_err_t;
 
 /* Static string for an error code (never NULL). */

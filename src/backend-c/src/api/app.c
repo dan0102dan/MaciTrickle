@@ -12,7 +12,9 @@
 
 #include "magitrickle/log.h"
 #include "magitrickle/rulesnap.h"
+#include "magitrickle/sub_fetch.h"
 #include "magitrickle/sub_runtime.h"
+#include "magitrickle/subparse.h"
 
 struct mt_app {
     mt_config_t *cfg;
@@ -444,6 +446,245 @@ mt_err_t mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id, bool *out_f
 
     mt_subscription_free(removed);
     republish_or_log(app);
+    return MT_OK;
+}
+
+/* ---- subscription sync (fetch-backed) ----------------------------------------- */
+
+static mt_subscription_t *find_subscription_mut(mt_app_t *app, mt_id_t id) {
+    for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
+        if (mt_id_equal(app->cfg->subscriptions[i]->id, id)) { return app->cfg->subscriptions[i]; }
+    }
+    return NULL;
+}
+
+static void free_sub_rule_array(mt_sub_rule_t **rules, size_t n) {
+    for (size_t i = 0; i < n; i++) { mt_sub_rule_free(rules[i]); }
+    free(rules);
+}
+
+mt_err_t mt_app_sync_subscription_by_id(mt_app_t *app, mt_id_t id, int64_t now_unix,
+                                        const char *url_override, bool *out_changed) {
+    *out_changed = false;
+
+    mt_subscription_t *sub = find_subscription_mut(app, id);
+    if (!sub) { return MT_ERR_NOENT; }
+    const char *fetch_url = (url_override && url_override[0] != '\0') ? url_override : sub->url;
+    if (!fetch_url || fetch_url[0] == '\0') { return MT_ERR_INVAL; }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    mt_err_t ferr = mt_sub_fetch_list(fetch_url, &body, &body_len);
+    if (ferr != MT_OK) {
+        MT_ERROR("failed to fetch subscription list: %s", mt_err_str(ferr));
+        return MT_ERR_UPSTREAM;
+    }
+
+    mt_sub_rule_t **refreshed = NULL;
+    size_t n_refreshed = 0;
+    mt_err_t rerr = mt_sub_refresh_rules(body, sub->rules, sub->n_rules, &refreshed, &n_refreshed);
+    free(body);
+    if (rerr != MT_OK) { return rerr; }
+    bool rules_changed = !mt_sub_same_rules(sub->rules, sub->n_rules, refreshed, n_refreshed);
+
+    /* Re-find defensively: nothing can actually mutate cfg between the
+     * lookup above and here in this synchronous single-thread model, but
+     * this mirrors Go's re-validation after the (there, concurrent)
+     * network fetch and keeps this code correct if a future worker-thread
+     * redesign (see app.h) makes the fetch genuinely concurrent. */
+    sub = find_subscription_mut(app, id);
+    if (!sub) {
+        free_sub_rule_array(refreshed, n_refreshed);
+        return MT_ERR_NOENT;
+    }
+
+    bool url_changed = strcmp(sub->url ? sub->url : "", fetch_url) != 0;
+    char *new_url = NULL;
+    if (mt_strset(&new_url, fetch_url) != MT_OK) {
+        free_sub_rule_array(refreshed, n_refreshed);
+        return MT_ERR_NOMEM;
+    }
+    char *prev_url = sub->url;
+    uint32_t prev_last_check = sub->last_check;
+    uint32_t prev_last_update = sub->last_update;
+    mt_sub_rule_t **prev_rules = sub->rules;
+    size_t prev_n_rules = sub->n_rules;
+
+    sub->url = new_url;
+    sub->last_check = (uint32_t)now_unix;
+
+    if (rules_changed) {
+        sub->rules = refreshed;
+        sub->n_rules = n_refreshed;
+        sub->last_update = (uint32_t)now_unix;
+
+        mt_err_t err = rebuild_subscription_rulesets(app);
+        if (err != MT_OK) {
+            free_sub_rule_array(sub->rules, sub->n_rules);
+            free(sub->url);
+            sub->url = prev_url;
+            sub->last_check = prev_last_check;
+            sub->last_update = prev_last_update;
+            sub->rules = prev_rules;
+            sub->n_rules = prev_n_rules;
+            mt_err_t rollback_err = rebuild_subscription_rulesets(app);
+            if (rollback_err != MT_OK) {
+                MT_ERROR("failed to rollback subscription rulesets: %s", mt_err_str(rollback_err));
+            }
+            *out_changed = true;
+            return err;
+        }
+        free_sub_rule_array(prev_rules, prev_n_rules);
+        republish_or_log(app);
+    } else {
+        free_sub_rule_array(refreshed, n_refreshed);
+    }
+    free(prev_url);
+
+    *out_changed = url_changed || rules_changed;
+    return MT_OK;
+}
+
+mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *out_any_changed) {
+    *out_any_changed = false;
+
+    mt_id_t *due_ids = NULL;
+    size_t n_due = 0, cap_due = 0;
+    for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
+        if (!mt_sub_is_due(app->cfg->subscriptions[i], now_unix)) { continue; }
+        if (n_due == cap_due) {
+            size_t new_cap = cap_due ? cap_due * 2 : 8;
+            mt_id_t *na = realloc(due_ids, new_cap * sizeof(*na));
+            if (!na) {
+                free(due_ids);
+                return MT_ERR_NOMEM;
+            }
+            due_ids = na;
+            cap_due = new_cap;
+        }
+        due_ids[n_due++] = app->cfg->subscriptions[i]->id;
+    }
+    if (n_due == 0) {
+        free(due_ids);
+        return MT_OK;
+    }
+
+    typedef struct sub_plan {
+        mt_id_t id;
+        mt_sub_rule_t **refreshed;
+        size_t n_refreshed;
+        bool changed;
+    } sub_plan_t;
+    sub_plan_t *plans = calloc(n_due, sizeof(*plans));
+    if (!plans) {
+        free(due_ids);
+        return MT_ERR_NOMEM;
+    }
+    size_t n_plans = 0;
+
+    for (size_t i = 0; i < n_due; i++) {
+        const mt_subscription_t *sub = find_subscription_mut(app, due_ids[i]);
+        if (!sub || !sub->url || sub->url[0] == '\0') { continue; }
+
+        char *body = NULL;
+        size_t body_len = 0;
+        mt_err_t ferr = mt_sub_fetch_list(sub->url, &body, &body_len);
+        if (ferr != MT_OK) {
+            char idbuf[MT_ID_STR_LEN];
+            mt_id_format(sub->id, idbuf);
+            MT_ERROR("failed to fetch subscription %s: %s", idbuf, mt_err_str(ferr));
+            continue;
+        }
+
+        mt_sub_rule_t **refreshed = NULL;
+        size_t n_refreshed = 0;
+        mt_err_t rerr = mt_sub_refresh_rules(body, sub->rules, sub->n_rules, &refreshed, &n_refreshed);
+        free(body);
+        if (rerr != MT_OK) { continue; }
+
+        plans[n_plans].id = due_ids[i];
+        plans[n_plans].refreshed = refreshed;
+        plans[n_plans].n_refreshed = n_refreshed;
+        plans[n_plans].changed = !mt_sub_same_rules(sub->rules, sub->n_rules, refreshed, n_refreshed);
+        n_plans++;
+    }
+    free(due_ids);
+
+    if (n_plans == 0) {
+        free(plans);
+        return MT_OK;
+    }
+
+    typedef struct rollback_entry {
+        mt_subscription_t *sub;
+        mt_sub_rule_t **rules;
+        size_t n_rules;
+        uint32_t last_check;
+        uint32_t last_update;
+        bool rules_replaced;
+    } rollback_entry_t;
+    rollback_entry_t *rollback = calloc(n_plans, sizeof(*rollback));
+    if (!rollback) {
+        for (size_t i = 0; i < n_plans; i++) { free_sub_rule_array(plans[i].refreshed, plans[i].n_refreshed); }
+        free(plans);
+        return MT_ERR_NOMEM;
+    }
+    size_t n_rollback = 0;
+    bool any_changed = false;
+
+    for (size_t i = 0; i < n_plans; i++) {
+        mt_subscription_t *sub = find_subscription_mut(app, plans[i].id);
+        if (!sub) {
+            free_sub_rule_array(plans[i].refreshed, plans[i].n_refreshed);
+            continue;
+        }
+        rollback[n_rollback].sub = sub;
+        rollback[n_rollback].rules = sub->rules;
+        rollback[n_rollback].n_rules = sub->n_rules;
+        rollback[n_rollback].last_check = sub->last_check;
+        rollback[n_rollback].last_update = sub->last_update;
+        rollback[n_rollback].rules_replaced = plans[i].changed;
+        n_rollback++;
+
+        sub->last_check = (uint32_t)now_unix;
+        if (plans[i].changed) {
+            sub->rules = plans[i].refreshed;
+            sub->n_rules = plans[i].n_refreshed;
+            sub->last_update = (uint32_t)now_unix;
+            any_changed = true;
+        } else {
+            free_sub_rule_array(plans[i].refreshed, plans[i].n_refreshed);
+        }
+    }
+    free(plans);
+
+    if (!any_changed) {
+        free(rollback);
+        return MT_OK;
+    }
+
+    mt_err_t err = rebuild_subscription_rulesets(app);
+    if (err != MT_OK) {
+        for (size_t i = 0; i < n_rollback; i++) {
+            mt_subscription_t *sub = rollback[i].sub;
+            if (rollback[i].rules_replaced) { free_sub_rule_array(sub->rules, sub->n_rules); }
+            sub->rules = rollback[i].rules;
+            sub->n_rules = rollback[i].n_rules;
+            sub->last_check = rollback[i].last_check;
+            sub->last_update = rollback[i].last_update;
+        }
+        free(rollback);
+        mt_err_t rollback_err = rebuild_subscription_rulesets(app);
+        if (rollback_err != MT_OK) {
+            MT_ERROR("failed to rollback subscription rulesets: %s", mt_err_str(rollback_err));
+        }
+        *out_any_changed = true;
+        return err;
+    }
+
+    free(rollback);
+    republish_or_log(app);
+    *out_any_changed = true;
     return MT_OK;
 }
 

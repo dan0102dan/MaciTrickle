@@ -18,6 +18,7 @@ const char *mt_err_str(mt_err_t err)
     case MT_ERR_PROTO:   return "protocol error";
     case MT_ERR_STATE:   return "invalid state";
     case MT_ERR_SYS:     return "system error";
+    case MT_ERR_UPSTREAM: return "upstream fetch failed";
     }
     return "unknown error";
 }

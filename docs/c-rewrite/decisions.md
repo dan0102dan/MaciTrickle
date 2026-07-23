@@ -1087,3 +1087,107 @@ regression tests), `static_analysis` (clang-tidy+cppcheck, 0 warnings),
 and `sanitize` (ASan+UBSan) all clean; `magitrickled-c` and
 `mt-configtool` rebuild cleanly with the new `main.c`/`app.c`/`app.h`
 signatures.
+
+## D-33: Subscription sync flows (`mt_app_sync_subscription_by_id`/`mt_app_sync_due_subscriptions`) and the blocking-fetch tradeoff
+
+**Ports `subscriptions.go`'s `SyncSubscriptionByID`/`SyncDueSubscriptions`
+onto `mt_app_t`, reusing the Phase 2 parse primitives
+(`mt_sub_refresh_rules`/`mt_sub_same_rules`/`mt_sub_is_due`, already
+shipped and differentially tested) and the Phase 7 fetch primitive
+(`mt_sub_fetch_list`) with the Phase 7 rebuild/rollback machinery
+(`rebuild_subscription_rulesets`) from D-32.** `mt_app_sync_subscription_by_id`
+mirrors Go field-for-field: `LastCheck`/`URL` update unconditionally on
+any successful fetch, `LastUpdate`/`Rules` (and the ruleset rebuild) only
+when the refreshed rules actually differ (`mt_sub_same_rules`) — matching
+the observation that a URL-only change never needs a ruleset rebuild in
+either language, since neither `RuleSet`/Go nor `mt_sub_runtime_group`/C
+read the subscription's URL when building matcher state. On a rebuild
+failure, every mutated field is rolled back to its pre-sync value and
+the rulesets rebuilt again from that (rollback failure logged, not
+returned, matching `mt_app_add_subscription`'s established pattern);
+`*out_changed` is still set `true` in that branch, faithfully matching
+Go's own literal `true` return there ("a change was attempted", even
+though it was rolled back). `mt_app_sync_due_subscriptions` mirrors the
+two-phase due-scan/apply split (`IsDue` filter, then per-subscription
+fetch+refresh, then one shared rebuild+rollback for whatever actually
+changed across the whole batch) exactly, including the detail that a
+subscription's `LastCheck` still advances even when its content turned
+out unchanged (so it won't be immediately re-fetched next tick), while
+only an *actual* rules change anywhere in the batch triggers the shared
+rebuild.
+
+**No result-copy struct in the API.** Go's `SyncSubscriptionByID` returns
+an `app.SubscriptionSyncResult{URL, LastUpdate, Rules}` value because its
+caller (the HTTP handler) runs in a different goroutine and needs a
+snapshot immune to concurrent mutation. This port's callers are all
+on the same single event-loop thread as the sync call itself (see
+below), so nothing can mutate `cfg` between `mt_app_sync_subscription_by_id`
+returning and the caller's next statement — `mt_app_find_subscription_by_id`
+called immediately after a successful sync already IS "target". This
+avoids a whole deep-copy/free lifecycle for a value that would be stale
+the instant a future worker-thread redesign made the fetch genuinely
+concurrent.
+
+**New `MT_ERR_UPSTREAM` error code**, kept deliberately distinct from
+`MT_ERR_IO`/`MT_ERR_PROTO`/`MT_ERR_LIMIT` (any of which `mt_sub_fetch_list`
+itself can return depending on the failure mode). Go collapses every
+fetch failure into a single `app.ErrSubscriptionFetch` sentinel via
+`fmt.Errorf("%w: ...")` specifically so the HTTP layer can map it to one
+status (502) regardless of cause; `mt_err_t` has no wrapping, so
+`mt_app_sync_subscription_by_id` does the same collapsing explicitly —
+logs the underlying `mt_sub_fetch_list` error, then returns
+`MT_ERR_UPSTREAM` — so a fetch failure can never be confused with a
+ruleset-rebuild failure (which reuses whatever `mt_ruleset_enable`/
+`_sync`/`MT_ERR_NOMEM` code the rebuild itself produced) by whatever
+HTTP status-mapping code consumes this in the next Phase 7 task.
+
+**Known, documented limitation: both sync functions perform a *blocking*
+libcurl fetch on the calling thread**, and today that thread is always
+the single event-loop thread — `mt_httpd_t`'s handler contract
+(`handle_complete_request` in `httpd.c`) builds and writes the HTTP
+response synchronously from a stack-local `mt_http_res_t` before
+returning, with no support for a handler to defer its response, so an
+HTTP-triggered sync (the next Phase 7 task) and the auto-update timer
+callback (the task after that) will both stall DNS resolution and HTTP
+serving for up to `MT_SUB_FETCH_TIMEOUT_SECONDS` on a slow or hung
+upstream. This is a real architectural gap from Go's model (where
+`SyncSubscriptionByID`/`SyncDueSubscriptions` block only their own
+goroutine, never DNS-serving or other HTTP-request goroutines) and was
+already anticipated in D-02 ("a small worker pool ... only for
+blocking/slow work: ... libcurl transfers") and D-17 ("when Phase 7
+introduces a worker thread for subscription fetch, the snapshot's
+publication must be marshalled onto the loop thread via `mt_loop_post`").
+Implementing that worker-thread + deferred-HTTP-response redesign was
+scoped out of this task given the size of the `httpd.c` refactor it
+would require (heap-allocating response state, extending the connection
+lifecycle to survive an async completion, handling the connection
+closing mid-fetch); it is called out here explicitly, as a documented
+divergence, rather than silently shipped as if it matched Go's
+non-blocking behavior. This mirrors the precedent already accepted for
+iptables fork+exec in Phase 5/6 (also invoked synchronously on the loop
+thread, also not yet moved to a worker pool) — subscription fetch simply
+makes the same tradeoff far more visible, since a hung fetch can block
+for the full 15-second timeout rather than a fork+exec's usual
+sub-100ms cost. Left as a candidate revisit for a later phase, not
+silently dropped.
+
+Verified with a new `tests/unit/test_sub_sync.c` (9 tests, against a
+real local `mt_httpd_t` server acting as the stub subscription-list
+host, same background-loop-thread harness as `test_sub_fetch.c`):
+first sync fetches and reports changed; a same-content resync reports
+unchanged but still advances `last_check`; a different-content resync
+(via `url_override`) updates both URL and rules and reports changed;
+unknown subscription id is `MT_ERR_NOENT`; an empty URL with no
+override is `MT_ERR_INVAL`; a fetch returning non-2xx is
+`MT_ERR_UPSTREAM` and leaves the subscription untouched; due-vs-not-due
+filtering in the batch sync (interval/last_check arithmetic); a
+due-but-content-unchanged batch sync still advances `last_check` without
+reporting a change; and a batch sync with nothing due is a no-op. A
+forced-rebuild-failure/rollback test was not added at this layer (no
+netfilter mock is currently wired through `mt_app_t`'s own tests to
+force `rebuild_subscription_rulesets` to fail deterministically) — the
+rollback code itself is structurally identical to
+`mt_app_add_subscription`/`_replace_subscriptions`'s already-established
+pattern from D-32. Full suite (28 unit-test binaries), `static_analysis`
+(clang-tidy+cppcheck, 0 warnings), and `sanitize` (ASan+UBSan, 0
+findings) all clean.
