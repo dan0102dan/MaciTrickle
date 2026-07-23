@@ -1365,3 +1365,132 @@ shutdown. Also re-ran the full unit suite (28 binaries), `static_analysis`
 (0 warnings), `sanitize` (0 findings), and `run_http_diff.sh` (44/44
 steps, Go vs C byte-identical, confirming `mt_sub_fetch_global_init`
 wired into startup didn't change any observable behavior) — all clean.
+
+## D-36: End-to-end fault-injection + soak test — a real leak found and fixed
+
+**New tooling**: `tools/bench/run_c_subscription_fault_soak.sh` +
+`tools/bench/subscription_fault_stub.py`, migration-plan.md's Phase 7
+"end-to-end: full daemon ... stub upstream + stub subscription server
+... fault injection" line item. Runs the real `magitrickled-c` binary
+against a stub DNS upstream (`dnsstub`, Phase 3/4 tooling, sustained
+load via `dnsload`) and a stub subscription-list HTTP server that
+deliberately exercises every `mt_sub_fetch_list`/
+`mt_app_sync_due_subscriptions` failure mode on a short (4s) auto-update
+interval for the whole run — a redirect loop, a non-2xx status, an
+oversized body, a connection-refused target — alongside one subscription
+whose content genuinely alternates on every fetch (forcing a real
+rebuild of the subscription-ruleset array and a DNS-snapshot republish
+on roughly every other tick). SIGHUP is sent periodically mid-run to
+exercise config reload concurrently with in-flight DNS traffic and due
+subscription fetches. All subscriptions use `enable:true` with
+`interface:""` — mirrors `mt_sub_is_due`/`mt_sub_runtime_group`'s
+actual semantics exactly (`IsDue` only checks Enable/URL/Interval, never
+Iface; the synthesized ruleset's own `enable` is forced false whenever
+Iface is empty, per `subscriptionAsRuntimeRuleSet`) — so each
+subscription is genuinely due for repeated auto-update cycles while its
+ruleset never attempts real netfilter work, keeping the soak focused on
+the fetch/sync/reload code under test.
+
+**Bounded duration stands in for the plan's 24h host soak**, documented
+here rather than silently substituted: this sandbox has no facility for
+an unattended 24h run. `DURATION` defaults to 90s, enough for ~20 real
+fetch cycles per stub endpoint at the 4s interval above — short in wall
+time, not in exercised-code-paths.
+
+**A genuine, previously-undetected memory leak was found and fixed**:
+running the soak under the sanitize build (ASan+UBSan) reported
+`LeakSanitizer: ... byte(s) leaked` at process exit, traced through
+`load_subscription`/`mt_subscription_add_rule` in `yaml_load.c` — but
+that was only the *allocation* site LSan reports, not the actual bug
+site. Isolated with a series of standalone repros (loading the same
+saved config file repeatedly via `mt_config_load_file` alone: clean;
+adding `mt_app_replace_subscriptions` cycles without a real sync: clean;
+adding a real `mt_app_sync_due_subscriptions` call with actual content
+changes between reload cycles: **leaked, deterministically, every
+time**) down to `mt_app_sync_due_subscriptions`'s success path in
+`app.c`: when a due subscription's rules actually changed, the loop
+correctly saves the subscription's *old* rules pointer into a per-
+subscription `rollback_entry_t` (for the failure/rollback path, which
+already frees them correctly) before overwriting `sub->rules` with the
+newly-fetched array — but the **success** path only ever did
+`free(rollback)`, freeing the bookkeeping array itself while never
+freeing `rollback[i].rules` (the now-superseded old array) for any
+subscription whose rules had actually changed. Every real "auto-update
+found new content" cycle silently leaked one `mt_sub_rule_t` array (plus
+each entry's `strdup`'d `rule`/`type` strings) forever. Notably,
+`mt_app_sync_subscription_by_id` (the single-ID sibling function, also
+task #42) already got this right — it calls
+`free_sub_rule_array(prev_rules, prev_n_rules)` on its own success path
+— so this was a narrow, single-function omission, not a
+systemic pattern. Fixed by adding the equivalent free loop over every
+`rollback[i]` with `rules_replaced == true` right before
+`mt_app_sync_due_subscriptions`'s final `free(rollback)`.
+
+This is exactly the class of bug integration/fault-injection testing at
+this stage is meant to catch: it required (a) a real repeated content
+change for the same subscription across (b) more than one due-sync
+cycle, a combination no existing unit test happened to drive twice in a
+row for the *batch* sync path specifically (`due_but_unchanged_...`
+tests a same-content resync; `due_subscriptions_are_fetched_...` tests
+one cycle) — plain code review of the (structurally reasonable-looking)
+rollback bookkeeping did not surface it either. Added a regression test,
+`tests/unit/test_sub_sync.c`'s `due_subscriptions_repeated_content_changes_leak_nothing`:
+a toggling stub endpoint drives `mt_app_sync_due_subscriptions` through
+two real content-change cycles for one subscription. It always passed
+functionally (the bug only orphaned memory, never corrupted the live
+subscription state) — its value is purely as `make sanitize` coverage,
+verified by confirming it caught the leak before the fix (via the same
+standalone repro) and passes clean after.
+
+**Also confirmed, and deliberately left alone: a pre-existing Go bug,
+faithfully reproduced.** Early soak runs (before pinning a real
+`MT_VERSION` for the test) showed every `SIGHUP` reload failing with
+`MT_ERR_STATE` ("config unsupported version") after the very first
+auto-update save. Root cause: `mt_app_save_config`/`mt_app_sync_due_subscriptions`'s
+save-on-change writes `configVersion: <MT_VERSION>`, and `MT_VERSION`
+defaults to `"unattached"` in this Makefile with no override anywhere in
+this repo's CI (`.github/workflows/*.yml`, `config/*/*`) — so any real
+build of this daemon would write a `configVersion` that its own
+`mt_config_load_file`'s `strncmp(version, "0.", 2) != 0` check (a
+faithful port of Go's `strings.HasPrefix(cfg.ConfigVersion, "0.")`,
+`config.go`) then rejects on the next load. Confirmed this is **not** a
+C-vs-Go divergence: Go's own `constant.Version = "unattached"` (same
+default, same no-CI-override situation) plus its byte-identical
+`HasPrefix` check means the *real* Go daemon would hit the exact same
+self-inflicted failure the moment any code path calls `SaveConfig()`
+with an unversioned build — `SyncDueSubscriptions` calling `SaveConfig()`
+on a changed subscription is exactly such a path. Per the master spec
+("port Go's behavior, bugs included, unless told otherwise" — never fix
+unrelated Go defects silently as a side effect of the C port), this was
+left unmodified in both the sync/save code and the version-check code;
+the soak test itself was simply built with `MT_VERSION=0.7.0` (matching
+the version string already used elsewhere in this repo's differential
+scratch configs) so this out-of-scope, pre-existing defect doesn't mask
+verification of the actual Phase 7 reload/fault-injection logic. Not
+silently patched, not silently ignored — documented here as a real,
+verified, out-of-scope finding.
+
+**A minor startup race, found and fixed in the test script itself, not
+the daemon**: the first soak-script draft started the stub subscription
+server and the real daemon back-to-back with only a fixed `sleep 0.3`
+in between. Since the daemon's very first auto-update tick fires almost
+immediately at startup (`mt_loop_add_timer`'s `initial_ms=0`), a slow
+stub-server bind occasionally lost the race, showing up as spurious
+`i/o error` fetch failures on cycle 0 only (harmless -- self-corrected
+on the next tick -- but a misleading signal in the summary counts).
+Fixed with an explicit `curl`-based readiness poll against the stub
+server (matching `run_http_diff.sh`'s `wait_for_port` pattern) before
+starting the daemon, instead of the fixed sleep.
+
+Verified: the fixed `magitrickled-c` (both the optimized build and the
+ASan+UBSan sanitize build) ran the full fault-injection soak cleanly —
+daemon alive throughout, multiple real SIGHUP reloads under concurrent
+DNS load and due-subscription fetches, sustained DNS load at ~20-30k
+rps, clean `SIGTERM` shutdown, **zero LeakSanitizer/ASan/UBSan findings**
+(confirmed on a 90s run with 4 SIGHUP reloads and ~20+ real subscription
+sync cycles including repeated content changes — the exact scenario
+that leaked before the fix). Also re-ran the full unit suite (28
+binaries, including the new regression test in `test_sub_sync.c`),
+`static_analysis` (0 warnings), `sanitize` (0 findings), and
+`run_http_diff.sh` (44/44 steps Go vs C byte-identical) — all clean
+after the fix.

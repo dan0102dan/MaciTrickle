@@ -37,6 +37,22 @@ static void h_notfound(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
     mt_http_res_write(res, 404, "text/plain", (const uint8_t *)body, sizeof(body) - 1);
 }
 
+/* Alternates content on every request -- lets a test drive
+ * mt_app_sync_due_subscriptions through more than one real "rules
+ * actually changed" cycle for the SAME subscription (regression
+ * coverage for the leaked-superseded-rules bug found by the Phase 7
+ * fault-injection soak, decisions.md D-36: only visible under
+ * `make sanitize`, since a normal run has no way to observe the leak
+ * functionally). */
+static bool g_toggle_state = false;
+static void h_toggle(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    g_toggle_state = !g_toggle_state;
+    const char *body = g_toggle_state ? "one.example\ntwo.example" : "three.example";
+    mt_http_res_write(res, 200, "text/plain", (const uint8_t *)body, strlen(body));
+}
+
 typedef struct harness {
     mt_loop_t *loop;
     mt_httpd_t *srv;
@@ -65,6 +81,7 @@ static harness_t *harness_start(void) {
     mt_httpd_route(h->srv, "GET", "/a", h_list, &g_list_a);
     mt_httpd_route(h->srv, "GET", "/b", h_list, &g_list_b);
     mt_httpd_route(h->srv, "GET", "/404", h_notfound, NULL);
+    mt_httpd_route(h->srv, "GET", "/toggle", h_toggle, NULL);
     if (mt_httpd_listen_tcp(h->srv, "127.0.0.1", TEST_PORT) != MT_OK) { return NULL; }
     pthread_create(&h->thread, NULL, loop_thread, h);
 
@@ -304,6 +321,43 @@ TEST due_but_unchanged_bumps_last_check_without_rebuild_flag(void) {
     PASS();
 }
 
+/* Regression test for the leaked-superseded-rules bug (decisions.md
+ * D-36): drives mt_app_sync_due_subscriptions through TWO real
+ * content-change cycles for the same subscription. Functionally this
+ * always passed (the bug only orphaned the old mt_sub_rule_t array,
+ * never corrupted the live one) -- its value is as `make sanitize`
+ * coverage: before the D-36 fix, this exact sequence leaked one
+ * mt_sub_rule_t (with its strdup'd rule/type strings) per changed
+ * cycle. */
+TEST due_subscriptions_repeated_content_changes_leak_nothing(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    mt_subscription_t *sub = mt_subscription_new();
+    sub->id = mt_id_random();
+    mt_strset(&sub->iface, "eth0");
+    mt_strset(&sub->url, url_for("/toggle"));
+    sub->enable = true;
+    sub->interval = 1;
+    ASSERT_EQ(MT_OK, mt_app_add_subscription(h->app, sub));
+    mt_id_t id = sub->id;
+
+    bool any_changed = false;
+    ASSERT_EQ(MT_OK, mt_app_sync_due_subscriptions(h->app, 1000, &any_changed));
+    ASSERT(any_changed);
+    const mt_subscription_t *cur = mt_app_find_subscription_by_id(h->app, id);
+    ASSERT_EQ(2u, cur->n_rules); /* toggled to "one.example\ntwo.example" */
+
+    any_changed = false;
+    ASSERT_EQ(MT_OK, mt_app_sync_due_subscriptions(h->app, 1002, &any_changed));
+    ASSERT(any_changed);
+    cur = mt_app_find_subscription_by_id(h->app, id);
+    ASSERT_EQ(1u, cur->n_rules); /* toggled back to "three.example" */
+    ASSERT_STR_EQ("three.example", cur->rules[0]->rule);
+
+    harness_stop(h);
+    PASS();
+}
+
 TEST no_due_subscriptions_is_a_noop(void) {
     harness_t *h = harness_start();
     ASSERT(h != NULL);
@@ -327,6 +381,7 @@ int main(int argc, char **argv) {
     RUN_TEST(fetch_failure_is_upstream_error);
     RUN_TEST(due_subscriptions_are_fetched_and_others_skipped);
     RUN_TEST(due_but_unchanged_bumps_last_check_without_rebuild_flag);
+    RUN_TEST(due_subscriptions_repeated_content_changes_leak_nothing);
     RUN_TEST(no_due_subscriptions_is_a_noop);
     GREATEST_MAIN_END();
 }

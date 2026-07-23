@@ -682,6 +682,20 @@ mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *ou
         return err;
     }
 
+    /* Success: rollback[i].rules is each subscription's PRE-sync rules
+     * array, already superseded by plans[i].refreshed for every entry
+     * with rules_replaced == true (see the loop above). Must be freed
+     * here -- unlike the rollback-on-failure branch, which frees the
+     * NEW rules and restores these same old ones, this success path was
+     * previously leaking them (found by the Phase 7 fault-injection
+     * soak under ASan/LSan: repeated real syncs across a SIGHUP reload
+     * leaked the exact size of a superseded rule array -- see
+     * decisions.md D-36). */
+    for (size_t i = 0; i < n_rollback; i++) {
+        if (rollback[i].rules_replaced) {
+            free_sub_rule_array(rollback[i].rules, rollback[i].n_rules);
+        }
+    }
     free(rollback);
     republish_or_log(app);
     *out_any_changed = true;
