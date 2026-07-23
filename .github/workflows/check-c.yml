@@ -47,25 +47,20 @@ jobs:
           make fuzz FUZZ_RUNS=200000
 
   differential:
-    name: Differential spikes (regexp2/PCRE2, yaml.v2/libyaml)
+    name: Differential/regression suites (vs golden snapshots)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '1.23'
 
       - name: Install libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev
 
-      - name: Run differential suites
+      - name: Run differential/regression suites
         working-directory: src/backend-c
-        # sudo: the Go oracle exercises the real /var/lib/magitrickle path
+        # sudo: the HTTP contract suite exercises the real /var/lib/magitrickle path
         run: sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh
 
   cross_build:

@@ -1856,3 +1856,107 @@ targets, 400,000 total runs, 0 crashes), `tests/differential/run_diff.sh`
 (all suites OK, including the 44-step HTTP contract) — all clean, no
 regressions from anything landed earlier in Phase 9 (the interfaces fix,
 D-43).
+
+## D-45: Go backend removal (task #57) — rationale, CI build gate, differential-harness retirement
+
+**Status: accepted.** With the parity checklist signed off (D-56/
+parity-checklist.md) and the user's explicit authorization to proceed,
+`src/backend` (Go), its Go module dependencies, and its Go-only CI steps
+were removed in this change, per migration-plan.md Phase 9's own text:
+"separate change: remove `src/backend` (Go), Go deps, Go CI steps; update
+Makefile, CLAUDE.md, AGENTS.md, README, docs." This is a single,
+cleanly-revertible commit — `git revert` restores Go in full if a gap is
+later found that the parity checklist missed.
+
+**What changed, mechanically:**
+
+- Root `Makefile`: the Phase 8 `BACKEND=go|c` switch is gone. `build_backend`
+  always builds `src/backend-c`. `CROSS_COMPILE`/`SYSROOT` (renamed from
+  `C_CROSS_COMPILE`/`C_SYSROOT`) and `DEPS_IPK`/`DEPS_APK` (renamed from
+  `C_DEPS_IPK`/`C_DEPS_APK`) are now the only names, unconditional. All 40
+  `config/*/*.config` files had their `GOOS=`/`GOARCH=`/`GOMIPS=`/`GOARM=`/
+  `GO386=` lines stripped — they carry only `PLATFORM=`/`TARGET=` now.
+- `.github/workflows/check.yml`: the Go `check`/`test_backend` jobs are
+  gone; only `test_frontend` remains.
+- `.github/workflows/check-c.yml`: the `differential` job no longer sets
+  up Go — it runs the same `run_diff.sh`, now Go-independent (below).
+- `.github/workflows/build.yml`: the "Set up Go" step is gone. **Critical
+  correctness note**: Go cross-compiled correctly and automatically for
+  every one of the 40 packaging targets via `GOOS`/`GOARCH`, using only
+  the Go toolchain (no per-target sysroot needed for a static Go binary).
+  C has no equivalent — a real target build needs a matching
+  cross-toolchain *and* a sysroot with `libyaml`/`libpcre2`/`libmnl`/
+  `libcurl`/`libcjson` built for that target's libc (Entware glibc /
+  OpenWrt musl), and no such toolchain+sysroot pipeline is wired into this
+  CI (D-37/D-38 already found the upstream Entware/OpenWrt toolchain
+  mirrors blocked; D-38's `ports.ubuntu.com` workaround covers only
+  arm64/armhf/riscv64 dev-lib *headers*, not a full per-target
+  cross-toolchain). Leaving `CROSS_COMPILE`/`SYSROOT` empty and just
+  running `make` in CI, as the old Go-based workflow implicitly could,
+  would silently produce a host-x86_64 binary mislabeled with that
+  target's architecture in the package filename — a correctness bug, not
+  a build failure, and a strictly worse outcome than a build that visibly
+  fails. Rather than accept that risk to keep the CI matrix "green," the
+  "Check cross-toolchain availability" step unconditionally sets
+  `ready=false` for every target with a `::notice::` explaining why, and
+  gates the actual build/package/upload steps on it. This is a deliberate,
+  disclosed regression in CI *build* coverage (40 targets go from
+  "packaged in CI" under Go to "not yet automated" under C) traded for
+  correctness — not a silent drop. Local `make` for a real device target
+  still works exactly as before once a real `CROSS_COMPILE`/`SYSROOT` is
+  supplied by hand; only the CI matrix's blind default is gated.
+- `src/backend-c/tests/differential/`: the entire suite hard-depended on
+  Go as a live comparison oracle (`oracle_go`, `cache_oracle_go`,
+  `dns_gen_go`, `dns_oracle_go`, all via `go.mod` `replace magitrickle =>
+  ../../../../backend`), plus two Phase 1 spikes
+  (`spikes/regex_corpus/oracle_go`, `spikes/yaml_emit/fixture_go`). Before
+  deleting `src/backend`, its live output for every suite (HTTP contract,
+  config-fixture load/save + missing-file defaults, rule matching,
+  subscription parsing, DNS wire dump/stripaaaa/ptrcheck, records cache,
+  regexp2 corpus, yaml.v2 emit) was captured one last time and frozen
+  under `tests/differential/golden/` and
+  `spikes/{regex_corpus,yaml_emit}/golden/` — byte-identical to C's own
+  output at capture time (the last thing D-44's final full-suite rerun
+  verified before this change). `run_diff.sh`, `run_http_diff.sh`, and
+  both spikes' `run.sh` were rewritten to diff the C tool's live output
+  against these golden snapshots instead of a live Go run. All Go oracle
+  directories were deleted. `tests/differential/corpus/dns_corpus.hex`
+  (previously regenerated per-run by the now-deleted `dns_gen_go`, and
+  accordingly gitignored) is now a committed, frozen fixture — the
+  `.gitignore` entry for it was removed.
+
+  This means these suites can no longer catch a *new* Go-vs-C divergence
+  (there is no more Go to diverge from) — they are now regression tests
+  against C's own previously-verified-correct behavior, same role
+  `parity-checklist.md` already assigns to the frozen contract text. A
+  real behavioral regression in the C backend still shows up as a diff
+  against golden/; it just can't be cross-checked against a live
+  reference anymore. This is the expected, disclosed trade-off of
+  completing the rewrite, not an oversight.
+
+- The `match`/`subparse`/`dns`/`cache` live-oracle corpus comparisons were
+  also converted to the same golden-file pattern (rather than dropped)
+  even though `tests/unit/test_match.c`, `test_subparse.c`,
+  `test_dnswire.c`, and `test_dns_cache.c` already carry an independent,
+  hardcoded port of the same Go test corpora — the differential corpus
+  files exercise the tools' CLI/stdin plumbing (`mt-configtool`,
+  `mt-dnstool`, `mt-cachetool`) end-to-end in a way the unit tests don't,
+  so retiring them outright would have been a real (if small) coverage
+  loss, not just redundant cleanup.
+
+**Verification after removal**: with `src/backend` fully absent from the
+working tree, `make CFLAGS_EXTRA=-Werror` (clean build), `make test`
+(unit tests), `make sanitize` (ASan+UBSan), and
+`sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh` (full
+regression suite incl. the rewritten golden-based ones) were all rerun
+from scratch and pass — confirming nothing in the retained test
+infrastructure was silently depending on Go being present.
+
+**Not done in this change, left as an explicit known gap** (already
+disclosed in parity-checklist.md and D-43): no real on-device Entware/
+OpenWrt verification has ever been performed in any phase of this
+rewrite (sandbox has no such hardware or reachable toolchain/feed
+mirror), and the Keenetic RCI hook lookup noted in parity-checklist.md
+was deferred rather than found. Both predate this change and are
+unaffected by it — they are pre-existing residual risk on the C
+implementation itself, not something Go removal introduces or worsens.

@@ -5,15 +5,13 @@ Keep this file free of transient progress notes and benchmark numbers.
 
 ## Project structure
 
-- `src/backend/` — **Go backend (current production implementation).**
-  Module `magitrickle`, entry `cmd/magitrickled/main.go`. It is the
-  reference implementation for the ongoing C rewrite and MUST NOT be
-  removed or behaviourally changed until the rewrite's Phase 9 gate
-  (see `docs/c-rewrite/migration-plan.md`).
-- `src/backend-c/` — C backend (appears from Phase 1 of the rewrite).
+- `src/backend-c/` — **C11 backend (production implementation).** Entry
+  `src/main/main.c`. This was rewritten from a Go implementation
+  (`src/backend/`, removed in Phase 9 once parity was verified — see
+  `docs/c-rewrite/`); there is no Go backend in this repository anymore.
 - `src/frontend/` — Svelte 5 + TypeScript WebUI (Vite build, Deno mock
-  backend in `dev/`, Playwright e2e in `tests/`). Not being rewritten;
-  only confirmed compatibility fixes are allowed, no redesigns.
+  backend in `dev/`, Playwright e2e in `tests/`). Only confirmed
+  compatibility fixes are allowed, no redesigns.
 - `config/entware/*.config`, `config/openwrt/*.config` — the build target
   matrix. This is the single source of truth for supported targets; never
   hand-edit a hardcoded target list elsewhere, never drop a target
@@ -21,16 +19,18 @@ Keep this file free of transient progress notes and benchmark numbers.
 - `files/` — packaging payload (init scripts, default config, hooks) for
   common/entware/entware_kn/openwrt.
 - `tools/bench/` — benchmark tooling (dnsstub, dnsload, genconfig,
-  configbench, run_baseline.sh). Raw results live in
-  `docs/c-rewrite/baseline-raw/`.
-- `docs/c-rewrite/` — C rewrite audit, contracts, plans, decisions.
-  `docs/swagger.yaml` — HTTP API reference.
+  configbench, run_baseline.sh / run_c_baseline.sh). Raw results live in
+  `docs/c-rewrite/baseline-raw*/`.
+- `docs/c-rewrite/` — the rewrite's audit, contracts, plans, and
+  phase-by-phase decisions log (kept as historical record — read
+  `decisions.md` before touching behaviour that traces back to a
+  documented Go-vs-C decision). `docs/swagger.yaml` — HTTP API reference.
 
 ## Build
 
 ```sh
-cp .config.example .config   # choose PLATFORM/TARGET
-make build_backend           # Go binary (later: C binary)
+cp .config.example .config   # choose PLATFORM/TARGET/CROSS_COMPILE/SYSROOT
+make build_backend           # C daemon binary
 make build_frontend          # Svelte dist/
 make package                 # .ipk (Entware/OpenWrt) / .apk (OpenWrt)
 make clean | make clear
@@ -44,11 +44,13 @@ Do not remove or rename the user-facing make targets
 ## Test
 
 ```sh
-cd src/backend
-go vet ./...
-go test ./...                 # main suite
-go test -tags testing ./utils/iptables/   # fake-executable iptables tests
-go test -tags entware_kn ./internal/interfaces/  # Keenetic-specific tests
+cd src/backend-c
+make CFLAGS_EXTRA=-Werror     # build, warnings as errors
+make test                      # unit tests (greatest.h)
+make sanitize                  # ASan+UBSan
+make static_analysis            # clang-tidy + cppcheck
+make fuzz FUZZ_RUNS=200000     # libFuzzer targets
+sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh  # regression suites vs golden/
 
 cd src/frontend
 npm run check                 # svelte-check + tsc
@@ -57,16 +59,15 @@ npm run test:unit             # Deno unit tests
 npm run test:e2e              # Playwright (needs built/mocked backend)
 ```
 
-Benchmarks: `sh tools/bench/run_baseline.sh` (root; see script header for
+Benchmarks: `sh tools/bench/run_c_baseline.sh` (root; see script header for
 requirements and env vars).
 
 ## Formatting / style
 
-- Go: gofmt (implicit); do not reformat unrelated files.
+- C: C11; warning set and `make sanitize`/`make static_analysis` defined
+  in `src/backend-c/`; GNU/Linux extensions only inside the platform
+  layer.
 - Frontend: Prettier via `npm run format`.
-- C (from Phase 1): C11; warning set and `make sanitize`/
-  `make static_analysis` defined in `src/backend-c/`; GNU/Linux extensions
-  only inside the platform layer.
 
 ## Target platforms & compatibility constraints
 
@@ -83,19 +84,23 @@ requirements and env vars).
   mips targets are first-class.
 - Binary/package size is NOT an optimization goal.
 
-## C rewrite ground rules
+## Backend behaviour contracts
 
-1. Phase order is defined in `docs/c-rewrite/migration-plan.md`; do not
-   skip phases or start later-phase work early without updating the plan.
-2. The Go backend is the behavioural oracle. Behaviour contracts live in
-   `docs/c-rewrite/compatibility-contract.md`; check them before changing
+The Go→C rewrite is complete (`docs/c-rewrite/migration-plan.md` Phase 9);
+these rules keep the C backend's behaviour from silently drifting from the
+contracts it was verified against:
+
+1. Behaviour contracts live in `docs/c-rewrite/compatibility-contract.md`
+   and `docs/c-rewrite/parity-checklist.md`; check them before changing
    anything observable, and record intentional divergences in
    `docs/c-rewrite/decisions.md` — never diverge silently.
-3. **Do not delete the Go backend, its tests, or its CI** until every
-   condition in migration-plan Phase 9 / spec §23 is met; removal is its
-   own separate change.
-4. No performance claims without `tools/bench` measurements attached.
-5. Config YAML field names, defaults, API routes/status codes, ipset/chain
+2. Regression suites in `src/backend-c/tests/differential/` compare live
+   C output against `golden/` snapshots frozen from the last verified
+   Go-vs-C run (see `decisions.md` D-45). A real regression still shows
+   up as a diff; update golden files only alongside a documented,
+   intentional behaviour change.
+3. No performance claims without `tools/bench` measurements attached.
+4. Config YAML field names, defaults, API routes/status codes, ipset/chain
    naming (`mt_`/`MT_` prefixes), and file paths are frozen contracts.
 
 ## Git etiquette

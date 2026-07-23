@@ -74,9 +74,8 @@ ifeq ($(PLATFORM),entware)
 	USRSHARE_DIR := $(ROOT_DIR)/opt/usr/share
 	STATE_DIR := $(ROOT_DIR)/opt/var/lib/magitrickle
 
-	GO_TAGS += entware
 	ifeq ($(filter %_kn,$(TARGET)),$(TARGET))
-		GO_TAGS += entware_kn
+		ENTWARE_KN := 1
 	endif
 endif
 
@@ -86,8 +85,6 @@ ifeq ($(PLATFORM),openwrt)
 	LIB_DIR := $(ROOT_DIR)/lib
 	USRSHARE_DIR := $(ROOT_DIR)/usr/share
 	STATE_DIR := $(ROOT_DIR)/etc/magitrickle/state
-
-	GO_TAGS += openwrt
 endif
 
 IPK_DIR := $(BUILD_DIR)/ipk
@@ -97,59 +94,39 @@ APK_DIR := $(BUILD_DIR)/apk
 
 # Build properties
 
-GO_FLAGS := \
-	$(if $(GOOS),GOOS="$(GOOS)") \
-	$(if $(GOARCH),GOARCH="$(GOARCH)") \
-	$(if $(GOMIPS),GOMIPS="$(GOMIPS)") \
-	$(if $(GOARM),GOARM="$(GOARM)") \
-	$(if $(GO386),GO386="$(GO386)") \
+# Cross-toolchain prefix (passed straight to src/backend-c/Makefile's
+# CROSS_COMPILE) and the sysroot providing the 5 feed deps (libyaml,
+# cJSON, PCRE2, libmnl, libcurl) built for that target/libc. Empty means
+# host-native gcc -- correct only when TARGET actually matches the build
+# host's own architecture (e.g. local dev, or a real per-target CI runner
+# image). See docs/c-rewrite/toolchains.md for the real Entware/OpenWrt
+# toolchain descriptors and decisions.md D-45 for which targets have
+# actually been built+verified this way (only a handful of glibc proxies
+# via Ubuntu's own cross packages, in a sandbox -- not real Entware/
+# OpenWrt toolchains, which were never reachable from this branch's
+# development environment; see D-37/D-38/D-40).
+CROSS_COMPILE ?=
+SYSROOT ?=
 
-GO_PARAMS = -v -trimpath -ldflags="-X 'magitrickle/constant.Version=$(PKG_VERSION)' -w -s" $(if $(GO_TAGS),-tags "$(GO_TAGS)")
-
-# Backend language switch (migration-plan.md Phase 8: build_backend gains a
-# real C path). Default stays `go` so every existing config/*/*.config
-# target (and CI's build matrix) keeps building exactly as before --
-# flipping a target to `c` requires a real cross-toolchain descriptor
-# (C_CROSS_COMPILE/C_SYSROOT below), which only exists today for targets
-# validated in docs/c-rewrite/toolchains.md's Phase 8 section. This is a
-# deliberate, per-target opt-in, not a project-wide cutover: real Entware/
-# OpenWrt toolchain+feed sysroots for the other targets are not available
-# to build or verify against yet (see decisions.md D-37).
-BACKEND ?= go
-
-# Only meaningful when BACKEND=c: cross-toolchain prefix (passed straight
-# to src/backend-c/Makefile's CROSS_COMPILE) and the sysroot providing the
-# 5 feed deps (libyaml, cJSON, PCRE2, libmnl, libcurl) built for that
-# target/libc. Empty means host-native gcc -- correct only when TARGET
-# actually matches the build host's own architecture (e.g. local dev).
-C_CROSS_COMPILE ?=
-C_SYSROOT ?=
-
-# Runtime library deps the C backend needs that the Go binary doesn't
+# Runtime library deps the C backend links that the old Go binary didn't
 # (libyaml, cJSON, PCRE2, libmnl, libcurl -- see
 # docs/c-rewrite/dependencies.md, confirmed available in both feeds during
 # the Phase 0 audit). Package NAMES below are this project's best-effort
 # reading of each feed's naming convention (lib-prefixed, unversioned,
 # matching the existing Depends entries below) -- NOT verified against a
-# live Entware/OpenWrt feed index from this sandbox (same egress block as
-# decisions.md D-37/D-38). Confirm against a real feed index (or a real
-# device's `opkg`/`apk` search) before shipping a BACKEND=c package.
+# live Entware/OpenWrt feed index (same egress block as decisions.md
+# D-37/D-38). Confirm against a real feed index (or a real device's
+# `opkg`/`apk` search) before shipping a package.
 # ipk Depends: fields are comma-separated (both platforms); apk's
 # `-I "depends:..."` is space-separated -- same 5 packages, two formats.
-C_DEPS_IPK := libyaml, libpcre2, libmnl, libcurl, libcjson
-C_DEPS_APK := libyaml libpcre2 libmnl libcurl libcjson
+DEPS_IPK := libyaml, libpcre2, libmnl, libcurl, libcjson
+DEPS_APK := libyaml libpcre2 libmnl libcurl libcjson
 
 # Incremental data
 
-ifeq ($(BACKEND),go)
-BACKEND_DEPENDENCIES := ./src/backend/go.mod ./src/backend/go.sum
-BACKEND_SOURCES := $(shell find ./src/backend -type f -name '*.go' 2>/dev/null)
-BACKEND_SOURCES += $(BACKEND_DEPENDENCIES)
-else
 BACKEND_DEPENDENCIES :=
 BACKEND_SOURCES := $(shell find ./src/backend-c/src ./src/backend-c/include -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null)
-endif
-BACKEND_BUILD_PROPERTIES := BACKEND=\"$(BACKEND)\" PLATFORM=\"$(PLATFORM)\" TARGET=\"$(TARGET)\" GOOS=\"$(GOOS)\" GOARCH=\"$(GOARCH)\" GOMIPS=\"$(GOMIPS)\" GOARM=\"$(GOARM)\" GO386=\"$(GO386)\" GO_TAGS=\"$(GO_TAGS)\" PKG_VERSION=\"$(PKG_VERSION)\" C_CROSS_COMPILE=\"$(C_CROSS_COMPILE)\" C_SYSROOT=\"$(C_SYSROOT)\"
+BACKEND_BUILD_PROPERTIES := PLATFORM=\"$(PLATFORM)\" TARGET=\"$(TARGET)\" PKG_VERSION=\"$(PKG_VERSION)\" CROSS_COMPILE=\"$(CROSS_COMPILE)\" SYSROOT=\"$(SYSROOT)\" ENTWARE_KN=\"$(ENTWARE_KN)\"
 
 FRONTEND_DEPENDENCIES := ./src/frontend/package.json ./src/frontend/package-lock.json
 FRONTEND_SOURCES := $(shell find ./src/frontend/src -type f 2>/dev/null)
@@ -166,7 +143,7 @@ BUILD_KEY_APK_PUB ?= public-key.pem
 # Targets
 #
 
-.PHONY: _return_export_dynamic_env all clear clean download download_backend download_frontend redownload redownload_backend redownload_frontend build build_backend build_backend_c build_frontend rebuild rebuild_backend rebuild_frontend prepare_files package package_ipk FORCE
+.PHONY: _return_export_dynamic_env all clear clean download download_backend download_frontend redownload redownload_backend redownload_frontend build build_backend build_frontend rebuild rebuild_backend rebuild_frontend prepare_files package package_ipk FORCE
 
 all: download build package
 
@@ -198,10 +175,6 @@ build: build_backend build_frontend
 # Backend
 
 $(STAMPS_DIR)/download-backend: $(BACKEND_DEPENDENCIES)
-ifeq ($(BACKEND),go)
-	cd ./src/backend && go mod tidy
-endif
-
 	@mkdir -p $(STAMPS_DIR)
 	@touch "$(STAMPS_DIR)/download-backend"
 
@@ -217,32 +190,16 @@ $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME): FORCE
 
 $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME): $(STAMPS_DIR)/download-backend $(BACKEND_SOURCES) $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME)
 	mkdir -p "$(COMPILE_DIR)"
-ifeq ($(BACKEND),go)
-	cd ./src/backend && $(GO_FLAGS) go build $(GO_PARAMS) -o "../../$(COMPILE_DIR)/magitrickled" ./cmd/magitrickled
-ifneq ($(filter $(GOARCH),riscv64 mips64 mips64le loong64),$(GOARCH))
-	upx -9 --lzma "$(COMPILE_DIR)/magitrickled"
-endif
-else
 	$(MAKE) -C ./src/backend-c BUILD="$(UNIQUE_NAME)" MT_VERSION="$(PKG_VERSION)" \
-	    $(if $(C_CROSS_COMPILE),CROSS_COMPILE="$(C_CROSS_COMPILE)") \
-	    $(if $(C_SYSROOT),SYSROOT="$(C_SYSROOT)") \
-	    $(if $(filter entware,$(PLATFORM)), $(if $(filter %_kn,$(TARGET)), ENTWARE_KN=1))
+	    $(if $(CROSS_COMPILE),CROSS_COMPILE="$(CROSS_COMPILE)") \
+	    $(if $(SYSROOT),SYSROOT="$(SYSROOT)") \
+	    $(if $(ENTWARE_KN),ENTWARE_KN=1)
 	cp "./src/backend-c/build/$(UNIQUE_NAME)/magitrickled-c" "$(COMPILE_DIR)/magitrickled"
-endif
 
 	@mkdir -p $(STAMPS_DIR)
 	@touch "$(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)"
 
 build_backend: $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)
-
-# Host-native C backend dev build, unrelated to the packaging BACKEND
-# switch above -- a thin alias kept for the entrypoint D-01 introduced in
-# Phase 1 ("parallel build_backend_c until switchover"). Equivalent to
-# `make BACKEND=c build_backend` with the current PLATFORM/TARGET, but
-# skips CROSS_COMPILE/SYSROOT (host gcc only) -- for local iteration, not
-# packaging a real cross target.
-build_backend_c:
-	$(MAKE) build_backend BACKEND=c
 
 rebuild_backend:
 	@rm -f "$(STAMPS_DIR)/build-backend"
@@ -331,21 +288,14 @@ package_ipk: prepare_files
 	echo 'Section: net' >> $(IPK_CONTROL_DIR)/control
 	echo 'Priority: optional' >> $(IPK_CONTROL_DIR)/control
 ifeq ($(PLATFORM),entware)
-	@DEPS="libc, iptables"; \
+	@DEPS="libc, iptables, $(DEPS_IPK)"; \
 	if echo "$(TARGET)" | grep -q '_kn$$'; then \
 		DEPS="$$DEPS, socat"; \
-	fi; \
-	if [ "$(BACKEND)" = "c" ]; then \
-		DEPS="$$DEPS, $(C_DEPS_IPK)"; \
 	fi; \
 	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
 endif
 ifeq ($(PLATFORM),openwrt)
-	@DEPS="libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft"; \
-	if [ "$(BACKEND)" = "c" ]; then \
-		DEPS="$$DEPS, $(C_DEPS_IPK)"; \
-	fi; \
-	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
+	echo "Depends: libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft, $(DEPS_IPK)" >> $(IPK_CONTROL_DIR)/control
 endif
 
 	tar -C "$(IPK_CONTROL_DIR)" -czvf "$(IPK_DIR)/control.tar.gz" --owner=0 --group=0 .
@@ -378,7 +328,7 @@ package_apk: prepare_files $(BUILD_KEY_APK_SEC)
 		-I "maintainer:$(PKG_MAINTAINER)" \
 		-I "url:$(PKG_URL)" \
 		-I "provider-priority:100" \
-		-I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft$(if $(filter c,$(BACKEND)), $(C_DEPS_APK))" \
+		-I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft $(DEPS_APK)" \
 		-s "post-install:$(APK_DIR)/post-install.sh" \
 		-s "pre-deinstall:$(APK_DIR)/pre-deinstall.sh" \
 		-s "post-upgrade:$(APK_DIR)/post-upgrade.sh" \

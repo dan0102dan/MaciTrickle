@@ -1,37 +1,40 @@
 #!/bin/sh
-# Differential test runner: Go reference backend vs C implementation.
+# Differential/regression test runner (C only; see decisions.md D-45).
+#
+# Through Phase 8, every suite here compared the real Go reference
+# backend against the C implementation. src/backend (Go) was removed in
+# Phase 9 once the compatibility contract was signed off
+# (parity-checklist.md) — these suites now compare the C
+# implementation's live output against golden/ snapshots frozen from the
+# last Go-vs-C run (captured byte-identical, immediately before removal),
+# so a real regression in C's own behavior still shows up as a diff.
 #
 # Suites:
-#   regex    — regexp2 vs PCRE2 corpus (Phase 1 spike; known divergences
-#              frozen in spikes/regex_corpus/known_divergences.tsv)
-#   yaml     — libyaml emit shape vs go-yaml v2 (Phase 1 spike)
-#   config   — load+save cross-comparison over fixtures/ (Phase 2):
-#              for every fixture, Go (real App.LoadConfig+SaveConfig) and
-#              C (mt-configtool resave) must produce byte-identical output
-#              (or both fail), plus C-save must reload cleanly in Go
-#   match    — rule matching corpus (models.Rule.IsMatch vs mt_rule_matcher)
-#   subparse — subscription list parsing corpus
-#   dns      — DNS wire corpus (miekg/dns vs mt-dnstool: dump/stripaaaa/ptrcheck)
-#   cache    — records cache script (recordsCache vs mt_cache; structural
-#              comparison only, see cache_oracle_go for why)
-#   http     — Phase 6 HTTP API contract: runs the real Go daemon and
-#              magitrickled-c against byte-identical scratch configs,
-#              drives each through the same fixed request sequence
-#              (http_contract/contract.py), diffs the traces (see
-#              run_http_diff.sh for what's normalized/redacted and why)
+#   regex    — PCRE2 corpus vs golden/regexp2.tsv (regexp2 oracle output,
+#              frozen; 3 known divergences documented in decisions.md D-07
+#              and spikes/regex_corpus/known_divergences.tsv)
+#   yaml     — libyaml emit vs golden/go-yaml-v2.yaml (Phase 1 spike)
+#   config   — mt-configtool resave over fixtures/*.yaml vs
+#              golden/config-fixtures/*.golden.yaml (Phase 2)
+#   match    — mt-configtool match corpus vs golden/match.golden.tsv
+#   subparse — mt-configtool subparse corpus vs golden/subparse.golden.txt
+#   dns      — mt-dnstool dump/stripaaaa/ptrcheck vs golden/dns.*.golden.txt
+#   cache    — mt-cachetool script vs golden/cache.golden.txt
+#   http     — Phase 6 HTTP API contract vs golden/http_contract.trace
+#              (see run_http_diff.sh for what's normalized/redacted and why)
 #
-# Requires root for the config and http suites (the Go oracle/daemon
-# exercise real /var/lib/magitrickle, real iptables). Exit non-zero on
-# any unexpected divergence.
+# Requires root for the http suite (real /var/lib/magitrickle, real
+# iptables). Exit non-zero on any unexpected divergence.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_C_DIR="$(cd "$DIR/../.." && pwd)"
 OUT="$DIR/out"
+GOLDEN="$DIR/golden"
 mkdir -p "$OUT"
 
 fail=0
 
-echo "== differential: regex (regexp2 vs PCRE2)"
+echo "== differential: regex (PCRE2 vs golden regexp2.tsv)"
 if ! sh "$BACKEND_C_DIR/spikes/regex_corpus/run.sh"; then
     KNOWN="$BACKEND_C_DIR/spikes/regex_corpus/known_divergences.tsv"
     ACTUAL_NORM="$BACKEND_C_DIR/spikes/regex_corpus/out/divergence.norm"
@@ -46,7 +49,7 @@ if ! sh "$BACKEND_C_DIR/spikes/regex_corpus/run.sh"; then
     fi
 fi
 
-echo "== differential: yaml emit (yaml.v2 vs libyaml)"
+echo "== differential: yaml emit (libyaml vs golden go-yaml-v2.yaml)"
 if ! sh "$BACKEND_C_DIR/spikes/yaml_emit/run.sh"; then
     fail=1
 fi
@@ -55,109 +58,81 @@ echo "== differential: building tools"
 ( cd "$BACKEND_C_DIR" && make >/dev/null )
 CONFIGTOOL="$BACKEND_C_DIR/build/host/mt-configtool"
 DNSTOOL="$BACKEND_C_DIR/build/host/mt-dnstool"
-( cd "$DIR/oracle_go" && go mod tidy >/dev/null 2>&1 && \
-  go build -ldflags "-X 'magitrickle/constant.Version=0.99.0'" \
-      -o "$OUT/oracle" . )
-ORACLE="$OUT/oracle"
+CACHETOOL="$BACKEND_C_DIR/build/host/mt-cachetool"
 
-echo "== differential: config load/save fixtures"
+echo "== differential: config load/save fixtures (vs golden)"
 for fixture in "$DIR"/fixtures/*.yaml; do
     name=$(basename "$fixture" .yaml)
-    "$ORACLE" resave "$fixture" > "$OUT/$name.go.yaml"
+    golden="$GOLDEN/config-fixtures/$name.golden.yaml"
     "$CONFIGTOOL" resave "$fixture" 0.99.0 > "$OUT/$name.c.yaml"
-    if ! diff -u "$OUT/$name.go.yaml" "$OUT/$name.c.yaml" \
-         > "$OUT/$name.diff" 2>&1; then
-        echo "   DIVERGENCE in $name:"
+    if ! diff -u "$golden" "$OUT/$name.c.yaml" > "$OUT/$name.diff" 2>&1; then
+        echo "   REGRESSION in $name (vs golden):"
         head -20 "$OUT/$name.diff"
         fail=1
     else
         echo "   $name: OK"
     fi
-    # cross: C output must reload identically through Go (skip failures)
-    if ! grep -q '^ERROR$' "$OUT/$name.c.yaml"; then
-        "$ORACLE" resave "$OUT/$name.c.yaml" > "$OUT/$name.cross.yaml"
-        if ! diff -u "$OUT/$name.go.yaml" "$OUT/$name.cross.yaml" \
-             > "$OUT/$name.cross.diff" 2>&1; then
-            echo "   CROSS-RELOAD divergence in $name"
-            head -10 "$OUT/$name.cross.diff"
-            fail=1
-        fi
-    fi
 done
 
-echo "== differential: missing-file behaviour (defaults)"
-"$ORACLE" resave -missing- > "$OUT/missing.go.yaml"
+echo "== differential: missing-file behaviour (defaults, vs golden)"
 "$CONFIGTOOL" resave /nonexistent/config.yaml 0.99.0 > "$OUT/missing.c.yaml"
-if ! diff -u "$OUT/missing.go.yaml" "$OUT/missing.c.yaml" \
+if ! diff -u "$GOLDEN/config-fixtures/missing.golden.yaml" "$OUT/missing.c.yaml" \
      > "$OUT/missing.diff" 2>&1; then
-    echo "   DIVERGENCE in defaults:"
+    echo "   REGRESSION in defaults (vs golden):"
     head -20 "$OUT/missing.diff"
     fail=1
 else
     echo "   defaults: OK"
 fi
 
-echo "== differential: rule matching corpus"
-"$ORACLE" match < "$DIR/corpus/match_corpus.tsv" > "$OUT/match.go.tsv"
+echo "== differential: rule matching corpus (vs golden)"
 "$CONFIGTOOL" match < "$DIR/corpus/match_corpus.tsv" > "$OUT/match.c.tsv"
-if ! diff -u "$OUT/match.go.tsv" "$OUT/match.c.tsv" \
+if ! diff -u "$GOLDEN/match.golden.tsv" "$OUT/match.c.tsv" \
      > "$OUT/match.diff" 2>&1; then
-    echo "   DIVERGENCE:"
+    echo "   REGRESSION (vs golden):"
     cat "$OUT/match.diff"
     fail=1
 else
-    echo "   $(grep -c . "$OUT/match.go.tsv") cases: OK"
+    echo "   $(grep -c . "$OUT/match.c.tsv") cases: OK"
 fi
 
-echo "== differential: subscription parse corpus"
-"$ORACLE" subparse < "$DIR/corpus/subparse_corpus.txt" > "$OUT/subparse.go.txt"
+echo "== differential: subscription parse corpus (vs golden)"
 "$CONFIGTOOL" subparse < "$DIR/corpus/subparse_corpus.txt" > "$OUT/subparse.c.txt"
-if ! diff -u "$OUT/subparse.go.txt" "$OUT/subparse.c.txt" \
+if ! diff -u "$GOLDEN/subparse.golden.txt" "$OUT/subparse.c.txt" \
      > "$OUT/subparse.diff" 2>&1; then
-    echo "   DIVERGENCE:"
+    echo "   REGRESSION (vs golden):"
     cat "$OUT/subparse.diff"
     fail=1
 else
-    echo "   $(grep -c . "$OUT/subparse.go.txt") rules: OK"
+    echo "   $(grep -c . "$OUT/subparse.c.txt") rules: OK"
 fi
 
-echo "== differential: DNS wire corpus (miekg/dns vs C)"
-( cd "$DIR/dns_gen_go" && go mod tidy >/dev/null 2>&1 && go run . ) \
-    > "$DIR/corpus/dns_corpus.hex"
-( cd "$DIR/dns_oracle_go" && go mod tidy >/dev/null 2>&1 && \
-  go build -o "$OUT/dns_oracle" . )
-DNS_ORACLE="$OUT/dns_oracle"
+echo "== differential: DNS wire corpus (vs golden)"
 DNS_CORPUS="$DIR/corpus/dns_corpus.hex"
 for mode in dump stripaaaa ptrcheck; do
-    "$DNS_ORACLE" "$mode" < "$DNS_CORPUS" > "$OUT/dns.$mode.go.txt"
     "$DNSTOOL" "$mode" < "$DNS_CORPUS" > "$OUT/dns.$mode.c.txt"
-    if ! diff -u "$OUT/dns.$mode.go.txt" "$OUT/dns.$mode.c.txt" \
+    if ! diff -u "$GOLDEN/dns.$mode.golden.txt" "$OUT/dns.$mode.c.txt" \
          > "$OUT/dns.$mode.diff" 2>&1; then
-        echo "   DNS $mode DIVERGENCE:"
+        echo "   DNS $mode REGRESSION (vs golden):"
         head -30 "$OUT/dns.$mode.diff"
         fail=1
     else
-        echo "   dns $mode: $(grep -c '^===' "$OUT/dns.$mode.go.txt") messages: OK"
+        echo "   dns $mode: $(grep -c '^===' "$OUT/dns.$mode.c.txt") messages: OK"
     fi
 done
 
-echo "== differential: DNS records cache (recordsCache vs mt_cache)"
-CACHETOOL="$BACKEND_C_DIR/build/host/mt-cachetool"
-( cd "$DIR/cache_oracle_go" && go mod tidy >/dev/null 2>&1 && \
-  go build -o "$OUT/cache_oracle" . )
-CACHE_ORACLE="$OUT/cache_oracle"
+echo "== differential: DNS records cache (vs golden)"
 CACHE_SCRIPT="$DIR/corpus/cache_script.txt"
-"$CACHE_ORACLE" < "$CACHE_SCRIPT" > "$OUT/cache.go.txt"
 "$CACHETOOL" < "$CACHE_SCRIPT" > "$OUT/cache.c.txt"
-if ! diff -u "$OUT/cache.go.txt" "$OUT/cache.c.txt" > "$OUT/cache.diff" 2>&1; then
-    echo "   DIVERGENCE:"
+if ! diff -u "$GOLDEN/cache.golden.txt" "$OUT/cache.c.txt" > "$OUT/cache.diff" 2>&1; then
+    echo "   REGRESSION (vs golden):"
     cat "$OUT/cache.diff"
     fail=1
 else
-    echo "   $(grep -c . "$OUT/cache.go.txt") queries: OK"
+    echo "   $(grep -c . "$OUT/cache.c.txt") queries: OK"
 fi
 
-echo "== differential: HTTP API contract (Phase 6, Go daemon vs magitrickled-c)"
+echo "== differential: HTTP API contract (vs golden)"
 if ! sh "$DIR/run_http_diff.sh"; then
     fail=1
 fi

@@ -18,7 +18,7 @@ with tests green, cross-build green, docs updated, report delivered.
 | 6 — API/WebUI | **done (this branch)** — see phase-6-report.md |
 | 7 — subscriptions/integration | **done (this branch)** — see phase-7-report.md |
 | 8 — packaging | **done (this branch)** — see phase-8-report.md |
-| 9 — optimization & Go removal | not started |
+| 9 — optimization & Go removal | **done (this branch)** — see phase-9-report.md |
 
 ## Phase 1 — foundation
 

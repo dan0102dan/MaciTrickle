@@ -1,23 +1,27 @@
 #!/bin/sh
-# HTTP API contract differential test (Phase 6, task #37): runs the real
-# Go daemon and magitrickled-c against byte-identical scratch configs,
-# drives each through the SAME fixed sequence of HTTP/Unix-socket
-# requests (http_contract/contract.py), and diffs the two resulting
-# traces. Every mutating request in the sequence supplies its own
-# explicit IDs, so a passing run means byte-identical (not just
-# structurally-equivalent) status codes and JSON bodies across both
-# backends for every step -- see http_contract/contract.py's docstring.
+# HTTP API contract regression test. Originally a Go-vs-C differential
+# (Phase 6, task #37): ran the real Go daemon and magitrickled-c against
+# byte-identical scratch configs, drove each through the same fixed
+# request sequence (http_contract/contract.py), and diffed the two
+# traces -- the last such run (golden/http_contract.trace, captured
+# immediately before Go was removed in Phase 9) was byte-identical
+# across both backends, 44/44 steps. Now that src/backend (Go) is gone,
+# this compares magitrickled-c's live trace against that golden
+# snapshot instead: a real behavioral regression in the C daemon's HTTP
+# surface still shows up as a diff, it just can no longer be checked
+# against a live Go reference. See decisions.md D-45 for the full
+# rationale and docs/c-rewrite/compatibility-contract.md +
+# parity-checklist.md for what was verified while Go was still present.
 #
-# Requires root (same as the "config" suite in run_diff.sh: real
-# /var/lib/magitrickle/config.yaml, real iptables). Temporarily
-# overwrites /var/lib/magitrickle/config.yaml (Go's config path is
-# hard-coded, no CLI override) -- any pre-existing file there is backed
-# up and restored on exit. Also requires python3 (stdlib only).
+# Requires root (real /var/lib/magitrickle/config.yaml, real iptables).
+# Temporarily overwrites /var/lib/magitrickle/config.yaml -- any
+# pre-existing file there is backed up and restored on exit. Also
+# requires python3 (stdlib only).
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_C_DIR="$(cd "$DIR/../.." && pwd)"
-BACKEND_GO_DIR="$(cd "$BACKEND_C_DIR/../backend" && pwd)"
 OUT="$DIR/out"
+GOLDEN="$DIR/golden/http_contract.trace"
 mkdir -p "$OUT"
 
 REAL_CONFIG=/var/lib/magitrickle/config.yaml
@@ -28,10 +32,8 @@ DNS_PORT=13595
 SOCK=/var/run/magitrickle.sock
 PIDFILE=/var/run/magitrickle.pid
 
-GO_PID=
 C_PID=
 cleanup() {
-    [ -n "$GO_PID" ] && kill "$GO_PID" 2>/dev/null || true
     [ -n "$C_PID" ] && kill "$C_PID" 2>/dev/null || true
     if [ -f "$REAL_CONFIG_BACKUP" ]; then
         cp "$REAL_CONFIG_BACKUP" "$REAL_CONFIG"
@@ -88,9 +90,6 @@ groups: []
 subscriptions: []
 EOF
 
-echo "== building Go daemon"
-( cd "$BACKEND_GO_DIR" && go build -o "$OUT/magitrickled-go" ./cmd/magitrickled )
-
 echo "== building C daemon"
 ( cd "$BACKEND_C_DIR" && make build/host/magitrickled-c >/dev/null )
 C_BIN="$BACKEND_C_DIR/build/host/magitrickled-c"
@@ -105,26 +104,10 @@ wait_for_port() {
     return 1
 }
 
-echo "== running contract against Go daemon"
+echo "== running contract against C daemon"
 mkdir -p /var/lib/magitrickle
 cp "$SCRATCH_CONFIG" "$REAL_CONFIG"
 rm -f "$SOCK" "$PIDFILE"
-"$OUT/magitrickled-go" > "$OUT/go_daemon.log" 2>&1 &
-GO_PID=$!
-if ! wait_for_port; then
-    echo "Go daemon failed to start:"; cat "$OUT/go_daemon.log"; exit 1
-fi
-python3 "$DIR/http_contract/contract.py" 127.0.0.1 "$PORT" "$SOCK" > "$OUT/go.trace" 2> "$OUT/go_contract.err"
-CONTRACT_STATUS=$?
-kill "$GO_PID" 2>/dev/null || true
-wait "$GO_PID" 2>/dev/null || true
-GO_PID=
-if [ "$CONTRACT_STATUS" -ne 0 ]; then
-    echo "contract run against Go failed:"; cat "$OUT/go_contract.err"; exit 1
-fi
-rm -f "$SOCK" "$PIDFILE"
-
-echo "== running contract against C daemon"
 "$C_BIN" --config "$SCRATCH_CONFIG" > "$OUT/c_daemon.log" 2>&1 &
 C_PID=$!
 if ! wait_for_port; then
@@ -139,11 +122,11 @@ if [ "$CONTRACT_STATUS" -ne 0 ]; then
     echo "contract run against C failed:"; cat "$OUT/c_contract.err"; exit 1
 fi
 
-echo "== diffing traces"
-if diff -u "$OUT/go.trace" "$OUT/c.trace" > "$OUT/http_contract.diff"; then
-    echo "   HTTP contract: OK ($(grep -c '^STEP' "$OUT/go.trace") steps)"
+echo "== diffing against golden trace"
+if diff -u "$GOLDEN" "$OUT/c.trace" > "$OUT/http_contract.diff"; then
+    echo "   HTTP contract: OK ($(grep -c '^STEP' "$GOLDEN") steps)"
 else
-    echo "   HTTP CONTRACT DIVERGENCE:"
+    echo "   HTTP CONTRACT REGRESSION (vs golden/http_contract.trace):"
     cat "$OUT/http_contract.diff"
     exit 1
 fi

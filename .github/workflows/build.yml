@@ -63,21 +63,34 @@ jobs:
         with:
           node-version: 22
 
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '1.23'
-
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fakeroot upx
+          sudo apt-get install -y fakeroot
 
       - name: Install apk-tools
         run: |
           docker run --rm -v /usr/local/bin:/mnt alpine:edge sh -c "apk add --no-cache apk-tools-static && cp /sbin/apk.static /mnt/apk && chmod +x /mnt/apk"
 
+      - name: Check cross-toolchain availability
+        id: toolchain
+        run: |
+          cp "${{ matrix.config }}" .config
+          . ./.config
+          # No real per-target Entware/OpenWrt cross-toolchain + feed
+          # sysroot (libyaml/cJSON/PCRE2/libmnl/libcurl built for that
+          # target's libc) is wired into this CI yet -- see
+          # docs/c-rewrite/toolchains.md and decisions.md D-45. Building
+          # without one would either fail outright or, worse, silently
+          # produce a host-x86_64 binary mislabeled as this target's
+          # architecture. So every target is explicitly marked
+          # not-yet-automated here (a known, documented gap, not a
+          # silent drop) until real toolchains are provisioned.
+          echo "::notice title=${{ matrix.name }}::Packaging for this target is not yet automated in CI: no real Entware/OpenWrt cross-toolchain + feed sysroot is provisioned for PLATFORM=$PLATFORM TARGET=$TARGET. See docs/c-rewrite/toolchains.md and decisions.md D-45. Skipping this job's build step."
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+
       - name: Build and package
+        if: steps.toolchain.outputs.ready == 'true'
         env:
           BUILD_KEY_APK_SEC_CONTENT: ${{ secrets.BUILD_KEY_APK_SEC }}
         run: |
@@ -92,6 +105,7 @@ jobs:
 
       - name: Collect package files
         id: package_outputs
+        if: steps.toolchain.outputs.ready == 'true'
         run: |
           mapfile -t packages < <(
             find .build -maxdepth 1 -type f \( -name "magitrickle_*.ipk" -o -name "magitrickle_*.apk" \) | sort
