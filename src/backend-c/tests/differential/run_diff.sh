@@ -14,9 +14,15 @@
 #   dns      — DNS wire corpus (miekg/dns vs mt-dnstool: dump/stripaaaa/ptrcheck)
 #   cache    — records cache script (recordsCache vs mt_cache; structural
 #              comparison only, see cache_oracle_go for why)
+#   http     — Phase 6 HTTP API contract: runs the real Go daemon and
+#              magitrickled-c against byte-identical scratch configs,
+#              drives each through the same fixed request sequence
+#              (http_contract/contract.py), diffs the traces (see
+#              run_http_diff.sh for what's normalized/redacted and why)
 #
-# Requires root for the config suite (the Go oracle exercises the real
-# /var/lib/magitrickle path). Exit non-zero on any unexpected divergence.
+# Requires root for the config and http suites (the Go oracle/daemon
+# exercise real /var/lib/magitrickle, real iptables). Exit non-zero on
+# any unexpected divergence.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_C_DIR="$(cd "$DIR/../.." && pwd)"
@@ -149,6 +155,11 @@ if ! diff -u "$OUT/cache.go.txt" "$OUT/cache.c.txt" > "$OUT/cache.diff" 2>&1; th
     fail=1
 else
     echo "   $(grep -c . "$OUT/cache.go.txt") queries: OK"
+fi
+
+echo "== differential: HTTP API contract (Phase 6, Go daemon vs magitrickled-c)"
+if ! sh "$DIR/run_http_diff.sh"; then
+    fail=1
 fi
 
 exit $fail

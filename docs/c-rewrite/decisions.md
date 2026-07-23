@@ -761,3 +761,87 @@ groups/system smoke test from D-27.
 
 25 unit-test binaries (up from 24), static analysis, and sanitizers all
 clean.
+
+## D-29: HTTP API contract differential suite (Go daemon vs magitrickled-c)
+
+Adds a new differential suite (`tests/differential/http_contract/
+contract.py` + `tests/differential/run_http_diff.sh`, wired into the
+master `run_diff.sh` as its final step) that runs the *real* Go daemon
+binary and the real `magitrickled-c` binary against byte-identical
+scratch configs and drives each through the same fixed sequence of 37
+HTTP/Unix-socket requests covering everything built in Phase 6 tasks
+#31-36 (auth status, full group/rule CRUD including bulk `PUT`,
+`system/interfaces`/`config/save`/`hooks/netfilterd`, subscriptions
+CRUD, and a Unix-socket spot check), then diffs the two resulting
+traces textually. This is the first suite in the project that stands up
+two full, real daemon processes rather than invoking one-shot CLI
+oracles — a different shape of test from every earlier phase's
+differential work, so several new problems had to be solved:
+
+**Go's config path has no CLI override.** Every earlier differential
+suite drives Go through small single-purpose `oracle_go`
+tools/`App.LoadConfig`+`SaveConfig` calls with paths passed as
+arguments. The real Go daemon (`cmd/magitrickled`) has no such
+flexibility: `cfgFileLocation` is `constant.AppStateDir +
+"/config.yaml"`, a hard-coded constant, unlike the C daemon's `--config`
+flag. `run_http_diff.sh` therefore backs up whatever is currently at
+`/var/lib/magitrickle/config.yaml` (this sandbox already had a stale
+`0.99.0` file left over from the `config` suite's own oracle runs),
+overwrites it with the scratch config for the Go run, and restores the
+backup (or removes the file if none existed) in a `trap ... EXIT`
+cleanup — the C run, by contrast, just uses `--config` against a
+separate scratch path, so it never touches the real file at all. Stale
+`/var/run/magitrickle.{pid,sock}` files are also cleared before each
+run (Go's `cmd/magitrickled` refuses to start with a stale PID file
+pointing at another process image, and both backends need a fresh
+socket path to bind).
+
+**Random IDs required a "learn, then redact" design, not just
+normalization.** A raw byte-diff between two independent backends will
+never match wherever either one generates a random ID (group/rule/
+subscription IDs are 4 random bytes, hex-encoded) — but simple
+normalization isn't enough either, because a later request needs the
+*real* ID to address the right resource (e.g. `PUT
+/groups/{id}/rules/{ruleId}` needs the actual rule ID a `POST` just
+returned, which is a different random value on each backend). Solved
+with `contract.py`'s `Trace.step(..., learn=callback)`: the callback
+inspects a step's parsed response *before* that step's own trace line is
+printed, registers the real ID against a stable per-slot placeholder
+(e.g. `<RULE-R2>`), and the redaction is applied everywhere that value
+subsequently appears — including retroactively in the very response
+that introduced it, and in the literal request path of later steps
+(`GET/PUT/DELETE .../rules/<real-id>` prints as `.../rules/<RULE-R2>`).
+Group- and subscription-level top-level IDs are the opposite case:
+those ARE supplied explicitly and ARE expected to be honored literally
+by both backends (a brand-new object's own client-supplied ID is used
+as-is), so they're deliberately left unredacted — verifying that literal
+echo is exactly the point.
+
+**One request body deliberately avoids a known, already-documented,
+intentional divergence rather than tripping over it.** The first draft
+of this suite created a subscription with `"enable": true` and got a
+real divergence: Go's `AddSubscription` builds and enables a real
+netfilter-backed subscription rule set (`syncSubscriptionRuleSetsLocked`
+→ the same `RuleSet` machinery groups use), which failed in this sandbox
+trying to link the "eth0" ipset (a real, if incidental, environment
+limitation); `mt_app_add_subscription` (D-28) has no such runtime
+counterpart yet and trivially succeeds. That gap is real and already
+documented in D-28 — this suite isn't the place to re-litigate it, so
+the subscription in the test sequence uses `"enable": false`, keeping
+both backends on the config-only path this suite is actually meant to
+verify (subscription netfilter parity has no C-side implementation to
+compare against yet).
+
+**Error message *text* is normalized away, not compared.** Any
+`{"error": "..."}` body has its message value redacted to a fixed
+placeholder before comparison (e.g. Go's `"subscription id conflict"`
+vs the C port's generic `mt_err_str(MT_ERR_EXIST)` → `"already exists"`
+for the same 409) — consistent with D-05's original position that
+byte-identical serialization (and, by extension, exact wording) was
+never the contract; status codes and shape are.
+
+Verified by running the full suite twice in a row (idempotent — no
+leftover iptables `MT_`-prefixed chains or stray socket/PID files
+between or after runs, confirmed via `iptables -L`/`-t nat -L`) and as
+part of a complete `run_diff.sh` invocation covering every earlier
+phase's differential suite alongside this one, all green.
