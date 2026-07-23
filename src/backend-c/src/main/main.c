@@ -118,7 +118,11 @@ static void daemon_teardown(struct daemon *d)
 
 static mt_ruleset_t *find_ruleset(struct daemon *d, mt_id_t id)
 {
-    return mt_app_find_group_by_id(d->app, id);
+    mt_ruleset_t *rs = mt_app_find_group_by_id(d->app, id);
+    if (rs != NULL) {
+        return rs;
+    }
+    return mt_app_find_subscription_ruleset_by_id(d->app, id);
 }
 
 static void on_signal(mt_loop_t *loop, int signo, void *ud)
@@ -205,6 +209,18 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
                      g->name, mt_err_str(err));
         }
     }
+    for (size_t i = 0; i < mt_app_subscription_ruleset_count(d->app); i++) {
+        mt_ruleset_t *rs = mt_app_subscription_ruleset_at(d->app, i);
+        const mt_group_t *g = mt_ruleset_group(rs);
+        if (g->iface == NULL || strcmp(g->iface, iface_name) != 0) {
+            continue;
+        }
+        mt_err_t err = mt_ruleset_on_link_up(rs);
+        if (err != MT_OK) {
+            MT_ERROR("error while handling interface up: group=%s err=%s",
+                     g->name, mt_err_str(err));
+        }
+    }
 }
 
 static void on_addr_change(const char *iface_name, void *ud)
@@ -213,6 +229,20 @@ static void on_addr_change(const char *iface_name, void *ud)
     MT_DEBUG("interface address changed: %s", iface_name);
     for (size_t i = 0; i < mt_app_user_group_count(d->app); i++) {
         mt_ruleset_t *rs = mt_app_user_group_at(d->app, i);
+        const mt_group_t *g = mt_ruleset_group(rs);
+        if (g->iface == NULL || strcmp(g->iface, iface_name) != 0) {
+            continue;
+        }
+        mt_err_t err = mt_ruleset_on_addr_change(rs);
+        if (err != MT_OK) {
+            MT_ERROR(
+                "error while handling interface addr change: group=%s "
+                "err=%s",
+                g->name, mt_err_str(err));
+        }
+    }
+    for (size_t i = 0; i < mt_app_subscription_ruleset_count(d->app); i++) {
+        mt_ruleset_t *rs = mt_app_subscription_ruleset_at(d->app, i);
         const mt_group_t *g = mt_ruleset_group(rs);
         if (g->iface == NULL || strcmp(g->iface, iface_name) != 0) {
             continue;
@@ -556,6 +586,7 @@ int main(int argc, char **argv)
     mt_app_deps_t app_deps = {
         .cfg = &cfg,
         .cache = d.cache,
+        .pipeline = d.pipeline,
         .ipt4 = d.ipt4,
         .ipt6 = d.ipt6,
         .rtnl = d.rtnl,
@@ -580,6 +611,23 @@ int main(int argc, char **argv)
         err = mt_ruleset_sync(rs, d.cache, now_unix());
         if (err != MT_OK) {
             MT_ERROR("failed to sync group: %s", mt_err_str(err));
+            daemon_teardown(&d);
+            mt_config_clear(&cfg);
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < mt_app_subscription_ruleset_count(d.app); i++) {
+        mt_ruleset_t *rs = mt_app_subscription_ruleset_at(d.app, i);
+        err = mt_ruleset_enable(rs);
+        if (err != MT_OK) {
+            MT_ERROR("failed to enable subscription: %s", mt_err_str(err));
+            daemon_teardown(&d);
+            mt_config_clear(&cfg);
+            return 1;
+        }
+        err = mt_ruleset_sync(rs, d.cache, now_unix());
+        if (err != MT_OK) {
+            MT_ERROR("failed to sync subscription: %s", mt_err_str(err));
             daemon_teardown(&d);
             mt_config_clear(&cfg);
             return 1;

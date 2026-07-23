@@ -80,6 +80,7 @@ CONFIG_SRCS := \
     src/rules/match.c \
     src/rules/snapshot.c \
     src/subscriptions/subparse.c \
+    src/subscriptions/runtime.c \
     src/dns/pipeline.c
 
 # Netfilter: ipset via libmnl (NFNETLINK/NFNL_SUBSYS_IPSET). Needs libmnl

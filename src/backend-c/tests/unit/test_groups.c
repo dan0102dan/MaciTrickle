@@ -23,14 +23,28 @@
 
 #include "magitrickle/app.h"
 #include "magitrickle/dns_cache.h"
+#include "magitrickle/dnspipeline.h"
 #include "magitrickle/groups.h"
 #include "magitrickle/loop.h"
+
+typedef struct captured_match {
+    bool matched;
+    mt_id_t group_id;
+} captured_match_t;
+
+static void capture_match(const mt_match_action_t *action, void *ud) {
+    captured_match_t *cap = ud;
+    cap->matched = true;
+    cap->group_id = action->group_id;
+}
 
 typedef struct harness {
     mt_loop_t *loop;
     mt_httpd_t *tcp;
     mt_config_t cfg;
     mt_cache_t *cache;
+    mt_dns_pipeline_t *pipeline;
+    captured_match_t cap;
     mt_app_t *app;
     mt_groups_ctx_t ctx;
     pthread_t thread;
@@ -48,7 +62,8 @@ static harness_t *harness_start(void) {
     harness_t *h = calloc(1, sizeof(*h));
     mt_config_init_defaults(&h->cfg);
     h->cache = mt_cache_create(0);
-    mt_app_deps_t deps = {.cfg = &h->cfg, .cache = h->cache};
+    h->pipeline = mt_dns_pipeline_create(h->cache, 0, capture_match, &h->cap);
+    mt_app_deps_t deps = {.cfg = &h->cfg, .cache = h->cache, .pipeline = h->pipeline};
     h->app = mt_app_create(&deps);
     h->ctx.app = h->app;
     h->ctx.config_path = NULL;
@@ -69,9 +84,30 @@ static void harness_stop(harness_t *h) {
     mt_httpd_destroy(h->tcp);
     mt_loop_destroy(h->loop);
     mt_app_destroy(h->app);
+    mt_dns_pipeline_destroy(h->pipeline);
     mt_cache_destroy(h->cache);
     mt_config_clear(&h->cfg);
     free(h);
+}
+
+/* Wire-encodes a plain dotted domain (no escaping needed for these tests)
+ * as length-prefixed labels terminated by a zero-length root label. */
+static size_t wire_name(const char *domain, uint8_t *buf, size_t cap) {
+    size_t out = 0;
+    const char *label = domain;
+    while (*label) {
+        const char *dot = strchr(label, '.');
+        size_t label_len = dot ? (size_t)(dot - label) : strlen(label);
+        if (out + 1 + label_len + 1 > cap) { return 0; }
+        buf[out++] = (uint8_t)label_len;
+        memcpy(buf + out, label, label_len);
+        out += label_len;
+        label += label_len;
+        if (*label == '.') { label++; }
+    }
+    if (out + 1 > cap) { return 0; }
+    buf[out++] = 0;
+    return out;
 }
 
 /* ---- tiny blocking HTTP/1.1 client ------------------------------------------ */
@@ -437,6 +473,53 @@ TEST put_rules_strict_id_validation(void) {
     PASS();
 }
 
+/* Regression test for the Phase-6 bug where an HTTP-driven group/rule
+ * mutation updated netfilter but never republished the DNS-matching
+ * snapshot (mt_ruleset_snapshot_build was only ever called once, at
+ * daemon startup). A rule created here via POST must be immediately
+ * matchable through the DNS pipeline without any snapshot rebuild call
+ * outside of groups.c's own handlers. */
+TEST rule_created_via_http_is_dns_matchable(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+
+    cJSON *g = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups",
+                             "{\"name\":\"g1\",\"interface\":\"eth0\","
+                             "\"rules\":[{\"name\":\"r1\",\"type\":\"domain\","
+                             "\"rule\":\"example.com\",\"enable\":true}]}",
+                             &g));
+    mt_id_t group_id;
+    ASSERT_EQ(MT_OK, mt_id_parse(jstr(g, "id"), &group_id));
+    cJSON_Delete(g);
+
+    uint8_t name[MT_DNS_MAX_NAME + 1];
+    size_t name_len = wire_name("example.com", name, sizeof(name));
+    ASSERT(name_len > 0);
+    uint8_t addr[4] = {93, 184, 216, 34};
+
+    mt_dns_rr_t rr = {0};
+    memcpy(rr.name, name, name_len);
+    rr.name_len = name_len;
+    rr.rtype = MT_DNS_TYPE_A;
+    rr.rclass = 1;
+    rr.ttl = 300;
+    rr.rdata = addr;
+    rr.rdata_len = sizeof(addr);
+
+    mt_dns_msg_t msg = {0};
+    msg.answers = &rr;
+    msg.n_answers = 1;
+
+    mt_dns_pipeline_handle_message(h->pipeline, &msg, 0);
+
+    ASSERT(h->cap.matched);
+    ASSERT(mt_id_equal(h->cap.group_id, group_id));
+
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -451,5 +534,6 @@ int main(int argc, char **argv) {
     RUN_TEST(put_groups_bulk_replace_reuses_ids_and_validates);
     RUN_TEST(rule_crud_roundtrip);
     RUN_TEST(put_rules_strict_id_validation);
+    RUN_TEST(rule_created_via_http_is_dns_matchable);
     GREATEST_MAIN_END();
 }

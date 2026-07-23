@@ -19,8 +19,9 @@
  * the ipset call multiple times for one CNAME event when several rules in
  * a group match; this collapses it to once).
  *
- * Subscription-derived rule sets are not modeled yet (subscription sync is
- * Phase 7); only user-defined groups from mt_config_t participate for now.
+ * Subscription-derived entries participate too (Phase 7): one synthesized
+ * mt_group_t per enabled subscription (mt_sub_runtime_group), matched
+ * exactly like a real config group; see snapshot.c.
  *
  * Concurrency: single-threaded today (everything runs on the loop thread,
  * decisions.md D-17), so "atomic swap" here is just a pointer store from

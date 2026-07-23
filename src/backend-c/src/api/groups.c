@@ -273,6 +273,18 @@ static void maybe_save(mt_groups_ctx_t *ctx, mt_http_req_t *req) {
     if (err != MT_OK) { MT_ERROR("failed to save config file: %s", mt_err_str(err)); }
 }
 
+/* Called after every in-place group/rule edit in this file (the handlers
+ * that go through mt_ruleset_group_mut rather than one of mt_app_t's own
+ * mutation functions, which already republish internally) -- otherwise
+ * an HTTP-created rule would update netfilter (via mt_app_sync_group)
+ * but never actually become resolvable over DNS. Found as a real gap in
+ * Phase 7 while wiring subscription rule sets into the same snapshot;
+ * see decisions.md and app.h's mt_app_republish_dns_snapshot doc. */
+static void republish_dns_snapshot(mt_groups_ctx_t *ctx) {
+    mt_err_t err = mt_app_republish_dns_snapshot(ctx->app);
+    if (err != MT_OK) { MT_ERROR("failed to republish DNS-matching snapshot: %s", mt_err_str(err)); }
+}
+
 static bool resolve_group(mt_groups_ctx_t *ctx, mt_http_req_t *req, mt_http_res_t *res, mt_ruleset_t **out) {
     const char *id_str = mt_http_req_param(req, "groupID");
     mt_id_t id;
@@ -463,6 +475,7 @@ static void handle_put_group(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
         return;
     }
     group_move_into(live, built);
+    republish_dns_snapshot(ctx);
 
     if (was_enabled) {
         err = mt_ruleset_enable(rs);
@@ -550,6 +563,7 @@ static void handle_put_rules(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
     free(group->rules);
     group->rules = new_rules;
     group->n_rules = (size_t)n;
+    republish_dns_snapshot(ctx);
 
     if (mt_ruleset_runtime_enabled(rs)) {
         mt_err_t err = mt_app_sync_group(ctx->app, rs);
@@ -585,6 +599,7 @@ static void handle_create_rule(mt_http_req_t *req, mt_http_res_t *res, void *ud)
         mt_http_res_write_error(res, 500, "out of memory");
         return;
     }
+    republish_dns_snapshot(ctx);
 
     if (mt_ruleset_runtime_enabled(rs)) {
         mt_err_t err = mt_app_sync_group(ctx->app, rs);
@@ -629,6 +644,7 @@ static void handle_put_rule(mt_http_req_t *req, mt_http_res_t *res, void *ud) {
         mt_http_res_write_error(res, 500, "out of memory");
         return;
     }
+    republish_dns_snapshot(ctx);
 
     if (mt_ruleset_runtime_enabled(rs)) {
         err = mt_app_sync_group(ctx->app, rs);
@@ -653,6 +669,7 @@ static void handle_delete_rule(mt_http_req_t *req, mt_http_res_t *res, void *ud)
     mt_rule_free(group->rules[idx]);
     for (size_t i = idx; i + 1 < group->n_rules; i++) { group->rules[i] = group->rules[i + 1]; }
     group->n_rules--;
+    republish_dns_snapshot(ctx);
 
     if (mt_ruleset_runtime_enabled(rs)) {
         mt_err_t err = mt_app_sync_group(ctx->app, rs);

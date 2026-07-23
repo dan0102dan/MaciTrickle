@@ -966,3 +966,124 @@ same background-loop-thread harness as `test_httpd.c` — covering plain
 non-2xx, oversized body, unsupported scheme, malformed URL, and
 connection-refused). Full suite (26 unit-test binaries), static
 analysis, and sanitizers all clean.
+
+## D-32: Subscription runtime rule sets, DNS-snapshot integration, and a Phase-6 DNS-matching regression fix
+
+**Synthesis over generalization, mirroring Go's own `Spec` design.**
+Go's `RuleSet` operates over `rulesets.Spec`, a small carrier type built
+either directly from a `*models.Group` (user groups) or synthesized
+fresh on every rebuild from a `*models.Subscription`
+(`subscriptionAsRuntimeRuleSet`). C's `mt_ruleset_t` is hardwired to
+`const mt_group_t *` (Phase 5, unmodified since, already tested). Rather
+than generalizing `ruleset.c` into a Spec-like abstraction, the
+subscription side mirrors Go's own approach: `mt_sub_runtime_group()`
+(`subscriptions/runtime.c`) synthesizes an independent `mt_group_t*`
+from a `mt_subscription_t` (id, name — falling back to
+`"subscription:<id>"` when empty, matching Go — interface, enable
+computed as `sub->enable && iface non-empty`, and one `mt_rule_t` per
+subscription rule), which is then fed through the existing, unmodified
+`mt_ruleset_new()` exactly like a real config-file group would be.
+`color` is intentionally left NULL: only the HTTP JSON layer reads it,
+and synthesized groups never reach that layer.
+
+**Ownership: `mt_ruleset_new()` borrows its group pointer** (ruleset.h's
+pre-existing documented contract — "callers keep the owning `mt_config_t`
+alive for the ruleset's lifetime"), so a synthesized group can't be
+freed right after building its ruleset. `mt_app_t` keeps a parallel
+owned array, `sub_synth_groups`, alongside `sub_rulesets`, freed in
+lockstep (`sub_rulesets_push`'s realloc only bumps `cap_sub_rulesets`
+once *both* parallel array reallocs have succeeded, so a partial-realloc
+failure can never leave the two arrays believing they have different
+capacities). Subscription rulesets live in this array, separate from
+`cfg->groups`' rulesets, because Go always rebuilds subscription rule
+sets wholesale (`buildSubscriptionRuleSetsLocked` disables+recreates
+every one on any subscription-list-or-rules change, never edits in
+place) — `rebuild_subscription_rulesets()` in `app.c` does the same:
+disable+free the old array, synthesize+build fresh for every
+subscription, roll back to nothing enabled and log on failure exactly
+like Go's `syncSubscriptionRuleSetsLocked` failure path.
+
+**`mt_app_add_subscription`/`_replace_subscriptions`/
+`_remove_subscription_by_id` all rebuild-wholesale and roll back the
+`mt_config_t` mutation (not just the rulesets) on failure**, mirroring
+Go's `AddSubscription`/`ReplaceSubscriptions`/`RemoveSubscriptionByID`
+exactly: mutate `cfg`, rebuild; on failure, undo the `cfg` mutation and
+rebuild again (logging if even that fails), so the app is never left
+with a `cfg`/ruleset-array mismatch. `mt_app_remove_subscription_by_id`
+changed signature from `bool` to `mt_err_t` + `bool *out_found` (mirrors
+Go's `(bool, error)` return) so the HTTP handler can distinguish 404
+(not found) from 500 (found, rebuild failed) — the one existing caller
+(`subscriptions_api.c`'s `handle_delete_subscription`) was updated in
+the same change.
+
+**Real Phase-6 regression found and fixed: the DNS-matching snapshot was
+never rebuilt after startup.** `mt_ruleset_snapshot_build(&cfg)` was
+called exactly once, at daemon startup in `main.c`, and never again —
+every Phase-6 HTTP-driven group/rule mutation updated netfilter (via
+`mt_ruleset_t`'s own enable/disable/sync) but never touched DNS
+matching, so a group or rule created purely through the HTTP API would
+never resolve traffic into it. This was a genuine bug in already-shipped
+Phase 6 code, not a hypothetical concern, found by tracing every call
+site of `mt_ruleset_snapshot_build`/`mt_dns_pipeline_set_snapshot`
+across `main.c`/`app.c`/`groups.c`. Fixed with a new public
+`mt_app_republish_dns_snapshot(app)`: rebuilds the snapshot from
+`app->cfg` and calls `mt_dns_pipeline_set_snapshot` on the pipeline
+handed to `mt_app_create` via the new (optional, NULL-able)
+`mt_app_deps_t.pipeline` field. Called internally by every `mt_app_t`
+group/subscription mutator (`mt_app_add_group`, `mt_app_clear_groups`,
+`mt_app_remove_group_by_index`, the subscription mutators above), and
+explicitly by `groups.c`'s in-place-mutation HTTP handlers
+(`handle_put_group`, `handle_put_rules`, `handle_create_rule`,
+`handle_put_rule`, `handle_delete_rule`), which mutate a live group
+in place via `mt_ruleset_group_mut` rather than going through
+`mt_app_t`'s own mutators. The group side had exactly the same bug as
+the subscription side, so both are fixed together rather than patching
+subscriptions alone. Confirmed against Go's own `LoadConfig()` (groups
+and subscription rule sets are both built, unenabled, while
+`a.enabled` is still false) and `Start()` (a single flat loop over
+`ruleSetSnapshot()` — groups+subscriptions together — enables and syncs
+everything uniformly) that this mirrors Go's actual startup/mutation
+model.
+
+**DNS-matching snapshot extended to include subscriptions**
+(`rules/snapshot.c`): a shared `append_snapshot_entry()` helper
+(factored out of the existing per-group loop) is now called once per
+enabled user group and once per enabled subscription (via a synthesized
+`mt_sub_runtime_group()`, discarded immediately after its id/name/rules
+are copied into the snapshot entry). Subscription rules of type
+`subnet`/`subnet6` need no special-casing: `mt_matcher_add()` already
+treats those as `RK_NEVER` (never matches a domain name), the same
+semantics Go's own matcher uses, so they flow through the identical
+matcher-building code as any group rule.
+
+**`main.c` wiring**: `app_deps.pipeline` now passed through to
+`mt_app_create`. `find_ruleset()` (used by the DNS match sink) now
+falls back to `mt_app_find_subscription_ruleset_by_id` when a match's
+`group_id` isn't a user group. `on_link_up`/`on_addr_change` now also
+iterate subscription rulesets via
+`mt_app_subscription_ruleset_count`/`_at` (confirmed against Go's
+`netlink.go`, where `handleLink`/`handleAddr` both iterate
+`ruleSetSnapshot()` — groups and subscriptions together — not just
+groups). A new enable+sync loop over the initial subscription rulesets
+runs right after the existing group-ruleset loop, before
+`mt_app_set_running(true)`, mirroring the same "build unenabled at
+config-load time, enable+sync everything in one flat pass at Start()"
+sequence Go uses.
+
+**Regression test**: `tests/unit/test_groups.c` gained
+`rule_created_via_http_is_dns_matchable` — creates a group with a
+domain rule purely via `POST /api/v1/groups`, then hand-builds a
+synthetic `mt_dns_msg_t` with a matching A-record answer and calls
+`mt_dns_pipeline_handle_message()` directly, asserting the match sink
+fires with the created group's id. Before this task's fix this would
+have failed (the snapshot handed to the pipeline would still have been
+the empty one built from the config file at daemon startup).
+`test_rulesnap.c` gained 4 tests covering subscription
+inclusion/exclusion (enabled+interface, no interface, disabled, and
+both groups+subscriptions participating together).
+
+Verified: full suite (27 unit-test binaries, including the new
+regression tests), `static_analysis` (clang-tidy+cppcheck, 0 warnings),
+and `sanitize` (ASan+UBSan) all clean; `magitrickled-c` and
+`mt-configtool` rebuild cleanly with the new `main.c`/`app.c`/`app.h`
+signatures.

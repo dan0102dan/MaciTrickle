@@ -376,7 +376,13 @@ static void handle_delete_subscription(mt_http_req_t *req, mt_http_res_t *res, v
         mt_http_res_write_error(res, 400, "invalid subscription id");
         return;
     }
-    if (!mt_app_remove_subscription_by_id(ctx->app, id)) {
+    bool found = false;
+    mt_err_t err = mt_app_remove_subscription_by_id(ctx->app, id, &found);
+    if (err != MT_OK) {
+        mt_http_res_write_error(res, 500, mt_err_str(err));
+        return;
+    }
+    if (!found) {
         mt_http_res_write_error(res, 404, "subscription not found");
         return;
     }
