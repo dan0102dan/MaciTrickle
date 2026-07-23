@@ -392,3 +392,50 @@ parsing, path-param extraction, POST body round-trip, the not-found
 fallback, middleware short-circuiting (401), keep-alive across multiple
 requests on one connection, and Unix-socket routing parity — all under
 ASan/UBSan with zero findings.
+
+## D-24 — Auth: platform paths module, and calendar-correct JWT expiry without timegm(3)
+
+Status: accepted (Phase 6). Two small additions supporting
+`src/api/auth.c` (port of `api/auth/{passwd,secret,password,middleware,
+handlers}.go`):
+
+1. `include/magitrickle/paths.h` — the C backend had no equivalent of
+   Go's build-tag-conditional `constant/path_{default,entware,openwrt}.go`
+   yet (only `main.c`'s single `MT_CONFIG_PATH` `#ifndef` override
+   existed). Added `MT_APP_SHARE_DIR`/`MT_APP_STATE_DIR`/`MT_SOCK_PATH`/
+   `MT_PASSWD_FILE`/`MT_SHADOW_FILE` with defaults matching
+   `path_default.go` and the same `#ifndef`-override hook, so Phase 8
+   packaging can wire per-platform `-D` flags exactly like it will for
+   `MT_CONFIG_PATH`. Until then every C build uses the non-Entware/
+   non-OpenWrt defaults.
+2. Go's `issueToken` computes the JWT expiry via
+   `issuedAt.AddDate(jwtYears, 0, 0)` — 20 *calendar* years, correctly
+   handling leap years (e.g. Feb 29 rolling to March 1 when the target
+   year isn't a leap year). Reproducing this without pulling in `timegm(3)`
+   (a GNU/BSD extension; project convention confines GNU extensions to
+   `src/platform/`, and auth.c isn't there) uses Howard Hinnant's
+   public-domain `days_from_civil`/`civil_from_days` integer arithmetic
+   (`mt_auth_add_years_utc`, exposed for testing). Verified against six
+   vectors captured from the real Go `time` package
+   (`tests/unit/test_auth.c`), including the Feb-29-2080-to-March-1-2100
+   non-leap-target-year edge case — byte-identical results.
+
+Also carries forward the shared-primitive extraction already implied by
+D-23: `mt_id_random()` (config/id.c) and the new secret generator both
+need cryptographically random bytes, so the `/dev/urandom` read-loop was
+pulled out into `src/util/rand.c`/`include/magitrickle/rand.h` (a
+behaviour-preserving refactor of already-tested code, not a new
+decision in itself, noted here for traceability).
+
+Two internal functions (`mt_auth_load_password_hash`,
+`mt_auth_authenticate`, `mt_auth_verify_token`) each have a
+`..._from(shadow_path, passwd_path, ...)` sibling taking explicit file
+paths, used only by `tests/unit/test_auth.c` to point at temp fixture
+files instead of mutating the sandbox's real `/etc/shadow` — the
+production entry points always pass the real `MT_SHADOW_FILE`/
+`MT_PASSWD_FILE`. The in-memory app-secret cache
+(`mt_auth_load_secret`) is loaded once per process lifetime (matching
+Go's `sync.Once`), which is why a test exercising "two different
+`state_dir`s in one process get two different secrets" isn't
+meaningful here — Go itself never has more than one `state_dir` per
+process either.

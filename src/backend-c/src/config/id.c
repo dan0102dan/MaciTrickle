@@ -1,9 +1,9 @@
 #include "magitrickle/id.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
+
+#include "magitrickle/rand.h"
 
 static int hex_val(char c)
 {
@@ -60,19 +60,6 @@ bool mt_id_equal(mt_id_t a, mt_id_t b)
 mt_id_t mt_id_random(void)
 {
     mt_id_t id = {{0, 0, 0, 0}};
-    /* /dev/urandom works from kernel 2.6 onward; getrandom(2) needs 3.17+
-     * and some Entware targets run 3.2/3.4, so read the device directly. */
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        size_t got = 0;
-        while (got < sizeof(id.b)) {
-            ssize_t n = read(fd, id.b + got, sizeof(id.b) - got);
-            if (n <= 0) {
-                break;
-            }
-            got += (size_t)n;
-        }
-        close(fd);
-    }
+    mt_random_bytes(id.b, sizeof(id.b));
     return id;
 }

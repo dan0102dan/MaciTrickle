@@ -46,6 +46,7 @@ CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
     src/util/bytebuf.c \
+    src/util/rand.c \
     src/core/lifecycle.c \
     src/logging/log.c \
     src/platform/loop.c \
@@ -101,6 +102,7 @@ NETFILTER_SRCS := \
 API_SRCS := \
     src/api/json.c \
     src/api/httpd.c \
+    src/api/auth.c \
     src/crypto/jwt.c
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS)
