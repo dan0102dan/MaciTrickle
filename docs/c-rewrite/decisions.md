@@ -439,3 +439,55 @@ Go's `sync.Once`), which is why a test exercising "two different
 `state_dir`s in one process get two different secrets" isn't
 meaningful here — Go itself never has more than one `state_dir` per
 process either.
+
+## D-25 — App layer: cfg->groups as the live group registry, not a Go-style reconstruction
+
+Status: accepted (Phase 6). `include/magitrickle/app.h` / `src/api/app.c`
+port the group/interface/config-save slice of `app.go`'s `App` struct
+(`UserGroups`/`AddGroup`/`ClearGroups`/`RemoveGroupByIndex`/
+`RemoveGroupByID`/`ListInterfaces`/`SaveConfig`/`ForceCommitIPTables`),
+promoting what main.c (Phase 5) built ad hoc into something Phase 6's
+HTTP handlers can drive at runtime.
+
+Go's `models.AppConfig` has no `Groups` field at all — group data lives
+solely in `a.userRuleSets` (each `*RuleSet` wraps a `*models.Group` via
+`spec.Model`), and `SaveConfig()` reconstructs a fresh `[]*models.Group`
+from `rs.Model()` on every save. The C port instead keeps `cfg->groups`
+(an array of pointers, so appending/removing entries reallocates the
+pointer array but never invalidates the pointees) as the single live,
+mutable group registry: `mt_ruleset_t` already stores a `const
+mt_group_t *` pointing straight at a `cfg->groups` entry (this was
+already true from Phase 5), so `mt_app_add_group`/`mt_app_remove_group_*`
+mutate `cfg->groups` and the app's parallel `mt_ruleset_t*` array
+together, index-for-index, and `mt_app_save_config` is then just a
+direct call to the existing `mt_config_save_file` — no Go-style
+reconstruction step needed. Two new `mt_config_t` helpers back this:
+`mt_config_remove_group_by_index` and `mt_config_clear_groups`.
+
+Faithfully ports two behavioural asymmetries visible in `app.go` that are
+easy to miss: `ClearGroups` calls `Disable()` on every group before
+clearing, but `RemoveGroupByIndex`/`RemoveGroupByID` do **not** — the Go
+callers (e.g. `handlers.go`'s `DeleteGroup`) call `Disable()` themselves
+first when the group is enabled. `mt_app_clear_groups` disables;
+`mt_app_remove_group_by_index`/`by_id` don't — Phase 6's Groups/Rules
+handlers (next task) must disable before removing, exactly like Go's
+handlers do.
+
+`ListInterfaces` is ported via `getifaddrs()` deduped by name (matching
+`net.Interfaces()`), filtered by `IFF_POINTOPOINT` unless
+`show_all_interfaces` is set (matching `interfaces.filterManaged`) — the
+default/non-`entware_kn` `IgnoredInterfaces` list is empty in Go, so
+there's nothing further to filter on this platform. The Keenetic-RCI
+friendly-name lookup (`entware_kn`-only, HTTP calls to `127.0.0.1:79`)
+is out of scope here: every interface's `name` field is empty, matching
+Go's `DummyRouterSpecificAPI` (the same fallback every non-`entware_kn`
+build already uses) — deferred to Phase 8 packaging alongside the rest
+of the `entware_kn` build-tag surface.
+
+Verified in `tests/unit/test_app.c`, including a rollback test that
+exercises `mt_app_add_group`'s real failure path: adding an
+`enable:true` group while the app is marked "running" attempts a real
+`ipset create` via libmnl, which fails in this sandbox (no `ip_set`
+kernel module — the same Phase-0/Phase-5 finding), and the test confirms
+the group is removed from both the ruleset list and `cfg.groups` after
+the rollback, not left half-added.

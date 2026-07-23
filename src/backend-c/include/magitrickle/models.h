@@ -141,6 +141,12 @@ void mt_app_config_clear(mt_app_config_t *c);
 mt_err_t mt_config_init_defaults(mt_config_t *c);
 void mt_config_clear(mt_config_t *c);
 mt_err_t mt_config_add_group(mt_config_t *c, mt_group_t *g);
+/* Frees c->groups[idx] and shifts the remaining pointers down (idx must
+ * be < c->n_groups). */
+void mt_config_remove_group_by_index(mt_config_t *c, size_t idx);
+/* Frees every group and empties c->groups (does not touch subscriptions
+ * or app config, unlike mt_config_clear). */
+void mt_config_clear_groups(mt_config_t *c);
 mt_err_t mt_config_add_subscription(mt_config_t *c, mt_subscription_t *s);
 
 /* Group color normalization: valid #rrggbb (case-insensitive) is lowercased

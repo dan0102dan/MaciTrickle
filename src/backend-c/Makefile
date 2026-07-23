@@ -103,6 +103,7 @@ API_SRCS := \
     src/api/json.c \
     src/api/httpd.c \
     src/api/auth.c \
+    src/api/app.c \
     src/crypto/jwt.c
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS)

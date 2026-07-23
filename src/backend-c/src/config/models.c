@@ -234,6 +234,25 @@ mt_err_t mt_config_add_group(mt_config_t *c, mt_group_t *g)
     return MT_OK;
 }
 
+void mt_config_remove_group_by_index(mt_config_t *c, size_t idx)
+{
+    mt_group_free(c->groups[idx]);
+    for (size_t i = idx; i + 1 < c->n_groups; i++) {
+        c->groups[i] = c->groups[i + 1];
+    }
+    c->n_groups--;
+}
+
+void mt_config_clear_groups(mt_config_t *c)
+{
+    for (size_t i = 0; i < c->n_groups; i++) {
+        mt_group_free(c->groups[i]);
+    }
+    free(c->groups);
+    c->groups = NULL;
+    c->n_groups = 0;
+}
+
 mt_err_t mt_config_add_subscription(mt_config_t *c, mt_subscription_t *s)
 {
     mt_err_t err = grow_array((void ***)&c->subscriptions, c->n_subscriptions);
