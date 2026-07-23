@@ -110,7 +110,13 @@ API_SRCS := \
     src/api/subscriptions_api.c \
     src/crypto/jwt.c
 
-LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS)
+# Subscriptions: fetch + runtime rule sets + sync orchestration
+# (Phase 7). Needs libcurl (host + feed sysroots, same cross-build
+# caveat as CONFIG_SRCS/NETFILTER_SRCS/API_SRCS).
+SUBSCRIPTIONS_SRCS := \
+    src/subscriptions/fetch.c
+
+LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS) $(SUBSCRIPTIONS_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
@@ -121,13 +127,14 @@ CORE_OBJS := $(CORE_SRCS:%.c=$(BUILDDIR)/%.o)
 CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
 NETFILTER_OBJS := $(NETFILTER_SRCS:%.c=$(BUILDDIR)/%.o)
 API_OBJS := $(API_SRCS:%.c=$(BUILDDIR)/%.o)
-LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS) $(API_OBJS)
+SUBSCRIPTIONS_OBJS := $(SUBSCRIPTIONS_SRCS:%.c=$(BUILDDIR)/%.o)
+LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS) $(API_OBJS) $(SUBSCRIPTIONS_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 CACHETOOL_OBJ := $(CACHETOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
-DEP_LIBS := -lyaml -lpcre2-8 -lmnl -lcjson
+DEP_LIBS := -lyaml -lpcre2-8 -lmnl -lcjson -lcurl
 
 # fake_iptables.c/fake_ipset_nl.c are test *support* (the former a port of
 # executable-fake.go, gated behind Go's `testing` build tag there; the

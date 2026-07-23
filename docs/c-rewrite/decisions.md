@@ -901,3 +901,68 @@ compile-time default in `paths.h` (real per-platform overrides are
 Phase 8 packaging work), so this suite writes to the real path rather
 than a build flag, and must not clobber anything already installed
 there.
+
+## D-31: Subscription list fetch via libcurl (`sub_fetch.h`/`fetch.c`)
+
+Ports `subscriptions/fetch.go`'s `FetchList` (Phase 7, task #40) onto
+libcurl rather than hand-rolled sockets/TLS — dependencies.md already
+called this out as the one place hand-rolling is out of the question
+("TLS is non-negotiable for https subscription URLs"). `libcurl4-openssl-dev`
+was not preinstalled in this sandbox (only the runtime `.so`); installed
+via `apt-get install libcurl4-openssl-dev` to get headers for
+development — the actual OpenWrt/Entware feed packages are the real
+dependency target (already listed in dependencies.md's table), this was
+only a local dev-environment gap.
+
+**Exact redirect semantics via libcurl's URL API, not its own redirect
+following.** `CURLOPT_FOLLOWLOCATION` is left off; the C port implements
+the same manual loop Go's `FetchList` does, because libcurl's automatic
+following (a) follows more status codes than Go's custom loop (which
+deliberately only treats 301/302 as "redirect to follow" — any other
+3xx, including 303/307/308, is treated as a plain non-2xx terminal
+failure, a genuine Go quirk kept here rather than "fixed"), and (b)
+doesn't expose the same loop-detection/hop-count semantics. Each hop:
+`curl_url()`/`curl_url_set(CURLUPART_URL)` validates the URL and
+extracts scheme+host (mirrors Go's `url.Parse` + non-empty
+scheme/host check); only `http`/`https` are accepted, at the original
+URL and at every redirect target. `CURLINFO_REDIRECT_URL` (queried after
+a `FOLLOWLOCATION`-off request that received a redirect status) already
+resolves a relative `Location` header to an absolute URL exactly like
+Go's manual `parsed.ResolveReference(location)` step, so no separate
+relative-URL-resolution code was needed. Loop detection uses a small
+fixed-capacity array (bounded by `MT_SUB_FETCH_MAX_REDIRECTS + 1` —
+tiny, so a linear scan beats introducing a hash set), seeded with the
+original URL before the loop starts, matching Go's `visited` map's
+initial seed. The `redirects >= maxFetchRedirects` bounds check is
+ordered exactly as Go's is (checked *before* marking the new location
+visited and advancing), so the boundary behavior matches precisely: up
+to 5 redirects succeed, a 6th is rejected as MT_ERR_LIMIT before ever
+being fetched — verified directly with two dedicated redirect chains in
+`test_sub_fetch.c` (`allows_exactly_five_redirects` /
+`rejects_six_redirects`).
+
+**`MT_SUB_FETCH_MAX_BODY_BYTES` (8 MiB) is new C-side hardening, not a
+behavior port.** Go's `io.ReadAll(resp.Body)` has no size limit at all;
+migration-plan.md's own Phase 7 line item calls for a "size bound" as a
+deliberate addition (mirrors the same "C version may add bounded
+limits... document as hardening" allowance already used for the HTTP
+server in Phase 6, D-06 revisited). Enforced in the libcurl write
+callback (returning a short write count aborts the transfer with
+`CURLE_WRITE_ERROR`, mapped to `MT_ERR_LIMIT`), verified with a
+dedicated test serving a body just over the cap.
+
+**`curl_global_init`/`curl_global_cleanup` are the caller's
+responsibility** (`mt_sub_fetch_global_init`/`_cleanup`), not called
+implicitly inside `mt_sub_fetch_list` — libcurl's own documented
+contract requires global init to happen once, non-concurrently, before
+any thread performs a transfer; main.c will call this once at startup
+(wired in a later Phase 7 task alongside the rest of the daemon startup
+sequence, not yet done as of this task).
+
+Verified with `tests/unit/test_sub_fetch.c` (11 tests, against a real
+local `mt_httpd_t` server acting as the stub subscription-list host —
+same background-loop-thread harness as `test_httpd.c` — covering plain
+200, empty body, 301, 302, redirect loop, the 5-vs-6-redirect boundary,
+non-2xx, oversized body, unsupported scheme, malformed URL, and
+connection-refused). Full suite (26 unit-test binaries), static
+analysis, and sanitizers all clean.
