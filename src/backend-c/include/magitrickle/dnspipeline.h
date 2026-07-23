@@ -53,4 +53,12 @@ void mt_dns_pipeline_set_snapshot(mt_dns_pipeline_t *p,
 void mt_dns_pipeline_handle_message(mt_dns_pipeline_t *p,
                                     const mt_dns_msg_t *msg, int64_t now);
 
+/* Updates additional_ttl_seconds -- Go's dns.go reads
+ * a.config.Netfilter.IPSet.AdditionalTTL fresh on every matched record,
+ * unlike the cache/snapshot pointers above (injected once). Used by the
+ * SIGHUP config reload (main.c) so this one setting takes live effect
+ * exactly like it does in Go, without recreating the pipeline. */
+void mt_dns_pipeline_set_additional_ttl(mt_dns_pipeline_t *p,
+                                        uint32_t additional_ttl_seconds);
+
 #endif /* MAGITRICKLE_DNSPIPELINE_H */

@@ -46,6 +46,12 @@ void mt_dns_pipeline_set_snapshot(mt_dns_pipeline_t *p,
     mt_ruleset_snapshot_free(old);
 }
 
+void mt_dns_pipeline_set_additional_ttl(mt_dns_pipeline_t *p,
+                                        uint32_t additional_ttl_seconds)
+{
+    p->additional_ttl = additional_ttl_seconds;
+}
+
 /* Drops exactly one trailing '.' — mt_dns_name_to_string always produces
  * a fully-qualified presentation name (root included), matching Go's
  * trimFQDN(name) on the wire-derived string. */

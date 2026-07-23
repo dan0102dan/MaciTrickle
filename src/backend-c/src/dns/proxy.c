@@ -953,3 +953,10 @@ uint64_t mt_dnsproxy_inflight(const mt_dnsproxy_t *p)
 {
     return atomic_load(&p->inflight);
 }
+
+void mt_dnsproxy_set_disable_flags(mt_dnsproxy_t *p, bool disable_fake_ptr,
+                                   bool disable_drop_aaaa)
+{
+    p->cfg.disable_fake_ptr = disable_fake_ptr;
+    p->cfg.disable_drop_aaaa = disable_drop_aaaa;
+}

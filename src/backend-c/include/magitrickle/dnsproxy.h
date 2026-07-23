@@ -62,4 +62,14 @@ mt_err_t mt_dnsproxy_start(mt_dnsproxy_t *p);
 uint64_t mt_dnsproxy_dropped(const mt_dnsproxy_t *p);
 uint64_t mt_dnsproxy_inflight(const mt_dnsproxy_t *p);
 
+/* Updates the two flags Go's dns.go reads fresh from a.config on every
+ * request/response (DisableFakePTR/DisableDropAAAA), unlike every other
+ * mt_dnsproxy_config_t field (host/port/upstream/timeouts), which are
+ * captured once at mt_dnsproxy_create time with no live-reconfiguration
+ * path in either backend. Used by the SIGHUP config reload (main.c) to
+ * match Go's LoadConfig taking live effect for exactly these two knobs
+ * without restarting the listener -- see decisions.md. */
+void mt_dnsproxy_set_disable_flags(mt_dnsproxy_t *p, bool disable_fake_ptr,
+                                   bool disable_drop_aaaa);
+
 #endif /* MAGITRICKLE_DNSPROXY_H */

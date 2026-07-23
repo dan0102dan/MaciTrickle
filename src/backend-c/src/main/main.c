@@ -44,6 +44,7 @@
 #include "magitrickle/rulesnap.h"
 #include "magitrickle/ruleset.h"
 #include "magitrickle/staticfiles.h"
+#include "magitrickle/sub_fetch.h"
 #include "magitrickle/subscriptions_api.h"
 #include "magitrickle/system.h"
 #include "magitrickle/version.h"
@@ -54,6 +55,8 @@
 #endif
 
 #define MT_CACHE_CLEANUP_INTERVAL_MS 30000
+/* Matches subscriptions.go's subscriptionAutoUpdateTick = time.Minute. */
+#define MT_SUBSCRIPTION_AUTO_UPDATE_INTERVAL_MS 60000
 
 struct daemon {
     mt_loop_t *loop;
@@ -68,6 +71,12 @@ struct daemon {
     mt_app_t *app;
     mt_httpd_t *http_tcp;
     mt_httpd_t *http_unix;
+
+    /* Not owned by daemon_teardown (cfg is main()'s own local, config_path
+     * points at argv or MT_CONFIG_PATH) -- only here so on_signal's SIGHUP
+     * handler can reach them for a config reload. */
+    mt_config_t *cfg;
+    const char *config_path;
 };
 
 static int64_t now_unix(void)
@@ -125,11 +134,99 @@ static mt_ruleset_t *find_ruleset(struct daemon *d, mt_id_t id)
     return mt_app_find_subscription_ruleset_by_id(d->app, id);
 }
 
+/* SIGHUP reload -- port of Go's `case syscall.SIGHUP: app.LoadConfig()`.
+ * Re-reads the config file into a scratch mt_config_t and applies it in
+ * two ways:
+ *
+ * (1) The handful of app-level settings Go's own runtime code re-reads
+ *     live from a.config on every DNS request/record (dns.go's
+ *     DisableFakePTR/DisableDropAAAA, and Netfilter.IPSet.AdditionalTTL)
+ *     take live effect here too, via mt_dnsproxy_set_disable_flags/
+ *     mt_dns_pipeline_set_additional_ttl. Every OTHER app-level setting
+ *     (host/port, chain/table prefixes, start_mark_table_index, the
+ *     `link` list, show_all_interfaces, log level, ...) is captured once
+ *     at startup to construct already-running subsystems (the DNS proxy
+ *     listener, the netfilter helper, the port-53 remap) in both
+ *     backends -- Go's LoadConfig updates a.config's in-memory copy of
+ *     those fields too, but nothing in either backend re-reads them
+ *     afterward, so reloading them here would be no more "live" than in
+ *     Go. Documented as a deliberate scope boundary, not an oversight
+ *     (see decisions.md).
+ * (2) Groups and subscriptions are reloaded wholesale when their YAML
+ *     key was present (mt_config_t's groups_present/subscriptions_present,
+ *     mirroring Go's cfg.Groups/cfg.Subscriptions != nil check) --
+ *     mirrors LoadConfig's own "disable all, rebuild fresh" loop for
+ *     groups and its "replace the whole slice" for subscriptions.
+ *     A group that fails to re-add (rebuild/enable/sync failure) stops
+ *     the loop there, matching Go's early return from LoadConfig on the
+ *     first addGroupLocked error -- groups already reloaded before the
+ *     failure stay in place, exactly like Go's partial a.userRuleSets. */
+static void reload_config(struct daemon *d)
+{
+    mt_config_t reload_cfg;
+    if (mt_config_init_defaults(&reload_cfg) != MT_OK) {
+        MT_ERROR("failed to reload config: out of memory");
+        return;
+    }
+    mt_err_t err = mt_config_load_file(&reload_cfg, d->config_path);
+    if (err == MT_ERR_NOENT) {
+        MT_INFO("reload: config file %s not found, keeping current config",
+                d->config_path);
+        mt_config_clear(&reload_cfg);
+        return;
+    }
+    if (err != MT_OK) {
+        MT_ERROR("failed to reload config %s: %s", d->config_path,
+                 mt_err_str(err));
+        mt_config_clear(&reload_cfg);
+        return;
+    }
+
+    if (d->proxy) {
+        mt_dnsproxy_set_disable_flags(d->proxy,
+                                      reload_cfg.app.dns_proxy.disable_fake_ptr,
+                                      reload_cfg.app.dns_proxy.disable_drop_aaaa);
+    }
+    if (d->pipeline) {
+        uint32_t additional_ttl = (uint32_t)(
+            reload_cfg.app.netfilter.ipset.additional_ttl / MT_DURATION_SEC);
+        mt_dns_pipeline_set_additional_ttl(d->pipeline, additional_ttl);
+    }
+
+    if (reload_cfg.groups_present) {
+        mt_app_clear_groups(d->app);
+        for (size_t i = 0; i < reload_cfg.n_groups; i++) {
+            mt_group_t *g = reload_cfg.groups[i];
+            reload_cfg.groups[i] = NULL; /* ownership moves to mt_app_add_group */
+            mt_err_t gerr = mt_app_add_group(d->app, g);
+            if (gerr != MT_OK) {
+                MT_ERROR("failed to reload group: %s", mt_err_str(gerr));
+                break;
+            }
+        }
+    }
+
+    if (reload_cfg.subscriptions_present) {
+        mt_subscription_t **subs = reload_cfg.subscriptions;
+        size_t n_subs = reload_cfg.n_subscriptions;
+        reload_cfg.subscriptions = NULL; /* ownership moves below */
+        reload_cfg.n_subscriptions = 0;
+        mt_err_t serr = mt_app_replace_subscriptions(d->app, subs, n_subs);
+        if (serr != MT_OK) {
+            MT_ERROR("failed to reload subscriptions: %s", mt_err_str(serr));
+        }
+    }
+
+    mt_config_clear(&reload_cfg);
+    MT_INFO("config reloaded from %s", d->config_path);
+}
+
 static void on_signal(mt_loop_t *loop, int signo, void *ud)
 {
-    (void)ud;
+    struct daemon *d = ud;
     if (signo == SIGHUP) {
-        MT_INFO("received signal: hangup (reload not implemented yet)");
+        MT_INFO("received signal: hangup (reloading config)");
+        reload_config(d);
         return;
     }
     MT_INFO("received signal: %s", strsignal(signo));
@@ -141,6 +238,36 @@ static void on_cache_cleanup_timer(mt_loop_t *loop, void *ud)
     (void)loop;
     struct daemon *d = ud;
     mt_cache_cleanup(d->cache, now_unix());
+}
+
+/* Port of subscriptions.go's StartSubscriptionAutoUpdate: a periodic tick
+ * (Go: time.NewTicker(time.Minute); here: a timerfd-backed mt_loop timer
+ * with the same interval, fired once immediately at startup and every
+ * minute after -- mt_loop_add_timer's initial_ms==interval_ms semantics
+ * don't support "fire now, then every N", so the immediate first check
+ * is done directly at startup instead, see main()) that calls
+ * mt_app_sync_due_subscriptions and saves the config file on any change,
+ * exactly mirroring Go's own "if changed { SaveConfig } else nothing" --
+ * mt_app_sync_due_subscriptions itself doesn't save (app.h: it has no
+ * path/version), matching the maybe_save() pattern used by the HTTP
+ * subscription handlers. Runs on the same event-loop thread as
+ * everything else, so a slow upstream blocks DNS/HTTP for the duration
+ * of whichever subscriptions were due this tick (decisions.md D-33). */
+static void on_subscription_auto_update_timer(mt_loop_t *loop, void *ud)
+{
+    (void)loop;
+    struct daemon *d = ud;
+    bool changed = false;
+    mt_err_t err = mt_app_sync_due_subscriptions(d->app, now_unix(), &changed);
+    if (err != MT_OK) {
+        MT_ERROR("failed to sync subscriptions: %s", mt_err_str(err));
+    }
+    if (changed) {
+        mt_err_t serr = mt_app_save_config(d->app, d->config_path, MT_VERSION);
+        if (serr != MT_OK) {
+            MT_ERROR("failed to save config file: %s", mt_err_str(serr));
+        }
+    }
 }
 
 /* Match sink: dispatches into the matched group's ipset -- port of dns.go's
@@ -370,6 +497,13 @@ int main(int argc, char **argv)
 
     MT_INFO("starting MagiTrickle daemon (C) version=%s", MT_VERSION);
 
+    /* libcurl's documented contract: call this once, non-concurrently,
+     * before any thread performs a transfer (D-31) -- must happen before
+     * any subscription fetch, whether HTTP-triggered (subscriptions_api.c)
+     * or from the auto-update timer below. No other thread exists yet at
+     * this point in startup. */
+    mt_sub_fetch_global_init();
+
     mt_config_t cfg;
     if (mt_config_init_defaults(&cfg) != MT_OK) {
         MT_ERROR("failed to init config defaults");
@@ -387,6 +521,8 @@ int main(int argc, char **argv)
     mt_log_set_level(mt_log_level_from_str(cfg.app.log_level));
 
     struct daemon d = {0};
+    d.cfg = &cfg;
+    d.config_path = config_path;
 
     if (mt_loop_create(&d.loop) != MT_OK) {
         MT_ERROR("failed to create event loop");
@@ -545,7 +681,7 @@ int main(int argc, char **argv)
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGHUP);
-    if (mt_loop_add_signals(d.loop, &set, on_signal, NULL) != MT_OK) {
+    if (mt_loop_add_signals(d.loop, &set, on_signal, &d) != MT_OK) {
         MT_ERROR("failed to subscribe to signals");
         daemon_teardown(&d);
         mt_config_clear(&cfg);
@@ -639,6 +775,18 @@ int main(int argc, char **argv)
      * enable+sync, while the initial set was already brought up above. */
     mt_app_set_running(d.app, true);
 
+    /* ---- subscription auto-update: 1-minute tick, fires once now too ------- */
+
+    int sub_auto_update_timer = 0;
+    if (mt_loop_add_timer(d.loop, 0, MT_SUBSCRIPTION_AUTO_UPDATE_INTERVAL_MS,
+                          on_subscription_auto_update_timer, &d,
+                          &sub_auto_update_timer) != MT_OK) {
+        MT_ERROR("failed to schedule subscription auto-update");
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
+    }
+
     /* ---- HTTP API: Unix socket (always on) + TCP WebUI (config-gated) ------ */
 
     mt_groups_ctx_t groups_ctx = {
@@ -725,5 +873,6 @@ int main(int argc, char **argv)
     MT_INFO("service stopped");
     daemon_teardown(&d);
     mt_config_clear(&cfg);
+    mt_sub_fetch_global_cleanup();
     return err == MT_OK ? 0 : 1;
 }

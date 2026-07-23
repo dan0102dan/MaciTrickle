@@ -1277,3 +1277,91 @@ Verified: full suite (28 unit-test binaries, including 7 new HTTP-level
 tests in `test_subscriptions_api.c` against a real two-loop harness),
 `static_analysis` (0 warnings), `sanitize` (0 findings), and the
 extended `run_http_diff.sh` (44/44 steps identical, Go vs C) all clean.
+
+## D-35: Subscription auto-update timer (timerfd, 1-minute tick) and SIGHUP config reload
+
+**Auto-update**: a straightforward port of `StartSubscriptionAutoUpdate`
+onto `mt_loop_add_timer`. Go's `time.NewTicker(time.Minute)` preceded by
+one immediate `SyncDueSubscriptions` call becomes a single
+`mt_loop_add_timer(d.loop, 0, MT_SUBSCRIPTION_AUTO_UPDATE_INTERVAL_MS, ...)`
+— `initial_ms=0` fires almost immediately (`loop.c` already special-cases
+zero to a 1ns `it_value`, since an all-zero `itimerspec` disarms a
+timerfd rather than firing it) and then every 60s after, so one timer
+registration reproduces "fire now, then every minute" without a separate
+manual bootstrap call. The callback calls `mt_app_sync_due_subscriptions`
+and — mirroring Go's `if changed { SaveConfig }` — saves the config file
+only when it reports a change, via `mt_app_save_config` (the same
+maybe-save shape used by the HTTP subscription handlers, since
+`mt_app_sync_due_subscriptions` itself never saves — D-33). Runs on the
+same event-loop thread as DNS/HTTP, so it inherits the blocking-fetch
+tradeoff already named in D-33/D-34: a due subscription with a slow
+upstream stalls the whole daemon for the fetch's duration, once a
+minute. `mt_sub_fetch_global_init()`/`_cleanup()` (D-31 had deferred
+wiring this) are now called at daemon startup/shutdown — load-bearing
+for the first time in Phase 7, since this timer (and the sync HTTP
+endpoints, D-34) are the first production code paths that actually
+invoke `mt_sub_fetch_list`.
+
+**SIGHUP reload**: replaces the previous "reload not implemented yet"
+stub with a real port of Go's `case syscall.SIGHUP: app.LoadConfig()`.
+Re-reads the config file into a scratch `mt_config_t` (fresh
+`mt_config_init_defaults` + `mt_config_load_file`, exactly like
+startup); a missing file is a no-op (matches Go's
+`errors.Is(err, os.ErrNotExist) { return nil }`), any other parse error
+is logged and also a no-op (nothing is applied) rather than leaving the
+live config half-migrated.
+
+Two things are actually applied, deliberately not everything Go's
+`LoadConfig` touches:
+
+1. **Groups and subscriptions**, gated on `mt_config_t`'s
+   `groups_present`/`subscriptions_present` flags (already tracked since
+   Phase 2 for exactly this "was the YAML key present at all" distinction
+   — mirrors Go's `cfg.Groups != nil`/`cfg.Subscriptions != nil` checks).
+   Groups: `mt_app_clear_groups` (disable + empty) then one
+   `mt_app_add_group` per freshly-parsed group, transferring ownership of
+   each `mt_group_t*` out of the scratch config as it's consumed (NULLing
+   the source slot so the scratch config's later `mt_config_clear` can't
+   double-free it) — mirrors `LoadConfig`'s own "disable all, rebuild
+   fresh" loop, including stopping at the first `addGroupLocked` failure
+   and leaving whatever was already re-added in place (Go doesn't roll
+   those back either). Subscriptions: one `mt_app_replace_subscriptions`
+   call with the whole freshly-parsed array (ownership of the array and
+   every element transferred the same way) — this already IS a wholesale
+   replace with its own rollback-on-rebuild-failure (D-32), unlike
+   groups, which have no such primitive and are reloaded one at a time
+   instead.
+2. **The specific handful of app-level settings Go's own runtime code
+   re-reads live from `a.config` on every DNS request/record**
+   (`dns.go`): `DisableFakePTR`/`DisableDropAAAA` (checked per-message)
+   and `Netfilter.IPSet.AdditionalTTL` (added to every matched record's
+   TTL). Traced every `a.config.*` read site in `dns.go`/`start.go`
+   specifically to answer "what does Go's own reload actually change
+   live, versus just update in an already-inert copy" before deciding
+   this split — `Host`/`Upstream`/`MaxIdleConns`/`MaxConcurrent`/`Timeout`,
+   the netfilter chain/table prefixes, `StartMarkTableIndex`,
+   `DisableIPv4`/`DisableIPv6`, the `link` list, and `LogLevel` are all
+   read exactly once in `start.go` to construct already-running
+   subsystems (the proxy listener, the netfilter helper, the port-53
+   remap) — Go's `LoadConfig` updates `a.config`'s in-memory copies of
+   these too, but nothing reads them again afterward, so they are no
+   more "live" in Go than in this port. New setters
+   (`mt_dnsproxy_set_disable_flags`, `mt_dns_pipeline_set_additional_ttl`)
+   were added specifically to make the two genuinely-live settings behave
+   identically in C — not a shortcut, a deliberate parity fix, verified
+   manually (see below). Every other field is left as a documented scope
+   boundary rather than silently ignored.
+
+**Verified manually against the real daemon binary** (no dedicated
+`main.c` test binary exists; this exercises code paths the unit suite
+can't reach): started `magitrickled-c` with an empty config, appended a
+group to the config file on disk, sent `SIGHUP`, and confirmed
+`GET /api/v1/groups` immediately showed the reloaded group over HTTP;
+repeated with a second reload back to empty plus a subscription add,
+then a clean `SIGTERM` shutdown -- all under the sanitize build
+(ASan+UBSan instrumented `magitrickled-c`), zero findings across two
+reload cycles, the auto-update timer's immediate first tick, and
+shutdown. Also re-ran the full unit suite (28 binaries), `static_analysis`
+(0 warnings), `sanitize` (0 findings), and `run_http_diff.sh` (44/44
+steps, Go vs C byte-identical, confirming `mt_sub_fetch_global_init`
+wired into startup didn't change any observable behavior) — all clean.
