@@ -122,3 +122,23 @@ Package size is a non-goal for the C port; UPX increases startup RSS (whole
 image resident, non-shareable pages). Phase 8: measure C binary startup/RSS
 with and without UPX and keep it only if it does not regress RAM (expected
 outcome: drop UPX).
+
+**Measured (Phase 8, host x86_64, `magitrickled-c`, 266,520 → 98,652 bytes,
+37.01% ratio with `upx -9 --lzma`)**: 30-run average wall-clock startup
+(exec → daemon's early-exit path, identical workload both variants) was
+**13.4 ms plain vs 21.6 ms UPX-compressed — UPX adds ~8 ms (~62%) to every
+process start**, consistent across two independent 20/30-run batches.
+Peak RSS was statistically indistinguishable (10.84 MB plain vs 10.83 MB
+UPX, 10-run average each) — at this binary size (hundreds of KB, not the Go
+binary's ~10 MB), RSS is dominated by the dynamically-linked shared
+libraries (libc, libyaml, PCRE2, libmnl, cJSON, libcurl + libcurl's own
+TLS/auth dependency chain), not by the executable's own resident image, so
+UPX's "whole image resident" cost barely registers against that baseline —
+but the decompression-at-exec cost is pure, unconditional latency with **no
+offsetting benefit**: 168 KB of on-disk savings is noise against a package
+already dominated by the frontend's `dist/` assets. **Decision: drop UPX
+for the C backend** — confirmed by measurement, not just the a priori
+expectation above. The root Makefile already reflects this: `BACKEND=c`'s
+build step (`Makefile`'s `build-backend-$(UNIQUE_NAME)` recipe) has never
+invoked `upx` — only the `BACKEND=go` branch does — so no Makefile change
+was needed to act on this decision, only to confirm it was the right one.
