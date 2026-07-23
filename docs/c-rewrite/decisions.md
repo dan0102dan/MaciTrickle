@@ -1494,3 +1494,65 @@ binaries, including the new regression test in `test_sub_sync.c`),
 `static_analysis` (0 warnings), `sanitize` (0 findings), and
 `run_http_diff.sh` (44/44 steps Go vs C byte-identical) — all clean
 after the fix.
+
+## D-37: `build_backend` gains a real C path — `BACKEND` switch, not a project-wide cutover
+
+**A new `BACKEND` variable (`go` default, `c` opt-in) drives the root
+Makefile's `build_backend`**, mirrored in `BACKEND_SOURCES`/
+`BACKEND_DEPENDENCIES`/`BACKEND_BUILD_PROPERTIES` so the existing
+stamp-based incremental build correctly invalidates on either a Go or a
+C source-tree change (not both, and not neither) and on any `BACKEND`/
+`C_CROSS_COMPILE`/`C_SYSROOT` change. `BACKEND=c` invokes `src/backend-c`'s
+own Makefile with `BUILD=$(UNIQUE_NAME)` (so per-target build artifacts
+stay isolated exactly like the existing `.build/$(PLATFORM)_$(TARGET)/`
+scheme) and copies its `magitrickled-c` output to the same
+`$(COMPILE_DIR)/magitrickled` path the Go build already produces —
+`prepare_files`/packaging needed **zero** changes to consume either
+backend's output, confirmed by running both paths back to back on host.
+
+**Deliberately NOT a project-wide cutover.** `BACKEND` defaults to `go`,
+so every existing `config/*/*.config` target — and CI's entire build
+matrix — keeps building exactly as before. Migration-plan.md's Phase 8
+exit criterion ("`make build_backend` switches to C for all 40 targets")
+requires a real cross-toolchain + sysroot (providing libyaml, cJSON,
+PCRE2, libmnl, libcurl built for that target's libc) for every one of the
+40 `config/*/*.config` targets — infrastructure this sandbox cannot
+provision: `downloads.openwrt.org` is blocked by the session's egress
+policy (confirmed via the agent-proxy status endpoint: a genuine 403
+policy denial, not a transient failure — per the proxy's own guidance,
+not retried or routed around), and no Entware toolchain image registry
+is reachable either. Flipping the *default* to `c` without real per-target
+sysroots would silently break the 40-target CI matrix the moment this
+lands — the opposite of the spec's "components move one at a time behind
+contracts." Two new variables, `C_CROSS_COMPILE`/`C_SYSROOT`, make this a
+per-target, explicit opt-in instead: a target only builds via C once
+someone supplies its real toolchain prefix and a sysroot with the 5 libs
+— exactly the "flip Recipe" the plan anticipated, just not exercisable
+end-to-end for the full matrix from inside this sandbox.
+
+**`src/backend-c/Makefile`'s cross-build path no longer restricts itself
+to the dependency-free core.** Previously `ifneq ($(CROSS_COMPILE),) all:
+core` (i.e. only the 5-dep-free subset) built under cross-compilation at
+all, explicitly deferred to "Phase 8 provides the feed sysroots." Now
+`all` always targets the full daemon + tools, matching the host build —
+a `CROSS_COMPILE`+`SYSROOT` invocation either produces the complete
+`magitrickled-c` (given a sysroot with the 5 deps) or fails at the exact
+missing-header boundary, rather than silently succeeding with a partial,
+non-shippable core-only build. `core` remains available as an explicit
+opt-in for anyone who genuinely only wants the dependency-free subset
+(e.g. an early sysroot-less smoke build).
+
+**Verified the mechanism, not the full matrix**: `make BACKEND=c
+build_backend` on host (no `C_CROSS_COMPILE`) produced a correct
+host-native `magitrickled-c` at `$(COMPILE_DIR)/magitrickled`; `make
+BACKEND=c C_CROSS_COMPILE=mipsel-linux-gnu- build_backend` (a real cross
+compiler available in this sandbox, though not the exact Entware
+toolchain) correctly cross-compiled every object file with
+`mipsel-linux-gnu-gcc` and failed at exactly the expected point — a
+missing `curl/curl.h`, since no sysroot was supplied — proving the
+`CROSS_COMPILE`/`SYSROOT` plumbing threads correctly from the root
+Makefile through to `src/backend-c`'s `CC`/`--sysroot` flags. Re-ran the
+default (`BACKEND=go`, unset) path end to end afterward, including the
+UPX step, to confirm zero regression to the existing production build.
+Full sysroot-backed cross validation is task-scoped separately (see the
+next decision entry).

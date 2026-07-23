@@ -106,12 +106,36 @@ GO_FLAGS := \
 
 GO_PARAMS = -v -trimpath -ldflags="-X 'magitrickle/constant.Version=$(PKG_VERSION)' -w -s" $(if $(GO_TAGS),-tags "$(GO_TAGS)")
 
+# Backend language switch (migration-plan.md Phase 8: build_backend gains a
+# real C path). Default stays `go` so every existing config/*/*.config
+# target (and CI's build matrix) keeps building exactly as before --
+# flipping a target to `c` requires a real cross-toolchain descriptor
+# (C_CROSS_COMPILE/C_SYSROOT below), which only exists today for targets
+# validated in docs/c-rewrite/toolchains.md's Phase 8 section. This is a
+# deliberate, per-target opt-in, not a project-wide cutover: real Entware/
+# OpenWrt toolchain+feed sysroots for the other targets are not available
+# to build or verify against yet (see decisions.md D-37).
+BACKEND ?= go
+
+# Only meaningful when BACKEND=c: cross-toolchain prefix (passed straight
+# to src/backend-c/Makefile's CROSS_COMPILE) and the sysroot providing the
+# 5 feed deps (libyaml, cJSON, PCRE2, libmnl, libcurl) built for that
+# target/libc. Empty means host-native gcc -- correct only when TARGET
+# actually matches the build host's own architecture (e.g. local dev).
+C_CROSS_COMPILE ?=
+C_SYSROOT ?=
+
 # Incremental data
 
+ifeq ($(BACKEND),go)
 BACKEND_DEPENDENCIES := ./src/backend/go.mod ./src/backend/go.sum
 BACKEND_SOURCES := $(shell find ./src/backend -type f -name '*.go' 2>/dev/null)
 BACKEND_SOURCES += $(BACKEND_DEPENDENCIES)
-BACKEND_BUILD_PROPERTIES := PLATFORM=\"$(PLATFORM)\" TARGET=\"$(TARGET)\" GOOS=\"$(GOOS)\" GOARCH=\"$(GOARCH)\" GOMIPS=\"$(GOMIPS)\" GOARM=\"$(GOARM)\" GO386=\"$(GO386)\" GO_TAGS=\"$(GO_TAGS)\" PKG_VERSION=\"$(PKG_VERSION)\"
+else
+BACKEND_DEPENDENCIES :=
+BACKEND_SOURCES := $(shell find ./src/backend-c/src ./src/backend-c/include -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null)
+endif
+BACKEND_BUILD_PROPERTIES := BACKEND=\"$(BACKEND)\" PLATFORM=\"$(PLATFORM)\" TARGET=\"$(TARGET)\" GOOS=\"$(GOOS)\" GOARCH=\"$(GOARCH)\" GOMIPS=\"$(GOMIPS)\" GOARM=\"$(GOARM)\" GO386=\"$(GO386)\" GO_TAGS=\"$(GO_TAGS)\" PKG_VERSION=\"$(PKG_VERSION)\" C_CROSS_COMPILE=\"$(C_CROSS_COMPILE)\" C_SYSROOT=\"$(C_SYSROOT)\"
 
 FRONTEND_DEPENDENCIES := ./src/frontend/package.json ./src/frontend/package-lock.json
 FRONTEND_SOURCES := $(shell find ./src/frontend/src -type f 2>/dev/null)
@@ -160,7 +184,9 @@ build: build_backend build_frontend
 # Backend
 
 $(STAMPS_DIR)/download-backend: $(BACKEND_DEPENDENCIES)
+ifeq ($(BACKEND),go)
 	cd ./src/backend && go mod tidy
+endif
 
 	@mkdir -p $(STAMPS_DIR)
 	@touch "$(STAMPS_DIR)/download-backend"
@@ -177,9 +203,16 @@ $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME): FORCE
 
 $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME): $(STAMPS_DIR)/download-backend $(BACKEND_SOURCES) $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME)
 	mkdir -p "$(COMPILE_DIR)"
+ifeq ($(BACKEND),go)
 	cd ./src/backend && $(GO_FLAGS) go build $(GO_PARAMS) -o "../../$(COMPILE_DIR)/magitrickled" ./cmd/magitrickled
 ifneq ($(filter $(GOARCH),riscv64 mips64 mips64le loong64),$(GOARCH))
 	upx -9 --lzma "$(COMPILE_DIR)/magitrickled"
+endif
+else
+	$(MAKE) -C ./src/backend-c BUILD="$(UNIQUE_NAME)" MT_VERSION="$(PKG_VERSION)" \
+	    $(if $(C_CROSS_COMPILE),CROSS_COMPILE="$(C_CROSS_COMPILE)") \
+	    $(if $(C_SYSROOT),SYSROOT="$(C_SYSROOT)")
+	cp "./src/backend-c/build/$(UNIQUE_NAME)/magitrickled-c" "$(COMPILE_DIR)/magitrickled"
 endif
 
 	@mkdir -p $(STAMPS_DIR)
@@ -187,10 +220,14 @@ endif
 
 build_backend: $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)
 
-# C backend (migration in progress, docs/c-rewrite/): host build only for
-# now; becomes the production build_backend at migration Phase 8.
+# Host-native C backend dev build, unrelated to the packaging BACKEND
+# switch above -- a thin alias kept for the entrypoint D-01 introduced in
+# Phase 1 ("parallel build_backend_c until switchover"). Equivalent to
+# `make BACKEND=c build_backend` with the current PLATFORM/TARGET, but
+# skips CROSS_COMPILE/SYSROOT (host gcc only) -- for local iteration, not
+# packaging a real cross target.
 build_backend_c:
-	$(MAKE) -C ./src/backend-c MT_VERSION="$(PKG_VERSION)"
+	$(MAKE) build_backend BACKEND=c
 
 rebuild_backend:
 	@rm -f "$(STAMPS_DIR)/build-backend"

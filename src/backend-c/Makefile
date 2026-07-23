@@ -1,13 +1,20 @@
-# MagiTrickle C backend — build system (Phase 1 foundation).
+# MagiTrickle C backend — build system.
 #
 # Host build:        make            (-> build/host/magitrickled-c)
 # Tests:             make test
 # Sanitizers:        make sanitize   (ASan+UBSan build of tests, host only)
 # Static analysis:   make static_analysis (clang-tidy + cppcheck if present)
-# Cross build:       make CROSS_COMPILE=mipsel-openwrt-linux- \
+# Cross build:       make CROSS_COMPILE=mipsel-linux-gnu- \
 #                         SYSROOT=/path/to/sysroot BUILD=cross-mipsel
 #   Per-target CFLAGS/LDFLAGS come from the toolchain descriptor
-#   (docs/c-rewrite/toolchains.md); never use -march=native.
+#   (docs/c-rewrite/toolchains.md); never use -march=native. SYSROOT must
+#   provide the 5 feed deps (libyaml, cJSON, PCRE2, libmnl, libcurl) built
+#   for that target/libc, or the link step fails -- this Makefile builds
+#   the full daemon (not just the dependency-free core) for any
+#   CROSS_COMPILE target given a sysroot with those 5 libs (Phase 8; see
+#   decisions.md D-37/D-38 for which real targets have been validated this
+#   way in this sandbox, and which remain unverified pending real
+#   Entware/OpenWrt toolchain+feed provisioning).
 
 CROSS_COMPILE ?=
 CC       := $(CROSS_COMPILE)gcc
@@ -153,14 +160,12 @@ FUZZ_BINS := $(FUZZ_SRCS:tests/fuzz/%.c=$(BUILDDIR)/fuzz/%)
 
 .PHONY: all core clean test sanitize static_analysis fuzz
 
-# The full daemon loads YAML config, so it links the config layer + deps.
-# Cross builds compile only the dependency-free core (Phase 8 provides the
-# feed sysroots for libyaml/pcre2 needed to cross-build the whole daemon).
-ifneq ($(CROSS_COMPILE),)
-all: core
-else
+# The full daemon loads YAML config, so it links the config layer + deps
+# (libyaml/cJSON/PCRE2/libmnl/libcurl) -- cross builds need those 5 libs
+# present in SYSROOT (Phase 8; `core` below remains available for anyone
+# who only wants the dependency-free subset, e.g. an early sysroot-less
+# cross smoke build).
 all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool $(BUILDDIR)/mt-dnstool $(BUILDDIR)/mt-cachetool
-endif
 
 core: $(CORE_OBJS)
 
