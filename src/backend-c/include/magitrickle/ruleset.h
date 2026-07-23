@@ -60,6 +60,13 @@ mt_ruleset_t *mt_ruleset_new(const mt_group_t *group, const mt_ruleset_deps_t *d
 void mt_ruleset_free(mt_ruleset_t *rs);
 
 const mt_group_t *mt_ruleset_group(const mt_ruleset_t *rs);
+/* Mutable accessor to the same borrowed group pointer mt_ruleset_group
+ * returns -- the group is genuinely mutable (owned by cfg->groups, see
+ * app.h's header comment), the ruleset just stores it as const to keep
+ * ruleset.c itself read-only. Used by the HTTP group/rule handlers
+ * (Phase 6) to mutate a group's fields in place, mirroring Go's
+ * RuleSet.Model() returning a *models.Group the caller mutates directly. */
+mt_group_t *mt_ruleset_group_mut(mt_ruleset_t *rs);
 bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs);
 
 mt_err_t mt_ruleset_enable(mt_ruleset_t *rs);

@@ -193,6 +193,10 @@ const mt_group_t *mt_ruleset_group(const mt_ruleset_t *rs) {
     return rs->group;
 }
 
+mt_group_t *mt_ruleset_group_mut(mt_ruleset_t *rs) {
+    return (mt_group_t *)rs->group;
+}
+
 bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs) {
     return rs->enabled;
 }

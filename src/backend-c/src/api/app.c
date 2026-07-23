@@ -156,6 +156,10 @@ mt_err_t mt_app_add_group(mt_app_t *app, mt_group_t *group) {
     return MT_OK;
 }
 
+mt_err_t mt_app_sync_group(mt_app_t *app, mt_ruleset_t *rs) {
+    return mt_ruleset_sync(rs, app->cache, (int64_t)time(NULL));
+}
+
 void mt_app_clear_groups(mt_app_t *app) {
     for (size_t i = 0; i < app->n_rulesets; i++) {
         mt_ruleset_disable(app->rulesets[i]);

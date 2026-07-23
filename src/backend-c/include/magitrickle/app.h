@@ -82,6 +82,13 @@ mt_ruleset_t *mt_app_find_group_by_id(const mt_app_t *app, mt_id_t id);
  * removeAdded closure). */
 mt_err_t mt_app_add_group(mt_app_t *app, mt_group_t *group);
 
+/* Re-syncs a single already-registered ruleset using the app's shared cache
+ * and current time -- used by the group/rule HTTP handlers (Phase 6) after
+ * editing an enabled group's rules, mirroring Go's RuleSet.Sync() (which
+ * reaches a.recordsCache through the RuleSet's owning *App). rs must be one
+ * of app's own rulesets (e.g. from mt_app_find_group_by_id). */
+mt_err_t mt_app_sync_group(mt_app_t *app, mt_ruleset_t *rs);
+
 /* Disables every group (matches Go's ClearGroups, which -- unlike
  * RemoveGroupByIndex/RemoveGroupByID below -- does call Disable() itself)
  * then frees every mt_ruleset_t and empties cfg->groups. */

@@ -491,3 +491,90 @@ exercises `mt_app_add_group`'s real failure path: adding an
 kernel module — the same Phase-0/Phase-5 finding), and the test confirms
 the group is removed from both the ruleset list and `cfg.groups` after
 the rollback, not left half-added.
+
+## D-26: Groups/Rules HTTP handlers (`groups.h`/`groups.c`)
+
+Ports `api/v1/handlers.go`'s group+rule handlers and
+`api/v1/converters.go` (compatibility-contract.md §2's groups/rules row)
+onto the Phase 6 `mt_httpd_t` + `mt_app_t` layers. DTO JSON is
+built/parsed directly with cJSON inside `groups.c` rather than a separate
+public type — mirrors `converters.go` living in the same Go package as
+`handlers.go`; nothing outside this module needs the wire shape.
+
+**Mutable access to a live group.** Go's `RuleSet.Model()` returns
+`*models.Group`, the *same* object the caller mutates in place (e.g.
+`PutGroup`'s `GroupFromReq(req, groupWrapper.Model())`). `mt_ruleset_t`
+stores its group as `const mt_group_t *` (ruleset.c is read-only over
+it), so a new accessor, `mt_ruleset_group_mut()`, was added to
+`ruleset.h`/`ruleset.c` — it returns the same borrowed pointer without
+the `const` qualifier. This is a legitimate cast, not a const-away hack:
+the pointee is genuinely mutable (owned by `cfg->groups`, per D-25), only
+`ruleset.c`'s own accessor was const for its internal safety. Used by
+`handle_put_group`/`handle_put_rule`/etc. to edit a group/rule's fields
+in place, preserving its `cfg->groups[i]` identity — critical, since
+every `mt_ruleset_t` borrows that exact pointer and swapping it out from
+under the ruleset would require re-pointing the ruleset too.
+
+**Building vs. mutating in place.** Unlike Go, `group_from_req()` in
+`groups.c` always returns a brand-new `mt_group_t*` rather than mutating
+`existing` directly (matching Go's signature `GroupFromReq(req,
+existing)` in spirit, not by aliasing the same memory). For `PutGroup`,
+where the live group's identity must be preserved, the new object is
+then transplanted onto the live one field-by-field
+(`group_move_into()`, which frees the live group's old contents, moves
+the built object's pointers over, and frees the now-empty built shell
+with a plain `free()` — not `mt_group_free()`, which would double-free
+the pointers just moved). For `CreateGroup`/`PutGroups`, the freshly
+built object becomes the live one directly via `mt_app_add_group`
+(which always takes ownership).
+
+**Lenient vs. strict rule-ID reuse — a real Go distinction, not a
+divergence.** Go has two different ID-matching code paths for rules,
+faithfully kept as two separate C functions:
+- `rule_from_req()` (lenient, mirrors `RuleFromReq`): used for
+  `CreateRule`, and for a `GroupReq`'s nested `"rules"` array
+  (`CreateGroup`/`PutGroup`/`PutGroups`). An `"id"` that doesn't match
+  any baseline rule is *not* an error — Go silently assigns a fresh
+  random ID instead of failing.
+- `rule_from_req_strict()`: used only by `PutRules` (the group-level
+  bulk rule replace), which has its own inline found-tracking loop in
+  Go, distinct from `RuleFromReq` — an unmatched `"id"` here is
+  `MT_ERR_NOENT` → HTTP 404 ("rule not found"), and a body missing the
+  top-level `"rules"` key is 400 ("no rules in request").
+
+`PutRule` (single-rule update by path) matches Go exactly by *not*
+calling either converter: it mutates the path-resolved rule's fields in
+place and never reads the body's own `"id"` field at all (Go: `rule :=
+groupWrapper.Model().Rules[ruleIdx]; rule.Name = req.Name; ...`).
+
+**Documented gap: subscription rule-set sync.** Go's `PutGroups` also
+calls `h.app.SyncSubscriptionRuleSets()` after replacing the group list.
+Subscriptions aren't wired into `mt_app_t` yet (that's Phase 6 task
+#36), so this call is a no-op here for now — noted with a code comment
+at the call site in `handle_put_groups`, to be revisited once
+subscriptions land.
+
+**Middleware-index smuggling not replicated.** Go's chi router resolves
+`groupID`/`ruleID` path params in nested middleware and smuggles the
+resulting index to inner handlers via a request header
+(`r.Header.Set("groupIdx", ...)`). The C router's `{name}` path-param
+support makes this unnecessary: each handler resolves `groupID`/`ruleID`
+directly off the request (`resolve_group`/`resolve_rule`), producing the
+same 400 (invalid hex id) / 404 (not found) behavior without the
+header-passing indirection — an implementation simplification with no
+observable behavior change.
+
+Verified in `tests/unit/test_groups.c` (10 tests, HTTP-level against a
+real `mt_httpd_t` + `mt_app_t` over the background-loop-thread +
+blocking-client harness already established by `test_httpd.c`/
+`test_auth.c`): empty list, create with color normalization and default
+`enable`, invalid/unknown group and rule ids, `PutGroup` preserving rules
+when the body omits `"rules"` and rejecting an ID mismatch, delete,
+bulk `PutGroups` reusing group/rule IDs across a replace while dropping
+unreferenced groups, full rule CRUD, and `PutRules`' strict-vs-lenient
+ID validation. The app under test is never marked "running", so
+enable/disable/sync are no-ops regardless of a group's `enable` field —
+the real-netfilter-backed failure path through these handlers is a thin,
+already-tested pass-through of `mt_ruleset_t`/`mt_app_t` return codes
+(see `test_app.c`'s `add_group_while_running_rolls_back_on_failure`),
+so it isn't re-exercised at the HTTP layer here.
