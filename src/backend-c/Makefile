@@ -38,7 +38,11 @@ CFLAGS   += $(CSTD) $(OPT) $(WARNINGS) -Iinclude -MMD -MP \
 CFLAGS_EXTRA ?=
 CFLAGS   += $(CFLAGS_EXTRA)
 LDFLAGS  ?=
-LDLIBS   := -lpthread
+# -latomic: src/dns/proxy.c uses 8-byte C11 atomics (counters/deadlines);
+# 32-bit targets (mipsel, arm, ...) lack native 64-bit atomic instructions
+# and lower __atomic_* calls to libatomic, which glibc/musl toolchains
+# ship but the linker won't pull in implicitly.
+LDLIBS   := -lpthread -latomic
 ifneq ($(SYSROOT),)
 CFLAGS  += --sysroot=$(SYSROOT)
 LDFLAGS += --sysroot=$(SYSROOT)
@@ -165,7 +169,22 @@ FUZZ_BINS := $(FUZZ_SRCS:tests/fuzz/%.c=$(BUILDDIR)/fuzz/%)
 # present in SYSROOT (Phase 8; `core` below remains available for anyone
 # who only wants the dependency-free subset, e.g. an early sysroot-less
 # cross smoke build).
+#
+# A CROSS_COMPILE build with no SYSROOT has nowhere to find those 5 libs
+# for the target arch, so it stays core-only, exactly as before Phase 8 --
+# this is what keeps the existing CI cross_build job (mipsel-linux-gnu, no
+# feed sysroot) working. Passing SYSROOT opts a target into the full
+# daemon build (see root Makefile's BACKEND/C_CROSS_COMPILE/C_SYSROOT).
+# mt-dnstool/mt-cachetool link against CORE_OBJS only (no DEP_LIBS), so
+# they are real, fully-linked binaries a sysroot-less cross build can
+# still produce -- CI's cross_build job checks one of these (not
+# magitrickled-c, which core-only cannot produce) for real target-arch
+# code, not just successful .o compilation.
+ifneq ($(and $(CROSS_COMPILE),$(if $(SYSROOT),,1)),)
+all: core $(BUILDDIR)/mt-dnstool $(BUILDDIR)/mt-cachetool
+else
 all: $(BUILDDIR)/magitrickled-c $(BUILDDIR)/mt-configtool $(BUILDDIR)/mt-dnstool $(BUILDDIR)/mt-cachetool
+endif
 
 core: $(CORE_OBJS)
 

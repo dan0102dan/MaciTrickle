@@ -1556,3 +1556,102 @@ default (`BACKEND=go`, unset) path end to end afterward, including the
 UPX step, to confirm zero regression to the existing production build.
 Full sysroot-backed cross validation is task-scoped separately (see the
 next decision entry).
+
+## D-38: Fixing real GitHub Actions CI failures (host build, mipsel cross_build, frontend unit tests)
+
+**A live CI run on `check-c.yml`/`check.yml` (GitHub Actions, not this
+sandbox) surfaced three failures**, none of them hypothetical, requiring
+targeted fixes rather than another docs-only note:
+
+1. **`check-c.yml`'s `build_test` job failed with `libmnl/libmnl.h: No
+   such file or directory`.** Its "Install tooling" step only ever
+   installed `libpcre2-dev libyaml-dev` — never updated when Phase 5
+   added `libmnl` (ipset via netlink), Phase 6 added `cJSON`, or Phase 7
+   added `libcurl`. This was a **pre-existing gap that predates Phase 8**,
+   not something D-37 introduced — the host build has linked against all
+   5 feed deps since Phase 7 at the latest, and the CI tooling-install
+   step was simply never kept in sync. Fixed by adding `libmnl-dev
+   libcjson-dev libcurl4-openssl-dev` to both the `build_test` job's
+   "Install tooling" step and the `differential` job's "Install
+   libraries" step (the latter's `run_diff.sh` also builds the full
+   daemon to run the HTTP contract suite against it).
+
+2. **`check-c.yml`'s `cross_build` job (mipsel-linux-gnu, no sysroot)
+   failed to compile at all — a real regression from D-37.** D-37's
+   `all` target change made cross builds always attempt the full daemon
+   regardless of whether a `SYSROOT` was supplied, so the long-standing
+   `cross_build` job — which only ever installs `gcc-mipsel-linux-gnu`,
+   by design, to prove a dependency-free skeleton cross-compiles — now
+   failed at the first missing feed header (`libmnl/libmnl.h`, same as
+   (1)) instead of succeeding as it always had. Fixed by re-conditioning
+   `all`: `CROSS_COMPILE` set **and** `SYSROOT` empty stays core-only
+   (restoring the pre-Phase-8 behavior this job depends on); `SYSROOT`
+   supplied (or no `CROSS_COMPILE` at all, i.e. host) still builds the
+   full daemon, preserving D-37's actual point — a per-target opt-in via
+   the root Makefile's `BACKEND=c`/`C_CROSS_COMPILE`/`C_SYSROOT`.
+   D-37's rationale comment ("all always targets the full daemon,
+   matching the host build") was simply wrong about what "always" could
+   safely mean here; corrected in the Makefile's own comment too.
+
+   While re-verifying this job end to end, found a **second,
+   independent, longer-standing bug**: the job's own final assertion,
+   `file build/cross-mipsel-linux-gnu/magitrickled-c | grep -q MIPS`, has
+   named a binary that a core-only cross build has never produced —
+   `core: $(CORE_OBJS)` compiles objects only, no link step — since
+   Phase 3 introduced `CONFIG_SRCS` (the point at which "core" stopped
+   being the whole daemon). This predates D-37 by five phases and was
+   never exercised as a real pass/fail signal in this sandbox (git log
+   shows `check-c.yml` untouched since Phase 3). Fixed properly rather
+   than patched around: `mt-dnstool`/`mt-cachetool` link against
+   `$(CORE_OBJS)` only (no `DEP_LIBS`), so they are real, fully linked,
+   dependency-free binaries a sysroot-less cross build **can** produce.
+   The core-only `all` branch now also links these two; the CI assertion
+   now checks `mt-dnstool` (confirmed `ELF 32-bit LSB executable, MIPS,
+   MIPS32 rel2 ... for GNU/Linux`) instead of the unreachable
+   `magitrickled-c`.
+
+   Linking `mt-dnstool` for mipsel then exposed a **third, genuinely new**
+   issue: `undefined reference to __atomic_fetch_add_8`/`__atomic_load_8`
+   from `src/dns/proxy.c`, which uses 8-byte C11 atomics for
+   counters/deadlines. 32-bit targets (mipsel, arm, ...) lack a native
+   64-bit atomic instruction, so gcc lowers those built-ins to libatomic
+   calls that the linker won't pull in implicitly. Fixed by adding
+   `-latomic` to `LDLIBS` unconditionally — confirmed present for both
+   the host toolchain and every cross toolchain available in this sandbox
+   (`gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabihf`,
+   `gcc-mipsel-linux-gnu`, `gcc-riscv64-linux-gnu`), and harmless on
+   64-bit hosts where it's linked but unused. This is exactly the kind of
+   thing Phase 9's real-toolchain validation needs to re-confirm for the
+   actual Entware/OpenWrt musl/glibc toolchains, since libatomic
+   packaging varies more across embedded toolchains than it does across
+   Ubuntu's cross packages.
+
+3. **`check.yml`'s `test_frontend` job failed before running a single
+   test**: `deno.json` deserialization error, `invalid type: string
+   "auto", expected a boolean`, for the `nodeModulesDir` field. This file
+   is untouched by the C rewrite (last changed March 2026, well before
+   Phase 0) — a pre-existing frontend/CI drift, not a rewrite-caused
+   regression, but still blocking the CI this task was asked to fix.
+   `nodeModulesDir: "auto"` requires a Deno version new enough to parse
+   the string-enum form; whatever `denoland/setup-deno@v1` resolves
+   `deno-version: v1.x` to in the live CI environment does not. Rather
+   than chase which exact Deno version the action currently resolves (not
+   verifiable from this sandbox — outbound access to Deno's/GitHub's
+   release assets is blocked by the same egress policy as D-37's
+   OpenWrt-download block), fixed the config itself: `nodeModulesDir:
+   true` is the boolean form of the same "auto-manage a local
+   `node_modules`" behavior and has always been accepted, so it parses
+   correctly regardless of which Deno 1.x patch is actually installed.
+
+**Verification**: host build (`make CFLAGS_EXTRA=-Werror`), `make test`
+(28/28 binaries pass), `make sanitize` (0 ASan/UBSan findings), `make
+static_analysis` (0 warnings), and `tests/differential/run_diff.sh`
+(all suites OK, including the 44-step HTTP contract) all re-run clean
+after these fixes. The mipsel `cross_build` job's exact commands
+reproduced locally end to end: compiles, links `mt-dnstool`, and `file`
+confirms real MIPS object code. `deno.json` re-validated as parseable
+JSON with the corrected field. Frontend Deno test *execution* itself
+(beyond config parsing) and Playwright e2e were not re-run in this
+sandbox (no Deno binary available here — same reachability constraint);
+the config fix specifically targets the reported deserialization error,
+which occurs before any test logic runs.

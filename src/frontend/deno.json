@@ -12,5 +12,5 @@
     "checkJs": true,
     "lib": ["deno.ns", "ESNext", "DOM"]
   },
-  "nodeModulesDir": "auto"
+  "nodeModulesDir": true
 }

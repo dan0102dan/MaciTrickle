@@ -21,7 +21,7 @@ jobs:
       - name: Install tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-tidy cppcheck libpcre2-dev libyaml-dev
+          sudo apt-get install -y clang-tidy cppcheck libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev
 
       - name: Build (warnings as errors)
         working-directory: src/backend-c
@@ -61,7 +61,7 @@ jobs:
       - name: Install libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpcre2-dev libyaml-dev
+          sudo apt-get install -y libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev
 
       - name: Run differential suites
         working-directory: src/backend-c
@@ -84,4 +84,9 @@ jobs:
         working-directory: src/backend-c
         run: |
           make CROSS_COMPILE=mipsel-linux-gnu- CFLAGS_EXTRA=-Werror
-          file build/cross-mipsel-linux-gnu/magitrickled-c | grep -q MIPS
+          # No feed sysroot is set up here, so this is core-only (see the
+          # Makefile's `all` rule) -- mt-dnstool is the dependency-free
+          # binary that build actually produces; magitrickled-c itself
+          # needs libyaml/cJSON/PCRE2/libmnl/libcurl for the target arch,
+          # which is Phase 8 territory (root Makefile's C_SYSROOT).
+          file build/cross-mipsel-linux-gnu/mt-dnstool | grep -q MIPS
