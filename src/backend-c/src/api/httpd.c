@@ -59,6 +59,8 @@ typedef struct route {
     void *ud;
 } route_t;
 
+typedef struct mt_http_conn mt_http_conn_t;
+
 struct mt_httpd {
     mt_loop_t *loop;
     int tcp_fd;
@@ -71,10 +73,12 @@ struct mt_httpd {
     mt_http_handler_fn not_found;
     void *not_found_ud;
     size_t n_conns;
+    mt_http_conn_t *conns;
 };
 
-typedef struct mt_http_conn {
+struct mt_http_conn {
     mt_httpd_t *server;
+    mt_http_conn_t *next;
     int fd;
     uint8_t *rbuf;
     size_t rbuf_len;
@@ -89,7 +93,7 @@ typedef struct mt_http_conn {
     bool close_after_write;
     bool http_1_0;
     int idle_timer_id;
-} mt_http_conn_t;
+};
 
 /* ---- small string helpers -------------------------------------------------- */
 
@@ -289,12 +293,17 @@ static route_t *match_route(mt_httpd_t *h, const char *method, const char *path,
 /* ---- connection lifecycle ----------------------------------------------------- */
 
 static void conn_close(mt_http_conn_t *c) {
+    mt_http_conn_t **link = &c->server->conns;
+    while (*link != NULL && *link != c) { link = &(*link)->next; }
+    if (*link == c) {
+        *link = c->next;
+        c->server->n_conns--;
+    }
     if (c->idle_timer_id) { mt_loop_del_timer(c->server->loop, c->idle_timer_id); }
     mt_loop_del_fd(c->server->loop, c->fd);
     close(c->fd);
     free(c->rbuf);
     free(c->wbuf);
-    c->server->n_conns--;
     free(c);
 }
 
@@ -716,6 +725,8 @@ static void on_accept(mt_loop_t *loop, int fd, uint32_t events, void *ud) {
             continue;
         }
         h->n_conns++;
+        c->next = h->conns;
+        h->conns = c;
         reset_idle_timer(c);
     }
 }
@@ -734,6 +745,7 @@ mt_err_t mt_httpd_create(mt_loop_t *loop, mt_httpd_t **out) {
 
 void mt_httpd_destroy(mt_httpd_t *h) {
     if (!h) { return; }
+    while (h->conns != NULL) { conn_close(h->conns); }
     if (h->tcp_fd >= 0) {
         mt_loop_del_fd(h->loop, h->tcp_fd);
         close(h->tcp_fd);

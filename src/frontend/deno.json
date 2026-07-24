@@ -8,9 +8,8 @@
   },
   "compilerOptions": {
     "strict": false,
-    "moduleResolution": "bundler",
     "checkJs": true,
     "lib": ["deno.ns", "ESNext", "DOM"]
   },
-  "nodeModulesDir": true
+  "nodeModulesDir": "auto"
 }

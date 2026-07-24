@@ -308,19 +308,13 @@ static void list_msg_cb(const struct nlmsghdr *h, void *ud) {
      * inside libmnl's own macro expansion, not in this project's code. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(top, h, sizeof(struct nfgenmsg))
-#pragma GCC diagnostic pop
-    {
+    mnl_attr_for_each(top, h, sizeof(struct nfgenmsg)) {
         uint16_t ttype = (uint16_t)(mnl_attr_get_type(top) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
         bool nested = (mnl_attr_get_type(top) & NLA_F_NESTED) != 0;
         if (ttype != IPSET_ATTR_ADT || !nested) { continue; }
 
         struct nlattr *entry;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wconversion"
-        mnl_attr_for_each_nested(entry, top)
-#pragma GCC diagnostic pop
-        {
+        mnl_attr_for_each_nested(entry, top) {
             uint16_t etype = (uint16_t)(mnl_attr_get_type(entry) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
             bool enested = (mnl_attr_get_type(entry) & NLA_F_NESTED) != 0;
             if (etype != IPSET_ATTR_DATA || !enested) { continue; }
@@ -328,6 +322,7 @@ static void list_msg_cb(const struct nlmsghdr *h, void *ud) {
             if (ctx->oom) { return; }
         }
     }
+#pragma GCC diagnostic pop
 }
 
 static mt_err_t real_list(nl_real_t *r, const char *name, uint8_t iplen, mt_ipset_entry4_t **out4,

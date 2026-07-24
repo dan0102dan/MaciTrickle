@@ -113,14 +113,12 @@ SYSROOT ?=
 # docs/c-rewrite/dependencies.md, confirmed available in both feeds during
 # the Phase 0 audit). Package NAMES below are this project's best-effort
 # reading of each feed's naming convention (lib-prefixed, unversioned,
-# matching the existing Depends entries below) -- NOT verified against a
-# live Entware/OpenWrt feed index (same egress block as decisions.md
-# D-37/D-38). Confirm against a real feed index (or a real device's
-# `opkg`/`apk` search) before shipping a package.
-# ipk Depends: fields are comma-separated (both platforms); apk's
-# `-I "depends:..."` is space-separated -- same 5 packages, two formats.
-DEPS_IPK := libyaml, libpcre2, libmnl, libcurl, libcjson
-DEPS_APK := libyaml libpcre2 libmnl libcurl libcjson
+# matching the existing Depends entries below). Entware's cJSON package is
+# named `cJSON`; OpenWrt uses `libcjson`.
+# ipk Depends fields are comma-separated; apk's `-I "depends:..."` is
+# space-separated.
+DEPS_IPK := libatomic, libyaml, libpcre2, libmnl, libcurl
+DEPS_APK := libatomic libyaml libpcre2 libmnl libcurl libcjson
 
 # Incremental data
 
@@ -288,14 +286,14 @@ package_ipk: prepare_files
 	echo 'Section: net' >> $(IPK_CONTROL_DIR)/control
 	echo 'Priority: optional' >> $(IPK_CONTROL_DIR)/control
 ifeq ($(PLATFORM),entware)
-	@DEPS="libc, iptables, $(DEPS_IPK)"; \
+	@DEPS="libc, iptables, $(DEPS_IPK), cJSON"; \
 	if echo "$(TARGET)" | grep -q '_kn$$'; then \
 		DEPS="$$DEPS, socat"; \
 	fi; \
 	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
 endif
 ifeq ($(PLATFORM),openwrt)
-	echo "Depends: libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft, $(DEPS_IPK)" >> $(IPK_CONTROL_DIR)/control
+	echo "Depends: libc, iptables-nft, iptables-mod-conntrack-extra, kmod-ipt-nat, kmod-ipt-ipset, ip6tables-nft, $(DEPS_IPK), libcjson" >> $(IPK_CONTROL_DIR)/control
 endif
 
 	tar -C "$(IPK_CONTROL_DIR)" -czvf "$(IPK_DIR)/control.tar.gz" --owner=0 --group=0 .

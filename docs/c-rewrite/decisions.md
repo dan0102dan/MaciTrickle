@@ -1960,3 +1960,113 @@ mirror), and the Keenetic RCI hook lookup noted in parity-checklist.md
 was deferred rather than found. Both predate this change and are
 unaffected by it — they are pre-existing residual risk on the C
 implementation itself, not something Go removal introduces or worsens.
+
+## D-46: Restore CI packages for Entware Keenetic targets after the C cutover
+
+**Status: accepted; source-built SDK implementation superseded by D-48.**
+D-45 correctly prevented host-x86_64 binaries from
+being mislabeled as embedded targets, but its unconditional gate also made
+all three previously shipped Keenetic (`*_kn`) packages disappear. These
+targets do not require a distinct Keenetic ABI: per `toolchains.md`, `_kn`
+only enables software behavior and packaging files on top of the matching
+Entware ABI.
+
+The three `_kn` matrix jobs now build against pinned revisions of the
+official Entware build system and `entware-packages` feed. Entware builds
+its glibc 2.27 cross-toolchain plus the development staging files for
+libyaml, PCRE2, libmnl, cJSON, and libcurl; the project then passes that
+compiler, compiler sysroot, target flags, and `/opt` staging library path
+to the C backend. Before packaging, the workflow checks ELF machine, byte
+order, and the `/opt/lib` program interpreter for every output. This makes
+an accidental native runner binary a hard failure rather than a publishable
+artifact. The SDK and the official builder image are cached, while their
+source revisions remain pinned by SHA.
+
+The fresh Entware tree is bootstrapped in its required phase order
+(`tools/install`, `toolchain/install`, `target/compile`) before compiling
+the selected library packages. Invoking a leaf package directly does not
+establish that ordering and can enter `package/libs/toolchain` with an empty
+toolchain staging directory. Only the three required external feed sources
+are linked; unrelated missing-dependency warnings from the rest of the
+packages feed are therefore excluded from the job. A failed parallel phase
+is repeated with `-j1 V=sc` so CI preserves the underlying command failure.
+
+The Entware runtime dependency is recorded as `cJSON`, matching the actual
+official feed package name; `libcjson` remains the OpenWrt package name.
+The remaining non-`_kn` Entware and OpenWrt jobs retain D-45's explicit
+gate until real SDK provisioning is added for them.
+
+## D-47: CI compatibility fixes after runner/tooling updates
+
+**Status: accepted.** Frontend CI moves from Deno 1.x to 2.x and unit tests
+use `@std/testing`'s BDD functions instead of Deno's incomplete
+`node:test` compatibility layer. The application replaces the deprecated
+`lucide-svelte` package with its drop-in successor `@lucide/svelte`; the
+removed GitLab brand icon is retained locally with the same SVG path. The
+Deno-only config no longer contains the unsupported `moduleResolution`
+option.
+
+ASan also exposed a real server-lifecycle leak: accepted keep-alive
+connections were owned only by epoll callbacks, so stopping the loop before
+the peer closed left the connection and read buffer allocated.
+`mt_httpd_t` now tracks accepted connections and closes all of them during
+destroy, while preserving the existing close path during normal operation.
+
+Finally, the HTTP regression trace no longer freezes interface names from
+the machine that produced the golden snapshot. The response must still be
+well-formed, begin with the synthetic `blackhole` interface, and contain at
+least one real host interface; only those host-specific names are replaced
+with a stable placeholder before comparison.
+
+## D-48: Use a prebuilt Entware SDK for Keenetic packages
+
+**Status: accepted; supersedes D-46's source-built CI SDK pipeline.**
+The corrected D-46 bootstrap order successfully produced the MIPS and
+MIPSEL SDKs, but each matrix job spent about 44 minutes rebuilding an
+unchanged GCC/glibc toolchain before reaching the project build. That is
+unnecessary CI latency and made iteration on the remaining packaging error
+impractical.
+
+The three `_kn` jobs now use `ownik/gh-action-entware-sdk`, pinned to the
+verified commit behind its `v1` tag. The action downloads the latest
+prebuilt `ownik/entware-sdk` release asset for the selected base Entware
+architecture, verifies the release-provided SHA-256 digest, and caches the
+archive. These SDK artifacts are explicitly an unofficial distribution of
+the Entware SDK; the compiler ABI remains Entware GCC 8.4.0/glibc 2.27.
+
+Because the action consumes an Entware/OpenWrt feed package rather than
+exporting an SDK path to later workflow steps, CI creates a small temporary
+feed containing the backend sources, already-built frontend, packaging
+payload, and `tools/ci/entware-package/Makefile`. That Makefile compiles the
+C backend with the SDK's `TARGET_CROSS`, target flags, and `/opt` dependency
+staging directory, enables `MT_ENTWARE_KN`, and installs the existing
+Keenetic init/NDM payload into the generated IPK. The workflow still extracts
+the daemon from the package and verifies ELF architecture, byte order, and
+the `/opt/lib` dynamic interpreter before upload.
+
+The temporary source archive uses the normal OpenWrt/Entware `PKG_SOURCE`
+and `file://` download path (including a versioned top-level directory), so
+the action's mandatory `package/check` target can validate it. Target flags
+are passed through the backend's additive `CFLAGS_EXTRA`/`LDFLAGS_EXTRA`
+hooks; assigning `CFLAGS` on the make command line would suppress the
+backend's own `-Iinclude` and feature defines. `WITH_DEPS=1` selects the
+full daemon build because the feed SDK already supplies its compiler
+sysroot implicitly; without that opt-in the backend correctly treats a
+generic sysroot-less cross compiler as core-only.
+
+The normal package path declares `libatomic` as an explicit runtime
+dependency. The temporary SDK-feed package instead links only libatomic
+statically while keeping glibc dynamic. This is especially material on
+32-bit MIPS, where 64-bit C11 atomics are provided by libatomic rather than
+native instructions.
+
+The published SDK archive contains the staged completed toolchain, but
+drops both its generated system IPKs and the completion stamps under
+`build_dir/.../toolchain`. Consequently any ordinary package dependency
+makes the build system try to rebuild GCC and fail on a removed
+`.prepared_*_check` prerequisite. The temporary feed restores the
+prepared/configured/built stamp chain for the pinned GCC 8.4/glibc 2.27 SDK
+while its Makefile is loaded. Entware can then package libc/libgcc from the
+staged toolchain and build normal feed dependencies without rebuilding the
+SDK. The hashes are deliberately explicit so an incompatible future SDK
+fails rather than silently reusing a stale stamp.

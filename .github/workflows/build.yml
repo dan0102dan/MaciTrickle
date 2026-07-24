@@ -58,75 +58,167 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Node.JS
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fakeroot
-
-      - name: Install apk-tools
-        run: |
-          docker run --rm -v /usr/local/bin:/mnt alpine:edge sh -c "apk add --no-cache apk-tools-static && cp /sbin/apk.static /mnt/apk && chmod +x /mnt/apk"
-
       - name: Check cross-toolchain availability
         id: toolchain
         run: |
           cp "${{ matrix.config }}" .config
           . ./.config
-          # No real per-target Entware/OpenWrt cross-toolchain + feed
-          # sysroot (libyaml/cJSON/PCRE2/libmnl/libcurl built for that
-          # target's libc) is wired into this CI yet -- see
-          # docs/c-rewrite/toolchains.md and decisions.md D-45. Building
-          # without one would either fail outright or, worse, silently
-          # produce a host-x86_64 binary mislabeled as this target's
-          # architecture. So every target is explicitly marked
-          # not-yet-automated here (a known, documented gap, not a
-          # silent drop) until real toolchains are provisioned.
-          echo "::notice title=${{ matrix.name }}::Packaging for this target is not yet automated in CI: no real Entware/OpenWrt cross-toolchain + feed sysroot is provisioned for PLATFORM=$PLATFORM TARGET=$TARGET. See docs/c-rewrite/toolchains.md and decisions.md D-45. Skipping this job's build step."
-          echo "ready=false" >> "$GITHUB_OUTPUT"
+          case "$PLATFORM/$TARGET" in
+            entware/*_kn)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "entware_config=${TARGET%_kn}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::notice title=${{ matrix.name }}::Packaging for this target is not yet automated in CI: no real Entware/OpenWrt cross-toolchain + feed sysroot is provisioned for PLATFORM=$PLATFORM TARGET=$TARGET. See docs/c-rewrite/toolchains.md and decisions.md D-45. Skipping this job's build step."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
-      - name: Build and package
+      - name: Set up Node.JS
         if: steps.toolchain.outputs.ready == 'true'
-        env:
-          BUILD_KEY_APK_SEC_CONTENT: ${{ secrets.BUILD_KEY_APK_SEC }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Prepare Entware package feed
+        id: entware_feed
+        if: steps.toolchain.outputs.ready == 'true'
         run: |
+          mkdir -p .build
           eval export $(make _return_export_dynamic_env);
           cp "${{ matrix.config }}" .config
-          if [ -n "$BUILD_KEY_APK_SEC_CONTENT" ]; then
-            KEY_FILE=$(mktemp)
-            printf '%s' "$BUILD_KEY_APK_SEC_CONTENT" > "$KEY_FILE"
-            export BUILD_KEY_APK_SEC="$KEY_FILE"
-          fi
-          make
+          make build_frontend
+          make _return_export_dynamic_env > .build/entware-package.env
 
-      - name: Collect package files
+          feed_dir="${RUNNER_TEMP}/magitrickle-feed-${{ matrix.name }}"
+          artifacts_dir="${RUNNER_TEMP}/magitrickle-artifacts-${{ matrix.name }}"
+          mkdir -p "$feed_dir/magitrickle" "$artifacts_dir"
+          cp tools/ci/entware-package/Makefile "$feed_dir/magitrickle/Makefile"
+          {
+            printf 'MAGITRICKLE_VERSION:=%s\n' "$PKG_VERSION"
+            printf 'MAGITRICKLE_RELEASE:=%s\n' "$PKG_REVISION"
+            printf 'MAGITRICKLE_TARGET:=%s\n' "${{ matrix.name }}"
+          } > "$feed_dir/magitrickle/version.mk"
+          tar -czf "$feed_dir/magitrickle/magitrickle-source.tar.gz" \
+            --transform "s,^,magitrickle-${PKG_VERSION}/," \
+            LICENSE files src/backend-c src/frontend/dist
+
+          echo "feed_dir=$feed_dir" >> "$GITHUB_OUTPUT"
+          echo "artifacts_dir=$artifacts_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Build with prebuilt Entware SDK
+        id: entware_sdk
+        if: steps.toolchain.outputs.ready == 'true'
+        continue-on-error: true
+        # v1, pinned to its verified commit rather than a mutable tag.
+        uses: ownik/gh-action-entware-sdk@003ddc33bb3b12a2f96e0c4689c56351614cf01a
+        env:
+          ARCH: ${{ steps.toolchain.outputs.entware_config }}
+          ARTIFACTS_DIR: ${{ steps.entware_feed.outputs.artifacts_dir }}
+          BUILD_LOG: 1
+          FEED_DIR: ${{ steps.entware_feed.outputs.feed_dir }}
+          PACKAGES: magitrickle
+          V: s
+
+      - name: Report Entware SDK build failure
+        if: steps.entware_sdk.outcome == 'failure'
+        run: |
+          log_root="${{ steps.entware_feed.outputs.artifacts_dir }}/logs"
+          if [ -d "$log_root" ]; then
+            {
+              echo "Entware package build failed. Relevant log lines:"
+              while IFS= read -r -d '' log; do
+                matches=$(
+                  grep -E \
+                    'make\[[0-9]+\]: \*\*\*|(^|: )(fatal )?error:|undefined reference|No rule to make target|collect2: error|ld returned [0-9]+ exit status' \
+                    "$log" || true
+                )
+                if [ -n "$matches" ]; then
+                  echo "==> $log <=="
+                  printf '%s\n' "$matches" | tail -n 80
+                  echo "Last 20 lines:"
+                  tail -n 20 "$log"
+                fi
+              done < <(find "$log_root" -type f -print0 | sort -z)
+            } | tee "${RUNNER_TEMP}/entware-sdk-failure.txt"
+          else
+            echo "Entware package build failed and produced no BUILD_LOG files." |
+              tee "${RUNNER_TEMP}/entware-sdk-failure.txt"
+          fi
+
+          message=$(
+            tail -n 200 "${RUNNER_TEMP}/entware-sdk-failure.txt" |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' |
+              awk 'BEGIN { ORS="%0A" } { print }'
+          )
+          echo "::error title=Entware SDK ${{ matrix.name }}::$message"
+          exit 1
+
+      - name: Collect and verify Entware package
         id: package_outputs
         if: steps.toolchain.outputs.ready == 'true'
         run: |
           mapfile -t packages < <(
-            find .build -maxdepth 1 -type f \( -name "magitrickle_*.ipk" -o -name "magitrickle_*.apk" \) | sort
+            find "${{ steps.entware_feed.outputs.artifacts_dir }}" \
+              -type f -name 'magitrickle_*.ipk' | sort
           )
-
-          if [ "${#packages[@]}" -eq 0 ]; then
-            echo "No package files found" >&2
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected exactly one magitrickle IPK, found ${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
             exit 1
           fi
 
-          if [ "${#packages[@]}" -gt 2 ]; then
-            echo "Expected at most 2 package files, found ${#packages[@]}" >&2
+          . .build/entware-package.env
+          package=".build/magitrickle_${PKG_VERSION}-${PKG_REVISION}_entware_${{ matrix.name }}.ipk"
+          cp "${packages[0]}" "$package"
+
+          data_archive=$(mktemp)
+          binary=$(mktemp)
+          if ar t "$package" >/dev/null 2>&1; then
+            ar p "$package" data.tar.gz > "$data_archive"
+          else
+            data_member=$(
+              tar -tf "$package" |
+                awk '$0 == "data.tar.gz" || $0 == "./data.tar.gz" { print; exit }'
+            )
+            if [ -z "$data_member" ]; then
+              echo "No data.tar.gz member in $package" >&2
+              exit 1
+            fi
+            tar -xOf "$package" "$data_member" > "$data_archive"
+          fi
+          binary_member=$(
+            tar -tzf "$data_archive" |
+              awk '$0 == "opt/bin/magitrickled" || $0 == "./opt/bin/magitrickled" { print; exit }'
+          )
+          if [ -z "$binary_member" ]; then
+            echo "No /opt/bin/magitrickled in $package" >&2
             exit 1
           fi
+          tar -xzOf "$data_archive" "$binary_member" > "$binary"
 
-          for i in "${!packages[@]}"; do
-            index=$((i + 1))
-            file="${packages[$i]}"
-            echo "package_${index}_path=${file}" >> "$GITHUB_OUTPUT"
-            echo "package_${index}_name=$(basename "${file}")" >> "$GITHUB_OUTPUT"
-          done
+          readelf -h "$binary"
+          readelf -l "$binary"
+          case "${{ matrix.name }}" in
+            aarch64-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
+              ;;
+            mips-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+              readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+              ;;
+            mipsel-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+              ;;
+          esac
+
+          echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
+          echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
 
       - name: Upload package artifact 1
         if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_1_path != '' }}

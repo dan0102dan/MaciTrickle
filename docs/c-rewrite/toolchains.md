@@ -115,6 +115,18 @@ toolchains; the risky ones to validate early are `arm_fa526` (armv4),
 `loongarch64_generic` (new SDK), `mips64*` (n64 ABI), Entware kernel-3.2/3.4
 syscall floor.
 
+The three Entware Keenetic targets (`*_kn`) are automated in
+`.github/workflows/build.yml`. CI uses the prebuilt SDK selected by
+`ownik/gh-action-entware-sdk` for the matching base architecture and builds
+MaciTrickle through a temporary Entware feed package. The action is pinned
+by commit; its SDK release archive is selected dynamically, digest-verified,
+and cached by the action. These SDK artifacts are unofficial builds of the
+Entware GCC 8.4.0/glibc 2.27 SDK. CI extracts the resulting daemon from the
+IPK and verifies its ELF architecture, byte order, and `/opt/lib` dynamic
+interpreter before upload. The non-`_kn` Entware targets and all OpenWrt
+targets remain explicitly gated until their corresponding jobs are wired to
+a real feed/SDK in the same way.
+
 ## UPX
 
 Today Go binaries are UPX-compressed except riscv64/mips64/mips64le/loong64.

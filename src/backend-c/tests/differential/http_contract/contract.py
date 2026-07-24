@@ -91,6 +91,21 @@ def _redact_live_timestamps(obj):
     return obj
 
 
+def _normalize_host_interfaces(obj):
+    """Preserve the response contract without freezing runner device names."""
+    if not isinstance(obj, dict) or set(obj.keys()) != {"interfaces"}:
+        return obj
+    interfaces = obj["interfaces"]
+    if (
+        not isinstance(interfaces, list)
+        or len(interfaces) < 2
+        or interfaces[0] != {"id": "blackhole"}
+        or not all(isinstance(item, dict) and isinstance(item.get("id"), str) for item in interfaces)
+    ):
+        return obj
+    return {"interfaces": [{"id": "blackhole"}, {"id": "<HOST-INTERFACES>"}]}
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """Minimal HTTPConnection over an AF_UNIX socket (stdlib has no
     built-in support for this)."""
@@ -147,7 +162,7 @@ class Trace:
         obj = _redact_live_timestamps(obj)
         return self._redact(json.dumps(obj, sort_keys=True, separators=(",", ":")))
 
-    def step(self, method, path, body=None, learn=None):
+    def step(self, method, path, body=None, learn=None, normalize=None):
         """learn, if given, is called with the parsed response body (or
         None) and must return an iterable of (real_id, placeholder)
         pairs to redact -- applied BEFORE this step's own trace line is
@@ -159,6 +174,8 @@ class Trace:
             parsed = json.loads(data.decode("utf-8")) if data else None
         except ValueError:
             parsed = None
+        if normalize:
+            parsed = normalize(parsed)
         if learn:
             for real_id, placeholder in learn(parsed):
                 self._learn(real_id, placeholder)
@@ -251,7 +268,7 @@ def run_tcp_sequence(base_host, base_port, out):
     t.step("GET", "/api/v1/groups?with_rules=true")
     t.step("PUT", "/api/v1/groups", "{}")
 
-    t.step("GET", "/api/v1/system/interfaces")
+    t.step("GET", "/api/v1/system/interfaces", normalize=_normalize_host_interfaces)
     t.step("POST", "/api/v1/system/hooks/netfilterd", json.dumps({"type": "iptables", "table": "nat"}))
     t.step("POST", "/api/v1/system/config/save")
 
