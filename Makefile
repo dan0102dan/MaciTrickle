@@ -189,6 +189,7 @@ $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME): FORCE
 $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME): $(STAMPS_DIR)/download-backend $(BACKEND_SOURCES) $(STAMPS_DIR)/build-properties-backend-$(UNIQUE_NAME)
 	mkdir -p "$(COMPILE_DIR)"
 	$(MAKE) -C ./src/backend-c BUILD="$(UNIQUE_NAME)" MT_VERSION="$(PKG_VERSION)" \
+	    $(if $(PLATFORM),PLATFORM="$(PLATFORM)") \
 	    $(if $(CROSS_COMPILE),CROSS_COMPILE="$(CROSS_COMPILE)") \
 	    $(if $(SYSROOT),SYSROOT="$(SYSROOT)") \
 	    $(if $(ENTWARE_KN),ENTWARE_KN=1)

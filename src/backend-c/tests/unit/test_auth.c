@@ -341,6 +341,34 @@ TEST auth_path_itself_is_exempt_even_when_enabled(void) {
     PASS();
 }
 
+TEST bare_lf_request_line_endings_are_accepted(void) {
+    /* The entware_kn ndm netfilter.d self-heal hook posts its request via a
+     * shell here-doc, which emits bare-LF (not CRLF) line endings. Go's
+     * net/http accepted those; the C server must too, or ndm's periodic
+     * flush of the iptables tables on Keenetic is never healed. A POST with
+     * a body exercises the header/body split on the bare-LF terminator. */
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    int fd = connect_tcp(AUTH_TEST_PORT);
+    ASSERT(fd >= 0);
+    const char *body = "{\"login\":\"admin\",\"password\":\"x\"}";
+    char req[512];
+    snprintf(req, sizeof(req),
+            "POST /api/v1/auth HTTP/1.1\nHost:\nContent-Type: application/json\n"
+            "Content-Length: %zu\n\n%s",
+            strlen(body), body);
+    send(fd, req, strlen(req), 0);
+    char resp[2048];
+    /* Without bare-LF support the request never completes and recv times
+     * out with nothing (0 bytes); with it the route is reached (404 here,
+     * since login is disabled -- the point is that it was dispatched). */
+    ASSERT(recv_response(fd, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(404, status_code_of(resp));
+    close(fd);
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -354,5 +382,6 @@ int main(int argc, char **argv) {
     RUN_TEST(login_disabled_returns_404);
     RUN_TEST(protected_route_requires_bearer_token);
     RUN_TEST(auth_path_itself_is_exempt_even_when_enabled);
+    RUN_TEST(bare_lf_request_line_endings_are_accepted);
     GREATEST_MAIN_END();
 }

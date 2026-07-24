@@ -29,6 +29,13 @@ MT_VERSION ?= unattached
 # derives GO_TAGS' entware_kn tag.
 ENTWARE_KN ?=
 
+# Target platform (entware|openwrt), passed through by the root Makefile.
+# Selects the compiled-in filesystem path defaults in paths.h (Entware
+# under /opt, OpenWrt under /etc/magitrickle/state) -- the C equivalent of
+# Go's entware/openwrt build tags. Empty (host builds, tests) keeps the
+# default /var/... paths.
+PLATFORM ?=
+
 WARNINGS := -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 \
             -Wundef -Wstrict-prototypes -Wmissing-prototypes
 # NOTE: -Werror is enabled in CI only (see .github/workflows), not forced
@@ -41,7 +48,9 @@ CFLAGS   ?=
 CFLAGS   += $(CSTD) $(OPT) $(WARNINGS) -Iinclude -MMD -MP \
             -D_POSIX_C_SOURCE=200809L \
             -DMT_VERSION=\"$(MT_VERSION)\" -fno-common \
-            $(if $(ENTWARE_KN),-DMT_ENTWARE_KN)
+            $(if $(ENTWARE_KN),-DMT_ENTWARE_KN) \
+            $(if $(filter entware,$(PLATFORM)),-DMT_PLATFORM_ENTWARE) \
+            $(if $(filter openwrt,$(PLATFORM)),-DMT_PLATFORM_OPENWRT)
 # CI passes CFLAGS_EXTRA=-Werror; local builds stay warning-tolerant.
 CFLAGS_EXTRA ?=
 CFLAGS   += $(CFLAGS_EXTRA)

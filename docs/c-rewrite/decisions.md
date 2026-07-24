@@ -406,8 +406,9 @@ handlers}.go`):
    `MT_PASSWD_FILE`/`MT_SHADOW_FILE` with defaults matching
    `path_default.go` and the same `#ifndef`-override hook, so Phase 8
    packaging can wire per-platform `-D` flags exactly like it will for
-   `MT_CONFIG_PATH`. Until then every C build uses the non-Entware/
-   non-OpenWrt defaults.
+   `MT_CONFIG_PATH`. (This per-platform wiring is now done — see D-49;
+   until D-49 every C build used the non-Entware/non-OpenWrt defaults,
+   which shipped the wrong `/var/...` paths in Entware packages.)
 2. Go's `issueToken` computes the JWT expiry via
    `issuedAt.AddDate(jwtYears, 0, 0)` — 20 *calendar* years, correctly
    handling leap years (e.g. Feb 29 rolling to March 1 when the target
@@ -2070,3 +2071,43 @@ while its Makefile is loaded. Entware can then package libc/libgcc from the
 staged toolchain and build normal feed dependencies without rebuilding the
 SDK. The hashes are deliberately explicit so an incompatible future SDK
 fails rather than silently reusing a stale stamp.
+
+## D-49: Wire per-platform filesystem paths into the build (fixes Entware `/opt` paths)
+
+**Status: accepted.** Closes the gap left open in D-24: `paths.h` had
+the `#ifndef`-override hook for `MT_APP_SHARE_DIR`/`MT_APP_STATE_DIR`/
+`MT_SOCK_PATH`/`MT_PASSWD_FILE`/`MT_SHADOW_FILE`, but nothing ever passed
+the per-platform `-D` flags, so **every** build — including the shipped
+Entware/Keenetic `_kn` packages — baked in the host defaults
+(`/var/lib/magitrickle/config.yaml`, `/var/run/magitrickle.sock`,
+`/etc/{passwd,shadow}`). On Entware, where the package installs
+everything under `/opt`, the daemon looked in the wrong place: it never
+found its config (logging "config file /var/lib/magitrickle/config.yaml
+not found, using defaults") and listened on `/var/run/magitrickle.sock`
+while the `_kn` `netfilter.d/100-magitrickle` hook talks to
+`/opt/var/run/magitrickle.sock`, so the Keenetic integration was broken.
+
+The fix mirrors Go's `entware`/`openwrt` build tags without introducing a
+new mechanism:
+
+- `paths.h` now selects its default set on `MT_PLATFORM_ENTWARE` /
+  `MT_PLATFORM_OPENWRT` (else host defaults), each value copied verbatim
+  from the old `constant/path_{entware,openwrt,default}.go`. Every macro
+  keeps its own `#ifndef` guard so a command-line `-D` still wins.
+- `main.c`'s `MT_CONFIG_PATH` now derives from `MT_APP_STATE_DIR`
+  (`MT_APP_STATE_DIR "/config.yaml"`), matching Go's
+  `cfgFileLocation = AppStateDir + "/config.yaml"`, so the config file
+  follows the platform state dir instead of being pinned separately.
+- `src/backend-c/Makefile` maps a passed-through `PLATFORM=entware|openwrt`
+  to `-DMT_PLATFORM_ENTWARE` / `-DMT_PLATFORM_OPENWRT` (same shape as the
+  existing `ENTWARE_KN` → `-DMT_ENTWARE_KN`).
+- Both build entry points pass `PLATFORM`: the root `Makefile`'s
+  `build_backend` (covers OpenWrt and local `entware` builds) and the CI
+  Keenetic packager `tools/ci/entware-package/Makefile`'s `Build/Compile`
+  (`PLATFORM=entware`, alongside its existing `ENTWARE_KN=1`).
+
+Host builds and the whole test/differential suite pass no `PLATFORM`, so
+they keep the `/var/...` defaults (no golden churn). Verified by
+preprocessor expansion for all three platforms (byte-identical to the Go
+constants) and by building the dependency-free `core`+tools for
+`PLATFORM=entware` and host.

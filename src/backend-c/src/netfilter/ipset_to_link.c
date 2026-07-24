@@ -140,12 +140,21 @@ static mt_err_t delete_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt) {
 /* ---- ip rule ---------------------------------------------------------- */
 
 static mt_err_t insert_ip_rule(mt_ipset_to_link_t *l) {
+    /* The best-effort delete before each add mirrors Go's
+     * insertIPRule(): `_ = netlink.RuleDel(rule)` (error deliberately
+     * ignored) before `netlink.RuleAdd(rule)`. RTM_NEWRULE carries
+     * NLM_F_EXCL, so without it a leftover rule with the same mark/table
+     * -- e.g. from a previous daemon instance killed before it could
+     * clean up -- makes every subsequent enable fail with EEXIST
+     * ("already exists") instead of being taken over. */
     if (l->ipt4) {
+        (void)mt_rtnl_rule_del(l->rtnl, AF_INET, l->mark, l->table);
         mt_err_t err = mt_rtnl_rule_add(l->rtnl, AF_INET, l->mark, l->table);
         if (err != MT_OK) { return err; }
         l->v4.rule_added = true;
     }
     if (l->ipt6) {
+        (void)mt_rtnl_rule_del(l->rtnl, AF_INET6, l->mark, l->table);
         mt_err_t err = mt_rtnl_rule_add(l->rtnl, AF_INET6, l->mark, l->table);
         if (err != MT_OK) { return err; }
         l->v6.rule_added = true;

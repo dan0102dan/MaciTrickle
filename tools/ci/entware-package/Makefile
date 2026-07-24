@@ -66,6 +66,7 @@ define Build/Compile
 		BUILD=entware-$(MAGITRICKLE_TARGET) \
 		MT_VERSION="$(PKG_VERSION)" \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
+		PLATFORM=entware \
 		ENTWARE_KN=1 \
 		WITH_DEPS=1 \
 		CFLAGS_EXTRA="$(TARGET_CFLAGS) -I$(STAGING_DIR)/opt/include" \

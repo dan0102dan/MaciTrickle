@@ -50,8 +50,10 @@
 #include "magitrickle/version.h"
 #include "magitrickle/yamlio.h"
 
+/* Matches Go's cfgFileLocation = AppStateDir + "/config.yaml", so the
+ * config file follows the per-platform state dir (paths.h). */
 #ifndef MT_CONFIG_PATH
-#define MT_CONFIG_PATH "/var/lib/magitrickle/config.yaml"
+#define MT_CONFIG_PATH MT_APP_STATE_DIR "/config.yaml"
 #endif
 
 #define MT_CACHE_CLEANUP_INTERVAL_MS 30000

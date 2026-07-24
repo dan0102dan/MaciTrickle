@@ -636,16 +636,31 @@ static void on_conn_readable(mt_loop_t *loop, int fd, uint32_t events, void *ud)
         c->rbuf_len += (size_t)n;
 
         if (!c->headers_done) {
+            /* End-of-headers is a blank line. Accept both CRLFCRLF and bare
+             * LFLF: the entware_kn ndm netfilter.d self-heal hook posts its
+             * request through a shell here-doc, which emits bare-LF line
+             * endings. Go's net/http (the old unix-socket API server)
+             * accepted those, so a strict CRLFCRLF-only scan would silently
+             * drop the hook and never re-commit iptables after ndm flushes
+             * the tables. parse_headers() already tolerates the optional
+             * per-line CR. */
             uint8_t *marker = NULL;
-            for (size_t i = 0; i + 3 < c->rbuf_len; i++) {
-                if (c->rbuf[i] == '\r' && c->rbuf[i + 1] == '\n' && c->rbuf[i + 2] == '\r' &&
-                    c->rbuf[i + 3] == '\n') {
+            size_t marker_len = 0;
+            for (size_t i = 0; i + 1 < c->rbuf_len; i++) {
+                if (i + 3 < c->rbuf_len && c->rbuf[i] == '\r' && c->rbuf[i + 1] == '\n' &&
+                    c->rbuf[i + 2] == '\r' && c->rbuf[i + 3] == '\n') {
                     marker = c->rbuf + i;
+                    marker_len = 4;
+                    break;
+                }
+                if (c->rbuf[i] == '\n' && c->rbuf[i + 1] == '\n') {
+                    marker = c->rbuf + i;
+                    marker_len = 2;
                     break;
                 }
             }
             if (marker) {
-                c->header_end = (size_t)(marker - c->rbuf) + 4;
+                c->header_end = (size_t)(marker - c->rbuf) + marker_len;
                 c->headers_done = true;
 
                 if (!parse_headers(c, &c->req)) {

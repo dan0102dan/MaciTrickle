@@ -151,7 +151,9 @@ Go backend не изменён.
   `MT_SOCK_PATH` (сейчас compile-time дефолты из `paths.h`, совпадающие
   с `path_default.go`) — реальная per-platform подстановка через build
   flags — Phase 8 packaging, как и было заложено в исходном плане этой
-  фазы.
+  фазы. **(Done — см. D-49: `PLATFORM=entware|openwrt` → `-DMT_PLATFORM_*`
+  выбирает набор путей в `paths.h`; без этого Entware-пакеты собирались с
+  `/var/...` вместо `/opt/...`.)**
 - Cross-compilation под реальные Entware/OpenWrt тулчейны не
   выполнялась в этой песочнице (тулчейны недоступны) — ровно та же
   ситуация, что и в Phase 4/5 (тулчейны/CI-матрица — предмет Phase 8);
