@@ -150,6 +150,7 @@ _return_export_dynamic_env:
 	@bash -c 'printf "COMMITS_SINCE_TAG=%q\n" "$(COMMITS_SINCE_TAG)"'
 	@bash -c 'printf "PKG_REVISION=%q\n" "$(PKG_REVISION)"'
 	@bash -c 'printf "PKG_VERSION=%q\n" "$(PKG_VERSION)"'
+	@bash -c 'printf "PKG_VERSION_APK=%q\n" "$(PKG_VERSION_APK)"'
 	@bash -c 'printf "PKG_VERSION_DISPLAY=%q\n" "$(PKG_VERSION_DISPLAY)"'
 	@bash -c 'printf "PKG_VERSION_PRERELEASE=%q\n" "$(PKG_VERSION_PRERELEASE)"'
 	@bash -c 'printf "PRERELEASE_DATE=%q\n" "$(PRERELEASE_DATE)"'

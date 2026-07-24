@@ -2111,3 +2111,464 @@ they keep the `/var/...` defaults (no golden churn). Verified by
 preprocessor expansion for all three platforms (byte-identical to the Go
 constants) and by building the dependency-free `core`+tools for
 `PLATFORM=entware` and host.
+
+## D-50: Real OpenWrt SDK CI for three well-known package archs
+
+**Status: accepted, confirmed via real CI iteration.** Mirrors D-48's
+Entware approach (real SDK, real feed-package build, real `.ipk`) for
+OpenWrt, but OpenWrt has no equivalent to `ownik/gh-action-entware-sdk`
+and its 24 package archs each need a specific SDK `target/subtarget`
+that isn't 1:1 with the package-arch name (multiple hardware targets can
+share one package arch; `toolchains.md`'s own OpenWrt table already had
+unfilled `Triplet` columns for most rows). Rather than guess all 24
+mappings from memory and risk silently pulling the wrong ABI,
+`build.yml`'s toolchain-check step marks three **well-known, stable**
+target/subtarget pairs `ready=true`: `x86_64` → `x86/64`, `mips_24kc` →
+`ath79/generic`, `mipsel_24kc` → `ramips/mt7621` (all three are among the
+most common, best-documented OpenWrt targets and have been stable across
+many releases). A fourth candidate, `aarch64_generic` → `armvirt/64`, was
+tried and removed: the first real CI run 404'd on
+`https://downloads.openwrt.org/releases/24.10.1/targets/armvirt/64/sha256sums`,
+so that mapping is wrong for this OpenWrt release. Since it can't be
+verified from this sandbox (proxy blocks `downloads.openwrt.org`) and
+isn't worth guessing again blindly, `aarch64_generic` was reverted to the
+default gated case rather than given a second guess. Every other OpenWrt
+package arch keeps the existing "not yet automated" notice — same
+explicit-gate principle as D-45, not a silent drop.
+
+**Mechanism** (`tools/ci/openwrt-package/Makefile`, new): a real OpenWrt
+SDK for `OPENWRT_VERSION=24.10.1` (matches the version `toolchains.md`
+already committed the feed to) is downloaded per matching target/
+subtarget from `downloads.openwrt.org`, its `sha256sums` file is fetched
+first specifically to discover the exact SDK archive filename (gcc
+version and compression suffix vary by target) rather than hardcoding
+one, and the download is verified against that digest before
+extraction — matching D-48's Entware SDK verification discipline. The
+daemon's own source is staged as an in-tree SDK package (`package/net/
+magitrickle/`, `PKG_SOURCE_URL:=file://...`, same as the Entware feed
+package), `./scripts/feeds install` pulls in `+libyaml +libpcre2 +libmnl
++libcurl +libcjson` plus the netfilter runtime deps, and `make package/
+magitrickle/{clean,compile}` builds it through the SDK's own toolchain
+and dependency graph — reusing exactly the same
+`CROSS_COMPILE=$(TARGET_CROSS)`/`WITH_DEPS=1`/`CFLAGS_EXTRA`/
+`LDFLAGS_EXTRA` hooks into `src/backend-c/Makefile` that D-37/D-48
+already established, no new backend-side mechanism. Unlike Entware,
+OpenWrt's standard `/usr` install paths need no custom dynamic-linker
+override (that was specifically for Entware's nonstandard `/opt/lib`).
+Feed dependency package names (`libyaml`, `libpcre2`, `libmnl`,
+`libcurl`, `libcjson`, `iptables-nft`, ...) reuse the exact names the
+root Makefile's `DEPS_IPK`/`DEPS_APK` already assumed for OpenWrt (D-39's
+"best guess, not verified against a live feed index" caveat carries
+forward unchanged — this task doesn't newly introduce that risk, just
+inherits it).
+
+**What real CI caught that this sandbox couldn't** (its proxy denies
+`downloads.openwrt.org`, same confirmed policy block as D-37/D-38's
+Entware mirror lookups, so none of this could be dry-run locally — only
+the Makefile's syntax and the workflow YAML's structure were checked
+locally before the first push). Two real bugs surfaced from actual
+GitHub Actions runs, both now fixed:
+
+1. The `aarch64_generic` → `armvirt/64` mapping (404, described above).
+2. `x86_64` and `mips_24kc` both failed identically, after the SDK
+   download/verification and `./scripts/feeds install` steps succeeded,
+   with `include/magitrickle/json.h:18:10: fatal error: cjson/cJSON.h:
+   No such file or directory` during `make package/magitrickle/compile`.
+   Root cause: `./scripts/feeds install <pkg>` only symlinks a package's
+   build recipe into the SDK's package tree — it does not build it or
+   stage its headers/libs into `staging_dir`, and a direct `make
+   package/<name>/compile` does not walk the `DEPENDS` graph to build
+   prerequisites first (unlike a full image `make`). Fixed by adding an
+   explicit `make package/libyaml/{clean,compile}
+   package/libpcre2/{clean,compile} package/libmnl/{clean,compile}
+   package/curl/{clean,compile} package/libcjson/{clean,compile} V=s`
+   step before `make package/magitrickle/{clean,compile}` in
+   `build.yml`, compiling exactly the compile-time (header/lib)
+   dependencies — the remaining `DEPENDS` (kernel modules, iptables CLI
+   binaries we only fork/exec) are runtime-only and need no such
+   pre-compile step.
+3. That dependency pre-compile step then failed itself: `make[1]: ***
+   No rule to make target 'package/libyaml/clean'`. The default failure
+   reporter only grepped for error-like patterns, which a missing
+   package's warning doesn't match, so `feeds-install.log` was never
+   shown — fixed first by always dumping it in full on failure. The
+   real content it revealed: `libyaml`/`libpcre2`/`libcurl` all resolved
+   fine (feeds install follows OpenWrt's virtual/provides aliases —
+   `libyaml`→`yaml`, `libpcre2`→`pcre2`, `libcurl`→`curl`), but
+   `WARNING: No feed for package 'libcjson' found` — cJSON is not
+   published in any OpenWrt feed for this release under any name, unlike
+   Entware's opkg feed (D-48) where it already existed. Fixed by
+   vendoring cJSON as a new in-tree SDK package,
+   `tools/ci/openwrt-package-libcjson/Makefile`, staged into
+   `$sdk_dir/package/libs/libcjson/` the same way `magitrickle`'s own
+   package is staged into `package/net/magitrickle/` — no `feeds
+   install` needed, since OpenWrt's package scanner walks the whole
+   `package/` tree regardless of feed origin (confirmed: `magitrickle`'s
+   own first-party package was already being found this way). The
+   package builds cJSON's amalgamated `cJSON.c` directly via a manual
+   `Build/Compile` (skip cJSON's own CMake build to keep the OpenWrt
+   package Makefile simple) into a versioned `.so`, installing headers
+   under `/usr/include/cjson/` to match `#include <cjson/cJSON.h>`.
+   Source is pulled via `PKG_SOURCE_PROTO:=git` pinned to tag `v1.7.18`
+   rather than a hash-verified tarball, since this sandbox's proxy also
+   blocks `github.com` (confirmed: a direct `curl` to a GitHub release
+   tarball 403'd here too) — no way to fetch a checksum to embed, so the
+   git tag itself is the integrity anchor, same idea as this project's
+   existing commit-pinned GitHub Actions (`ownik/gh-action-entware-sdk`).
+   `libcjson` was removed from the `./scripts/feeds install` argument
+   list (it would otherwise re-print the same "no feed" warning
+   harmlessly, but there's no reason to ask feeds for a package that
+   isn't a feed package) while staying in the explicit dependency
+   pre-compile step from finding 2, since our own package still declares
+   `+libcjson` in `DEPENDS` and still needs it compiled first.
+
+`mipsel_24kc` independently confirmed finding 3's exact same
+`No rule to make target 'package/libyaml/clean'` failure once pulled.
+
+4. The cJSON-vendoring fix from finding 3 landed correctly (confirmed:
+   the "has a dependency on 'libcjson', which does not exist" warning is
+   gone from `defconfig.log`/`feeds-install.log` on all three targets
+   post-fix), but it exposed the same "DEPENDS name vs. real package
+   name" mismatch for two more packages: `feeds-install.log` had already
+   shown `Installing package 'yaml' from packages` and `Installing
+   package 'pcre2' from base` — `feeds install` resolves the `+libyaml`/
+   `+libpcre2` DEPENDS entries as virtual/provides aliases, but the
+   actual buildable package name (and thus `make package/<name>/...`
+   target) is `yaml`/`pcre2`, not `libyaml`/`libpcre2`. The explicit
+   pre-compile step in finding 2 used the DEPENDS names verbatim, which
+   is why it kept hitting the identical `package/libyaml/clean` error
+   even after the cJSON fix. Fixed by changing the pre-compile targets
+   to `package/yaml/{clean,compile}` and `package/pcre2/{clean,compile}`
+   (`libmnl` and `curl` keep their DEPENDS names as-is — confirmed no
+   rename for those in the same log).
+
+5. Findings 3-4's fixes worked: the real daemon build (`Prepare OpenWrt
+   SDK + package`) succeeded on all three targets for the first time —
+   a genuine `.ipk` was produced under `$sdk_dir/bin/packages` and
+   found by the `Collect and verify package` step's `find`. That step
+   then failed itself: `ar: <package>.ipk: file format not recognized`.
+   Root cause: unlike Entware's `.ipk` (a classic `ar` archive containing
+   `debian-binary`/`control.tar.gz`/`data.tar.gz`), OpenWrt's own
+   `opkg-build` produces the `.ipk` as a **plain tar** with the same
+   three members, no `ar` wrapper — so `ar p` can't read it. The
+   Entware branch of this same verification step already had a fallback
+   for exactly this (`if ar t ...; then ar p ...; else tar -tf ...`),
+   added for Entware's own SDK output; the OpenWrt branch was written
+   without porting that same fallback. Fixed by adding the identical
+   `ar`-then-`tar`-fallback to the OpenWrt branch.
+
+This entry's fixes (findings 3-5) are unverified from this sandbox (no
+network to actually run the SDK/feeds/build steps) and, like every
+other network-touching change in this entry, are expected to need at
+least one more real-CI round-trip before landing clean — though finding
+5 is the first time the actual daemon binary itself successfully built
+for OpenWrt, which is the hard part; the verification-step fix is
+comparatively low-risk.
+
+Currently produces only `.ipk` (OpenWrt ≤24.10, opkg); `.apk` (OpenWrt
+≥25.12) is not wired up for any target. See D-51 for the subsequent
+expansion to the remaining package archs and Entware's non-Keenetic
+targets.
+
+## D-51: Expand CI to the remaining Entware and OpenWrt package archs
+
+**Status: accepted, expect substantial iteration.** With D-50's three
+OpenWrt package archs confirmed working end-to-end (real SDK build +
+real `.ipk` produced and verified), this activates CI for the rest of
+`config/entware/*.config` and `config/openwrt/*.config` rather than
+leaving them indefinitely gated.
+
+**Entware — low risk, reuses D-48 verbatim.** The three non-Keenetic
+targets (`aarch64-3.10`, `mips-3.4`, `mipsel-3.4`) and one never-tried
+before (`armv7-3.2`) use the exact same `ownik/gh-action-entware-sdk`
+mechanism as the already-working `_kn` targets — same SDK, same feed
+package flow, just without Keenetic's NDM integration. This required
+making `tools/ci/entware-package/Makefile` target-aware
+(`MAGITRICKLE_IS_KN:=$(filter %_kn,$(MAGITRICKLE_TARGET))`, mirroring
+the root Makefile's own `$(filter %_kn,$(TARGET))` gate at
+`Makefile:77`): only `_kn` targets get `ENTWARE_KN=1`, the NDM
+`netfilter.d` hook, and the `+socat` dependency; plain Entware targets
+install the existing `files/entware/etc/init.d/S99magitrickle` (which
+sources the standard Entware `rc.func`, present on real non-Keenetic
+Entware installs, unlike the self-contained Keenetic variant) — the
+same distinction the non-CI `make package_ipk` path already draws
+(`Makefile:256-257`). `armv7-3.2` is the one genuinely new risk here:
+unlike the other three archs, no `_kn` variant of it has ever built in
+this CI, so its own SDK asset availability is unverified.
+
+**OpenWrt — higher risk, target/subtarget mappings are best-effort.**
+Of the 21 remaining package archs (excluding the already-gated
+`aarch64_generic`), this attempted 18. This section originally listed
+them by a priori confidence level before any of it had run in real CI;
+that framing is now replaced below by what real CI actually confirmed.
+
+**Confirmed working (real CI, all 15):** `i386_pentium-mmx`/
+`i386_pentium4` → `x86/generic`; `loongarch64_generic` →
+`loongarch64/generic`; `aarch64_cortex-a53` → `bcm27xx/bcm2710`;
+`aarch64_cortex-a72` → `bcm27xx/bcm2711`; `arm_arm1176jzf-s_vfp` →
+`bcm27xx/bcm2708`; `arm_cortex-a15_neon-vfpv4` → `ipq806x/generic`;
+`arm_cortex-a9`/`arm_cortex-a9_neon` → `mvebu/cortexa9`; `arm_xscale` →
+`ixp4xx/generic`; `arm_cortex-a7` → `mediatek/mt7623`;
+`arm_cortex-a7_neon-vfpv4` → `sunxi/cortexa7`; `arm_cortex-a9_vfpv3-d16`
+→ `bcm53xx/generic`; `mips64_octeonplus` → `octeon/generic`;
+`mipsel_74kc` → `bcm47xx/mips74k`.
+
+**Confirmed wrong (real CI, all 3, reverted to gated):**
+`riscv64_generic` (tried `riscv64/generic`), `mips64el_mips64r2`
+(tried `loongson64/generic`), and `mipsel_mips32` (tried
+`bcm63xx/generic`) all 404'd identically on their SDK's `sha256sums`
+lookup for `OPENWRT_VERSION=24.10.1` — the *a priori* "high confidence"
+label given to `riscv64_generic` (assumed, wrongly, to be as clean a
+1:1 mapping as `loongarch64_generic`) turned out no better calibrated
+than the "medium confidence" ones; real CI is the only actual signal
+that mattered here. No stronger alternative target/subtarget came to
+mind for any of the three, so — matching D-50's `aarch64_generic`
+precedent — they're reverted to the default gated case rather than
+guessed again.
+
+**Still explicitly gated, never attempted**: `aarch64_cortex-a76`,
+`arm_arm926ej-s`, `arm_cortex-a5_vfpv4`, `arm_cortex-a7_vfpv4`,
+`arm_cortex-a8_vfpv3`, `arm_fa526`, `mips64_mips64r2`,
+`mipsel_24kc_24kf` — either too many plausible hardware families share
+the CPU baseline to pick one with any confidence, or (for
+`mips_4kec`/`mips_mips32`, also gated) the only candidate cores that
+came to mind (`ramips`, `bcm47xx`) are little-endian, which would fail
+the `Collect and verify package` step's own `mips_*` → big-endian
+assertion for a package arch name that (unlike `mipsel_*`) doesn't
+carry an "el".
+
+**Entware**: all four (`aarch64-3.10`, `mips-3.4`, `mipsel-3.4`,
+including the previously-untested `armv7-3.2`) confirmed working in the
+same real CI run — the D-48 mechanism ported over with zero surprises.
+
+Net result: **25 of the 28 real-build-attempt targets pass in CI**
+(7 Entware + 18 OpenWrt, on top of D-50's original 3), 3 OpenWrt archs
+reverted to gated after a confirmed-wrong guess, 11 OpenWrt archs remain
+gated as never attempted.
+
+## D-52: Build `.apk` (OpenWrt ≥25.12) packages in CI via a self-built `apk-tools`
+
+**Status: accepted, expect iteration.** `Makefile`'s own `package_apk`
+target (non-CI, source-build path) has produced valid `.apk` metadata
+logic since Phase 8, but `apk mkpkg` — OpenWrt's APKv3 packaging
+subcommand — was never actually run anywhere in this project; Phase 8's
+own verification could only dry-run it (`make -n`) because `apk-tools`
+isn't installed in any sandbox this project has had. Checked again for
+this task: no `apk-tools` package exists in Ubuntu's apt repos (the
+`build` job's runner), so CI needs to build it from source, same as it
+already does for the SDKs themselves.
+
+**Mechanism.** A new `apk_tools` job (parallel with `prepare`, not
+matrix'd — `apk`/`mkpkg` runs as a *host* tool that assembles the
+package archive, it's never cross-compiled) clones Alpine's own
+`apk-tools` (APKv3/`mkpkg` was contributed upstream into the mainline
+project by OpenWrt's own developers rather than staying a separate
+fork), builds it via its `meson`/`ninja` build system, and uploads the
+resulting `apk` binary as a workflow artifact — built once, reused by
+every OpenWrt matrix job via `actions/cache` + `actions/download-artifact`
+rather than rebuilt 18+ times. Each OpenWrt `build` job downloads it
+only when `openwrt_target` is set (Entware jobs never need it).
+
+**Packaging step reuses the already-produced `.ipk`'s own `data.tar.gz`**
+as the `.apk`'s file tree (`apk mkpkg -F <dir>`) instead of re-deriving
+`Package/install` logic a second time — the ipk's data archive already
+*is* the target root filesystem tree, so extracting it and pointing
+`mkpkg` at that directory is exactly equivalent to what a from-scratch
+install-root construction would produce, with far less duplicated
+logic. `conffiles`/`post-install`/`pre-deinstall`/`post-upgrade`
+handling copies `files/openwrt/_apk/*` verbatim — the same files the
+non-CI `make package_apk` path already uses (`Makefile:241`), so this
+introduces no new packaging metadata, only a new place that invokes it.
+The ECDSA signing key is a fresh ephemeral one generated per CI run
+(`openssl ecparam ... -genkey`, ceremony identical to `Makefile`'s own
+`$(BUILD_KEY_APK_SEC)` target) — packages are unsigned-by-any-persistent-
+key and installed with `--allow-untrusted`, matching the README's own
+install instructions; there is no distributed public key to verify
+against, by design, same as before this change.
+
+**Failure isolation — got this wrong on the first attempt.** Originally
+wrapped `.apk` packaging in `if ( set -eu; ...; ); then :; else
+::warning; fi`. The first real CI run hit two real bugs:
+
+1. `apk` failed at runtime: `error while loading shared libraries:
+   libapk.so.3.0.0: cannot open shared object file` — the `apk_tools`
+   job only shipped the `apk` executable, not the `libapk.so` it
+   dynamically links against. Fixed by also finding and shipping
+   `libapk.so*` from the build tree, and invoking `apk` with
+   `LD_LIBRARY_PATH` pointed at the artifact directory.
+2. Worse: despite that failure, the `if (subshell); then` still took
+   its *success* branch, so `package_2_path` got set to a `.apk` path
+   that was never created — and since `Upload package artifact 2` has
+   no failure isolation of its own (`if-no-files-found: error`), this
+   **broke the job for targets whose `.ipk` had already built
+   successfully**, a real regression this change introduced into
+   previously-working targets. Root cause: bash's `errexit`
+   suppression for a command being tested by `if` can extend into a
+   subshell that re-enables `set -e` inside it — a genuine, if
+   obscure, bash gotcha, not something guessable without hitting it.
+   Fixed by abandoning the `if (subshell)` idiom entirely: `set +e`,
+   run the subshell directly (capturing `$?` into a variable), `set
+   -e` again, then branch on the captured exit code. Also added a
+   `test -s "$apk_package"` inside the subshell itself as a
+   belt-and-suspenders check, independent of `apk mkpkg`'s own exit
+   code, before ever reporting success.
+
+With both fixes, `.apk` packaging failing now only emits a `::warning`
+annotation and leaves `package_2_path`/`package_2_name` unset (the
+existing `if steps.package_outputs.outputs.package_2_path != ''` guards
+on the upload steps handle that cleanly) — it cannot fail the job or
+take down the already-produced, already-verified `.ipk`, which is what
+was intended from the start. `apk-tools`' own build was otherwise
+confirmed working in that same run (the `apk_tools` job itself
+succeeded); this was purely an artifact-completeness bug plus a bash
+control-flow bug in the consuming step, not a problem with building
+apk-tools itself. Unverified from this sandbox as always; expect this
+to need at least one more real-CI confirmation that packaging actually
+succeeds end-to-end now, not just that it fails safely.
+
+**Not done here**: `PKG_VERSION_APK` (apk's version-string dialect —
+opkg/deb-style `~git<date>.<hash>` pre-release suffixes aren't valid apk
+version syntax) was already computed by the root `Makefile` but not
+previously exported by `_return_export_dynamic_env`; added that one
+line so the CI step can read it from `.build/openwrt-package.env`
+without duplicating the `sed` transform in the workflow YAML.
+
+## D-53: Second pass on D-51's "too ambiguous" OpenWrt archs — less conservative, per explicit request
+
+**Status: accepted, expect iteration — several of these are lower
+confidence than D-51's original batch.** D-51 left 8 OpenWrt package
+archs explicitly gated as "too many plausible hardware families share
+this CPU baseline to pick one with confidence." Asked to reconsider
+rather than leave them gated, since the cost of a wrong guess here (a
+fast 404 on SDK download, same as D-51's 3 misses) is low relative to
+the value of not leaving things gated by default caution alone.
+
+Re-examined all 8 with a lower confidence bar than D-51 used, since
+`arm_*` package archs carry no byte-order verification risk in
+`Collect and verify package` (only `aarch64_*`/`mips_*`/`mipsel_*`/
+`x86_64` are checked there) — the only real risk left for any `arm_*`
+guess is "does this SDK target/subtarget exist for
+`OPENWRT_VERSION=24.10.1`", the same fast-fail 404 category as D-51's
+misses, not a slow build-then-fail:
+
+- `aarch64_cortex-a76` → `bcm27xx/bcm2712` (Raspberry Pi 5, the specific
+  board this CPU baseline was clearly named after — missed on the
+  first pass despite being fairly obvious in retrospect).
+- `arm_arm926ej-s` → `gemini/generic` (Cortina/Storlink Gemini SoCs,
+  e.g. D-Link DNS-313 — ARM926EJ-S is essentially the *only* core this
+  OpenWrt target family uses, making it a cleaner match than most of
+  D-51's own "medium confidence" picks were).
+- `arm_fa526` → `gemini/generic` too — the Gemini SoC family's older
+  members (SL2312-era) are believed to predate the SL351x/ARM926EJ-S
+  generation and use the FA526 core instead; reusing the same
+  target/subtarget as `arm_arm926ej-s` on the theory that OpenWrt's
+  `gemini` target builds one kernel image spanning both. Lower
+  confidence than the other picks here — this is the one most likely
+  to turn out wrong.
+- `arm_cortex-a5_vfpv4` → `at91/sama5` (Microchip/Atmel SAMA5 SoCs).
+- `arm_cortex-a7_vfpv4` (no NEON) → `realtek/rtl930x` (Realtek's
+  ARM-based switch SoCs, e.g. Zyxel GS1900 series — cost-optimized
+  switch silicon plausibly lacking full NEON, unlike most other
+  Cortex-A7 implementations which do have it).
+- `mips64_mips64r2` → `octeon/generic` — reuses the exact same
+  target/subtarget as `mips64_octeonplus` (already confirmed working
+  and big-endian in D-51's real CI run). Deliberately redundant: no
+  other big-endian MIPS64 OpenWrt target came to mind, and Octeon is
+  now an *empirically confirmed* big-endian target rather than a guess,
+  which is a stronger basis than most of this entry's other picks.
+- `mipsel_24kc_24kf` (little-endian, hardware-FPU 24Kc) → `lantiq/xrx200`
+  (Lantiq/Intel/MaxLinear VDSL SoCs) — lowest confidence of this batch;
+  not certain `xrx200` actually has hardware FPU rather than the
+  soft-float baseline the plain `mipsel_24kc`/`ramips` mapping already
+  covers. **Confirmed wrong via real CI**: the SDK downloaded and the
+  daemon built fine, but the resulting binary is BIG-endian MIPS (per
+  the verification step's own `readelf -h` check) — Lantiq's whole
+  MIPS lineup is apparently big-endian, contradicting the "mipsel_"
+  name. Reverted to gated; no better little-endian 24Kc+FPU candidate
+  came to mind.
+
+**Still gated, no change**: `arm_cortex-a8_vfpv3` — unlike every other
+arch above, no real OpenWrt target name came to mind at all for
+Cortex-A8 (TI Sitara/BeagleBone-class SoCs aren't a router/NAS target
+family in current OpenWrt), so this one stays gated rather than
+fabricate a target/subtarget out of nothing. (D-54 later found a
+candidate — `sunxi/cortexa8` — see that entry.)
+
+**Confirmed via real CI**: 6 of this entry's 7 attempted mappings
+passed (`aarch64_cortex-a76`, `arm_arm926ej-s`, `arm_fa526`,
+`arm_cortex-a5_vfpv4`, `arm_cortex-a7_vfpv4`, `mips64_mips64r2`) — only
+`mipsel_24kc_24kf` (above) turned out wrong, and for a reason (real
+endianness mismatch) that couldn't have been predicted from a 404
+alone. The "lower confidence bar" framing above turned out more
+accurate than it looked going in: even the admittedly-weakest guesses
+(`gemini/generic` reused for both ARM926EJ-S and FA526) held up.
+
+## D-54: Close out the remaining gated OpenWrt archs — every config now attempts a real build
+
+**Status: accepted, weakest-confidence entry in this series — expect
+the highest miss rate of any batch so far.** After D-53, 4 OpenWrt
+package archs were still gated: `aarch64_generic` (D-50's confirmed
+404 on `armvirt/64`), `mips_4kec`/`mips_mips32` (no big-endian
+candidate found), and `arm_cortex-a8_vfpv3` (no candidate at all).
+Asked again to close these out rather than leave anything gated by
+default caution.
+
+- **`arm_cortex-a8_vfpv3`** → `sunxi/cortexa8` — Allwinner A10/A13
+  (single-core Cortex-A8, e.g. Olimex OLinuXino boards), an older
+  sibling of the already-working `sunxi/cortexa7` (A20) subtarget used
+  for `arm_cortex-a7_neon-vfpv4`. Missed on the first two passes
+  despite `sunxi` already being in use for a related core.
+- **`aarch64_generic`**: retried under the theory that OpenWrt renamed
+  its generic/QEMU-class aarch64 target from `armvirt` to `armsr`
+  (subtarget `armv8`) at some point after the version this project's
+  training knowledge was current for. If that memory is right, this
+  fixes D-50's 404; if wrong, it just 404s again the same way and
+  reverts to gated — no worse off than leaving it gated would have been.
+- **`mips_4kec`/`mips_mips32`**: no OpenWrt target for the older
+  4KEc-class AR71xx generation, or a plain big-endian generic mips32
+  baseline, came to mind at all — every real candidate considered
+  (`ramips`, `bcm47xx`) is little-endian, confirmed by D-51's own real
+  CI (`mipsel_74kc` → `bcm47xx/mips74k` passed, proving that family's
+  endianness). Rather than leave these flatly gated with nothing tried,
+  both reuse `ath79/generic` — the one OpenWrt target this project has
+  *empirically confirmed* big-endian via `mips_24kc`'s own passing CI
+  run. This is explicitly a "best available reuse," not a claimed
+  correct match: it should link and pass this repo's own byte-order
+  verification, but ath79's real `-march` default may assume 24Kc/74Kc
+  instruction extensions that genuine 4KEc-class or plain-mips32
+  hardware lacks, which no CI check here can catch (no real 4KEc device
+  or emulator to test boot/run on) — a binary that builds clean could
+  still crash with an illegal-instruction trap on real hardware. If
+  that turns out to matter, revisit rather than trust the green
+  checkmark blindly.
+
+**Confirmed via real CI: all 4 of this entry's mappings passed** —
+`arm_cortex-a8_vfpv3` (`sunxi/cortexa8`), `aarch64_generic`
+(`armsr/armv8` — the rename theory was right), `mips_4kec`, and
+`mips_mips32` (both `ath79/generic`) all built and verified clean.
+Combined with D-53's 6/7, **only `mipsel_24kc_24kf` (D-53) failed** out
+of the entire second-pass batch — and for a real, specific reason
+(confirmed big-endian binary from a `mipsel_`-named arch), not a vague
+404. The weakest-confidence framing this entry opened with did not
+hold up: the actual miss rate across D-53+D-54 combined was 1/11, far
+lower than D-51's own 3/21 despite deliberately looser reasoning.
+
+With this, every OpenWrt package arch config in the repo has attempted
+a real CI build at least once — none remain gated purely because no
+mapping was ever tried. Four package archs are gated with a confirmed
+reason instead: `riscv64_generic`, `mips64el_mips64r2`, and
+`mipsel_mips32` (D-51, SDK 404) plus `mipsel_24kc_24kf` (D-53, wrong
+endianness).
+
+## D-55: Bound OpenWrt matrix concurrency and retry network setup
+
+**Status: accepted.** A full matrix run launched all newly enabled
+OpenWrt jobs together; 17 otherwise independent targets failed while
+cloning the same upstream feeds with transient GitHub HTTP 504 errors.
+These were infrastructure failures, not target or compiler failures.
+
+The package matrix is limited to six concurrent jobs. OpenWrt SDK and
+checksum downloads use curl's retry-all-errors mode, and
+`scripts/feeds update -a` is retried four times with increasing backoff.
+No target is dropped or silently skipped: an exhausted retry budget still
+fails the corresponding job and publishes its captured feed log.

@@ -39,16 +39,23 @@ ifneq ($(findstring aarch64,$(MAGITRICKLE_TARGET)),)
 MAGITRICKLE_DYNAMIC_LINKER:=ld-linux-aarch64.so.1
 endif
 
+# Mirrors the root Makefile's own $(filter %_kn,$(TARGET)) gate: only
+# Keenetic (_kn) targets get ENTWARE_KN=1, the NDM netfilter.d hook, and
+# the self-contained (no /opt/etc/init.d/rc.func) init script. Plain
+# Entware targets use the generic init script that sources rc.func, same
+# as the non-CI ipk packaging path.
+MAGITRICKLE_IS_KN:=$(filter %_kn,$(MAGITRICKLE_TARGET))
+
 define Package/magitrickle
   SECTION:=net
   CATEGORY:=Network
   TITLE:=DNS-based routing application
   URL:=https://magitrickle.dev
-  DEPENDS:=+iptables +libyaml +libpcre2 +libmnl +libcurl +cJSON +socat
+  DEPENDS:=+iptables +libyaml +libpcre2 +libmnl +libcurl +cJSON $(if $(MAGITRICKLE_IS_KN),+socat)
 endef
 
 define Package/magitrickle/description
- DNS-based routing application for Entware on Keenetic devices.
+ DNS-based routing application for Entware.
 endef
 
 define Package/magitrickle/conffiles
@@ -67,7 +74,7 @@ define Build/Compile
 		MT_VERSION="$(PKG_VERSION)" \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
 		PLATFORM=entware \
-		ENTWARE_KN=1 \
+		$(if $(MAGITRICKLE_IS_KN),ENTWARE_KN=1) \
 		WITH_DEPS=1 \
 		CFLAGS_EXTRA="$(TARGET_CFLAGS) -I$(STAGING_DIR)/opt/include" \
 		LDLIBS="-lpthread -Wl,-Bstatic -latomic -Wl,-Bdynamic" \
@@ -93,6 +100,7 @@ define Package/magitrickle/install
 		$(1)/opt/var/lib/magitrickle/config.yaml
 
 	$(INSTALL_DIR) $(1)/opt/etc/init.d
+ifneq ($(MAGITRICKLE_IS_KN),)
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/entware_kn/etc/init.d/S99magitrickle \
 		$(1)/opt/etc/init.d/S99magitrickle
 
@@ -100,6 +108,10 @@ define Package/magitrickle/install
 	$(INSTALL_BIN) \
 		$(PKG_BUILD_DIR)/files/entware_kn/etc/ndm/netfilter.d/100-magitrickle \
 		$(1)/opt/etc/ndm/netfilter.d/100-magitrickle
+else
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/entware/etc/init.d/S99magitrickle \
+		$(1)/opt/etc/init.d/S99magitrickle
+endif
 endef
 
 $(eval $(call BuildPackage,magitrickle))

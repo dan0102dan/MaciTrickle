@@ -123,9 +123,49 @@ by commit; its SDK release archive is selected dynamically, digest-verified,
 and cached by the action. These SDK artifacts are unofficial builds of the
 Entware GCC 8.4.0/glibc 2.27 SDK. CI extracts the resulting daemon from the
 IPK and verifies its ELF architecture, byte order, and `/opt/lib` dynamic
-interpreter before upload. The non-`_kn` Entware targets and all OpenWrt
-targets remain explicitly gated until their corresponding jobs are wired to
-a real feed/SDK in the same way.
+interpreter before upload.
+
+Three OpenWrt package archs are automated the same way (D-50): `x86_64`
+(SDK target/subtarget `x86/64`), `mips_24kc` (`ath79/generic`),
+`mipsel_24kc` (`ramips/mt7621`) — chosen because these target/subtarget
+pairs are among the most common and best-documented in the OpenWrt
+project, unlike most of the other 21 package archs above where the
+table's `Triplet` column is still blank and no specific target/subtarget
+has been confirmed. `aarch64_generic` was tried against `armvirt/64` but
+that pairing 404s for `OPENWRT_VERSION=24.10.1` (confirmed against real
+CI, not this sandbox) — reverted to gated rather than guess again
+blindly; a real aarch64 target/subtarget for this OpenWrt release still
+needs to be found. CI downloads the real `OPENWRT_VERSION=24.10.1` SDK
+for each confirmed target (via `tools/ci/openwrt-package/Makefile`, a
+real in-tree SDK package, not a temporary feed), verifies its digest,
+and builds through `./scripts/feeds install` + explicitly compiling the
+compile-time feed dependencies (`libyaml`/`libpcre2`/`libmnl`/`curl` —
+`feeds install` only symlinks a package's recipe, it does not build or
+stage its headers, which the first real-CI run caught) + `make
+package/magitrickle/compile`. The explicit compile step's make targets
+had to be the SDK's real package names, not the `+libX` DEPENDS/
+feeds-install names: `libyaml` resolves (as a virtual/provides alias)
+to the real package `yaml`, `libpcre2` to `pcre2` (`libmnl`/`curl` keep
+their DEPENDS names as-is) — confirmed from `feeds-install.log`'s own
+`Installing package 'yaml' from packages` / `Installing package
+'pcre2' from base` lines after the first real-CI run kept hitting `No
+rule to make target 'package/libyaml/clean'` even past the cJSON fix.
+cJSON isn't in any OpenWrt feed for this release at all (`WARNING: No
+feed for package 'libcjson' found`, confirmed via CI), so it's vendored
+as its own in-tree SDK package (`tools/ci/openwrt-package-libcjson/
+Makefile`, source pinned to git tag `v1.7.18` — no hash-verified
+tarball, since this sandbox can't reach `github.com` either to source a
+checksum) and compiled the same explicit way as the other compile-time
+deps.
+
+D-51 subsequently activated the rest: the three non-`_kn` Entware targets
+(`aarch64-3.10`, `mips-3.4`, `mipsel-3.4`) plus a fourth never-tried-before
+one (`armv7-3.2`) reuse the identical `ownik/gh-action-entware-sdk`
+mechanism, and 18 of the remaining 21 OpenWrt package archs got a
+best-effort target/subtarget mapping (see D-51 for the confidence
+breakdown and the full list of what's still explicitly gated: 8 OpenWrt
+archs judged too ambiguous or endianness-mismatched to guess, plus `.apk`
+(OpenWrt ≥25.12) packaging for any target).
 
 ## UPX
 

@@ -17,68 +17,25 @@ mt-c (произносится как *Мэджитрикл*, по назван�
 
 Принцип работы основан на подмене основного DNS-сервера через промежуточный компонент без его отключения. Это позволяет перехватывать входящие DNS-запросы, кешировать ответы и сопоставлять IP-адреса с доменными именами. Благодаря этому становится возможной маршрутизация трафика без необходимости очистки DNS-кэша на стороне клиентов. Очистка кэша требуется только при запуске или перезапуске сервиса, поскольку в этот момент кэш ещё не прогрет, и маршрутизация невозможна до первого запроса к нужному домену.
 
-## Установка (Entware)
+## Установка
 
-1. Добавление репозитория в пакетный менеджер:
+Пакеты (`.ipk`) для Entware/Keenetic и OpenWrt собираются в GitHub Actions и публикуются на странице [Releases](https://github.com/dan0102dan/mt-c/releases). Скачайте `.ipk` под архитектуру роутера и установите:
+
+**Entware/Keenetic:**
 ```shell
-wget -qO- http://bin.magitrickle.dev/packages/add_repo.sh | sh
-```
-2. Установка пакета:
-```shell
-opkg update && opkg install magitrickle
-```
-3. Запуск пакета:
-```shell
+opkg install ./magitrickle_<версия>_entware_<архитектура>.ipk
 /opt/etc/init.d/S99magitrickle start
 ```
 
-Дальнейшее обновление можно осуществлять с помощью:
+**OpenWrt (≤ 24.10, opkg):**
 ```shell
-opkg update && opkg install magitrickle
-/opt/etc/init.d/S99magitrickle restart
-```
-
-## Установка (OpenWrt >= 25.12.X)
-
-1. Добавление репозитория в пакетный менеджер:
-```shell
-wget -qO- http://bin.magitrickle.dev/packages/add_repo.sh | sh
-```
-2. Установка пакета:
-```shell
-apk update && apk add magitrickle
-```
-3. Запуск пакета:
-```shell
+opkg install ./magitrickle_<версия>_openwrt_<архитектура>.ipk
 service magitrickle start
 ```
 
-Дальнейшее обновление можно осуществлять с помощью:
-```shell
-apk update && apk add magitrickle
-service magitrickle restart
-```
+Обновление — тем же способом (скачать новую версию, установить, `restart` вместо `start`).
 
-## Установка (OpenWrt <= 24.10.X)
-
-1. Добавление репозитория в пакетный менеджер:
-```shell
-wget -qO- http://bin.magitrickle.dev/packages/add_repo.sh | sh
-```
-2. Установка пакета:
-```shell
-opkg update && opkg install magitrickle
-```
-3. Запуск пакета:
-```shell
-service magitrickle start
-```
-
-Дальнейшее обновление можно осуществлять с помощью:
-```shell
-opkg update && opkg install magitrickle
-service magitrickle restart
-```
+`.apk` (OpenWrt ≥ 25.12, apk) пока не собирается в CI — только через `make build && make package` из исходников (см. `CLAUDE.md`).
 
 ## Почему mt-c
 

@@ -11,6 +11,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   prepare:
     name: Prepare build matrix
@@ -19,7 +22,7 @@ jobs:
       configs: ${{ steps.collect.outputs.configs }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build config matrix
         id: collect
@@ -44,22 +47,73 @@ jobs:
           print(f"configs={json.dumps(matrix, separators=(',', ':'))}")
           PY
 
+  apk_tools:
+    name: Build apk-tools (host, for mkpkg)
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Cache apk-tools binary
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: apk-tools-bin
+          # Bump this key if the pinned ref below changes.
+          key: apk-tools-v3.0.0-ubuntu-latest-v2
+
+      - name: Build apk-tools from source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build pkg-config zlib1g-dev libssl-dev lua5.3 liblua5.3-dev
+          # OpenWrt's APKv3 packaging (the `mkpkg` subcommand our .apk
+          # packaging needs) was contributed upstream into Alpine's own
+          # apk-tools rather than staying a separate fork -- host-only
+          # tool, built natively for the runner, never cross-compiled.
+          git clone --depth 1 --branch v3.0.0 https://gitlab.alpinelinux.org/alpine/apk-tools.git apk-tools-src
+          cd apk-tools-src
+          meson setup build -Ddocs=disabled
+          ninja -C build
+          mkdir -p "$GITHUB_WORKSPACE/apk-tools-bin"
+          find build -maxdepth 3 -type f -name apk -exec cp {} "$GITHUB_WORKSPACE/apk-tools-bin/apk" \;
+          # `apk` dynamically links against its own libapk.so -- ship
+          # that alongside it (the first real-CI run confirmed this was
+          # missing: "error while loading shared libraries: libapk.so.*").
+          find build -maxdepth 3 -type f -name 'libapk.so*' -exec cp {} "$GITHUB_WORKSPACE/apk-tools-bin/" \;
+          test -x "$GITHUB_WORKSPACE/apk-tools-bin/apk"
+          ls -la "$GITHUB_WORKSPACE/apk-tools-bin"
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apk-tools-bin" "$GITHUB_WORKSPACE/apk-tools-bin/apk" mkpkg --version
+
+      - name: Upload apk-tools artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: apk-tools-bin
+          path: apk-tools-bin
+          retention-days: 7
+
   build:
     name: Build packages (${{ matrix.name }})
-    needs: prepare
+    needs: [prepare, apk_tools]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Feed repositories rate-limit/fail when every OpenWrt architecture
+      # clones them at once. Keep enough concurrency for useful throughput
+      # without creating a synchronized clone storm.
+      max-parallel: 6
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.configs) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Check cross-toolchain availability
         id: toolchain
+        env:
+          OPENWRT_VERSION: "24.10.1"
         run: |
           cp "${{ matrix.config }}" .config
           . ./.config
@@ -68,21 +122,220 @@ jobs:
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "entware_config=${TARGET%_kn}" >> "$GITHUB_OUTPUT"
               ;;
+            # Plain (non-Keenetic) Entware targets reuse the exact same
+            # proven ownik/gh-action-entware-sdk mechanism as the _kn
+            # targets above (D-48) -- entware_config is just the arch
+            # name verbatim, no _kn suffix to strip. tools/ci/entware-
+            # package/Makefile is target-aware and skips ENTWARE_KN,
+            # the NDM hook, and the socat dep for these (D-51).
+            entware/aarch64-3.10 | entware/mips-3.4 | entware/mipsel-3.4 | entware/armv7-3.2)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "entware_config=$TARGET" >> "$GITHUB_OUTPUT"
+              ;;
+            # Well-known, stable target/subtarget for each package arch below
+            # (source: downloads.openwrt.org's own release layout for
+            # OPENWRT_VERSION). x86_64/mips_24kc/mipsel_24kc were verified
+            # via real CI (D-50); the rest below are best-effort mappings
+            # (D-51) from general OpenWrt hardware-target knowledge, not
+            # individually verified against a live feed/SDK index from this
+            # sandbox (proxy blocks downloads.openwrt.org) -- expect some to
+            # 404 or fail on first real CI run and need correction, exactly
+            # like D-50's aarch64_generic did. Package archs judged too
+            # ambiguous to guess with any confidence are left in the
+            # default gated case below rather than pick blindly.
+            openwrt/x86_64)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=64" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips_24kc)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ath79" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_24kc)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ramips" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mt7621" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/i386_pentium-mmx | openwrt/i386_pentium4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/loongarch64_generic)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=loongarch64" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/aarch64_cortex-a53)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm2710" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/aarch64_cortex-a72)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm2711" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_arm1176jzf-s_vfp)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm2708" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a15_neon-vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ipq806x" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a9 | openwrt/arm_cortex-a9_neon)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=mvebu" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa9" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_xscale)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ixp4xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a7)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=mediatek" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mt7623" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a7_neon-vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=sunxi" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa7" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a9_vfpv3-d16)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm53xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips64_octeonplus)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=octeon" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_74kc)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm47xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mips74k" >> "$GITHUB_OUTPUT"
+              ;;
+            # D-53: second pass over the archs D-51 left gated as "too
+            # ambiguous" -- reconsidered with less conservatism per
+            # explicit user request. Real candidates found for 7 of the
+            # remaining 8 (see decisions.md D-53 for the per-arch
+            # reasoning); still no arm_* byte-order check in this step
+            # to worry about (only aarch64_*/mips_*/mipsel_*/x86_64 are
+            # checked below), so these carry no verification-time risk
+            # beyond "does the SDK download exist".
+            openwrt/aarch64_cortex-a76)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm2712" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_arm926ej-s)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=gemini" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a5_vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=at91" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=sama5" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a7_vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=realtek" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=rtl930x" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips64_mips64r2)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=octeon" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_fa526)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=gemini" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a8_vfpv3)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=sunxi" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa8" >> "$GITHUB_OUTPUT"
+              ;;
+            # D-54: retried aarch64_generic (D-50's one confirmed 404,
+            # armvirt/64) under the theory that OpenWrt renamed its
+            # generic/QEMU-class aarch64 target from "armvirt" to "armsr"
+            # (subtarget "armv8") at some point -- if that rename memory
+            # is right this fixes the 404; if wrong it just 404s again
+            # and reverts to gated same as before, no worse off either way.
+            openwrt/aarch64_generic)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=armsr" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=armv8" >> "$GITHUB_OUTPUT"
+              ;;
+            # mips_4kec/mips_mips32 (no "el") need a genuinely BIG-endian
+            # MIPS target per this step's own later `mips_*` byte-order
+            # assertion -- ramips/bcm47xx (the only other MIPS32 cores
+            # that came to mind) are little-endian, and no OpenWrt target
+            # for the older 4KEc-class AR71xx generation or a plain
+            # generic big-endian mips32 baseline came to mind either.
+            # Rather than leave these flatly gated, reuse ath79/generic
+            # (the one target confirmed big-endian in this project's own
+            # CI, via mips_24kc) on the theory that it at least produces
+            # a byte-order-correct, linkable binary -- caveat: ath79's
+            # actual -march default may assume 24Kc/74Kc-specific
+            # instruction extensions genuine 4KEc-class or plain-mips32
+            # hardware lacks, so this is a "best available" reuse, not a
+            # confirmed-correct match; if it fails or produces a broken
+            # binary on real hardware, revert to gated.
+            openwrt/mips_4kec | openwrt/mips_mips32)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ath79" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            # riscv64_generic (riscv64/generic), mips64el_mips64r2
+            # (loongson64/generic), and mipsel_mips32 (bcm63xx/generic)
+            # were tried in D-51 and all three 404'd on their sha256sums
+            # lookup for OPENWRT_VERSION=24.10.1 (confirmed via real CI)
+            # -- reverted to gated rather than guess again blindly.
+            # mipsel_24kc_24kf (D-53) was tried as lantiq/xrx200: SDK
+            # downloaded and built fine, but the resulting binary is
+            # BIG-endian MIPS (confirmed via real CI's own readelf
+            # check) -- lantiq's whole MIPS lineup is apparently
+            # big-endian, contradicting the "mipsel_" package arch name.
+            # No better little-endian 24Kc+FPU candidate came to mind,
+            # so reverted to gated rather than guess again.
             *)
               echo "::notice title=${{ matrix.name }}::Packaging for this target is not yet automated in CI: no real Entware/OpenWrt cross-toolchain + feed sysroot is provisioned for PLATFORM=$PLATFORM TARGET=$TARGET. See docs/c-rewrite/toolchains.md and decisions.md D-45. Skipping this job's build step."
               echo "ready=false" >> "$GITHUB_OUTPUT"
               ;;
           esac
+          echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.JS
         if: steps.toolchain.outputs.ready == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
 
+      - name: Download apk-tools artifact
+        if: steps.toolchain.outputs.openwrt_target != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: apk-tools-bin
+          path: apk-tools-bin
+
+      - name: Make apk-tools executable
+        if: steps.toolchain.outputs.openwrt_target != ''
+        run: chmod +x apk-tools-bin/apk
+
       - name: Prepare Entware package feed
         id: entware_feed
-        if: steps.toolchain.outputs.ready == 'true'
+        if: steps.toolchain.outputs.entware_config != ''
         run: |
           mkdir -p .build
           eval export $(make _return_export_dynamic_env);
@@ -108,7 +361,7 @@ jobs:
 
       - name: Build with prebuilt Entware SDK
         id: entware_sdk
-        if: steps.toolchain.outputs.ready == 'true'
+        if: steps.toolchain.outputs.entware_config != ''
         continue-on-error: true
         # v1, pinned to its verified commit rather than a mutable tag.
         uses: ownik/gh-action-entware-sdk@003ddc33bb3b12a2f96e0c4689c56351614cf01a
@@ -154,75 +407,371 @@ jobs:
           echo "::error title=Entware SDK ${{ matrix.name }}::$message"
           exit 1
 
-      - name: Collect and verify Entware package
+      - name: Prepare OpenWrt SDK + package
+        id: openwrt_sdk
+        if: steps.toolchain.outputs.openwrt_target != ''
+        continue-on-error: true
+        run: |
+          set -eu
+          mkdir -p .build
+          eval export $(make _return_export_dynamic_env);
+          cp "${{ matrix.config }}" .config
+          make build_frontend
+          make _return_export_dynamic_env > .build/openwrt-package.env
+          . .build/openwrt-package.env
+
+          version="${{ steps.toolchain.outputs.openwrt_version }}"
+          target="${{ steps.toolchain.outputs.openwrt_target }}"
+          subtarget="${{ steps.toolchain.outputs.openwrt_subtarget }}"
+          base_url="https://downloads.openwrt.org/releases/${version}/targets/${target}/${subtarget}"
+
+          sdk_root="${RUNNER_TEMP}/openwrt-sdk-${{ matrix.name }}"
+          mkdir -p "$sdk_root"
+          log_dir="${RUNNER_TEMP}/openwrt-logs-${{ matrix.name }}"
+          mkdir -p "$log_dir"
+          echo "log_dir=$log_dir" >> "$GITHUB_OUTPUT"
+
+          (
+            cd "$sdk_root"
+            curl --retry 5 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 30 -fsSL -o sha256sums \
+              "${base_url}/sha256sums" 2>&1 | tee "$log_dir/download.log"
+            sdk_file=$(grep -oE 'openwrt-sdk-[^ ]+\.tar\.(zst|xz)' sha256sums | head -n1)
+            if [ -z "$sdk_file" ]; then
+              echo "Could not find an SDK archive name in ${base_url}/sha256sums" | tee -a "$log_dir/download.log" >&2
+              exit 1
+            fi
+            echo "SDK archive: $sdk_file" | tee -a "$log_dir/download.log"
+            curl --retry 5 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 30 -fsSL -o "$sdk_file" \
+              "${base_url}/${sdk_file}" 2>&1 | tee -a "$log_dir/download.log"
+            grep -- "$sdk_file\$" sha256sums | sha256sum -c - 2>&1 | tee -a "$log_dir/download.log"
+
+            case "$sdk_file" in
+              *.tar.zst) tar --use-compress-program=unzstd -xf "$sdk_file" ;;
+              *.tar.xz) tar -xJf "$sdk_file" ;;
+              *) echo "Unrecognized SDK archive extension: $sdk_file" >&2; exit 1 ;;
+            esac
+          )
+          echo "sdk_root=$sdk_root" >> "$GITHUB_OUTPUT"
+
+          sdk_dir=$(find "$sdk_root" -mindepth 1 -maxdepth 1 -type d -name 'openwrt-sdk-*')
+          if [ -z "$sdk_dir" ]; then
+            echo "Extracted SDK directory not found under $sdk_root" >&2
+            exit 1
+          fi
+          echo "sdk_dir=$sdk_dir" >> "$GITHUB_OUTPUT"
+
+          pkg_dir="$sdk_dir/package/net/magitrickle"
+          mkdir -p "$pkg_dir"
+          cp tools/ci/openwrt-package/Makefile "$pkg_dir/Makefile"
+          {
+            printf 'MAGITRICKLE_VERSION:=%s\n' "$PKG_VERSION"
+            printf 'MAGITRICKLE_RELEASE:=%s\n' "$PKG_REVISION"
+          } > "$pkg_dir/version.mk"
+          tar -czf "$pkg_dir/magitrickle-source.tar.gz" \
+            --transform "s,^,magitrickle-${PKG_VERSION}/," \
+            LICENSE files src/backend-c src/frontend/dist
+
+          # cJSON isn't in any OpenWrt feed for this release (confirmed via
+          # CI: "WARNING: No feed for package 'libcjson' found" -- see
+          # decisions.md D-50), so it's vendored as its own in-tree SDK
+          # package, discovered by the package scanner the same way
+          # `magitrickle` itself is, with no `feeds install` step needed.
+          cjson_pkg_dir="$sdk_dir/package/libs/libcjson"
+          mkdir -p "$cjson_pkg_dir"
+          cp tools/ci/openwrt-package-libcjson/Makefile "$cjson_pkg_dir/Makefile"
+
+          (
+            cd "$sdk_dir"
+            : > "$log_dir/feeds-update.log"
+            feeds_updated=false
+            for attempt in 1 2 3 4; do
+              echo "feeds update attempt $attempt/4" >> "$log_dir/feeds-update.log"
+              if ./scripts/feeds update -a >> "$log_dir/feeds-update.log" 2>&1; then
+                feeds_updated=true
+                break
+              fi
+              if [ "$attempt" -lt 4 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            if [ "$feeds_updated" != true ]; then
+              echo "feeds update failed after 4 attempts" >> "$log_dir/feeds-update.log"
+              exit 1
+            fi
+            ./scripts/feeds install libyaml libpcre2 libmnl libcurl \
+              iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft libatomic \
+              > "$log_dir/feeds-install.log" 2>&1
+            make defconfig > "$log_dir/defconfig.log" 2>&1
+            # `feeds install` only symlinks each recipe -- it does not build or
+            # stage its headers/libs into staging_dir. Our own package only
+            # needs libyaml/libpcre2/libmnl/curl(libcurl)/libcjson at compile
+            # time (the rest are runtime-only: kernel modules and iptables
+            # CLI binaries we fork/exec, never #include), so compile just
+            # those explicitly first, by package name (not physical
+            # subdirectory -- same name-based target the `magitrickle`
+            # package itself already resolves through). Note the make
+            # target is the SDK's real package name, which for some
+            # packages differs from the `+libX` DEPENDS/feeds-install
+            # name feeds install resolves as a virtual alias: `libyaml`
+            # installs the package named `yaml`, `libpcre2` installs
+            # `pcre2` (feeds-install.log confirmed both renames; `libmnl`
+            # and `curl` keep their DEPENDS names as-is).
+            make package/yaml/{clean,compile} \
+                 package/pcre2/{clean,compile} \
+                 package/libmnl/{clean,compile} \
+                 package/curl/{clean,compile} \
+                 package/libcjson/{clean,compile} \
+                 V=s > "$log_dir/deps-build.log" 2>&1
+            make package/magitrickle/{clean,compile} V=s > "$log_dir/build.log" 2>&1
+          )
+
+      - name: Report OpenWrt SDK build failure
+        if: steps.openwrt_sdk.outcome == 'failure'
+        run: |
+          log_dir="${{ steps.openwrt_sdk.outputs.log_dir }}"
+          {
+            echo "OpenWrt SDK package build failed. Relevant log lines:"
+            if [ -n "$log_dir" ] && [ -d "$log_dir" ]; then
+              while IFS= read -r -d '' log; do
+                matches=$(
+                  grep -E \
+                    'make\[[0-9]+\]: \*\*\*|(^|: )(fatal )?error:|undefined reference|No rule to make target|collect2: error|ld returned [0-9]+ exit status|curl:|sha256sum:.*FAILED|WARNING:|[Nn]o feed for package|[Nn]ot found' \
+                    "$log" || true
+                )
+                if [ -n "$matches" ]; then
+                  echo "==> $log <=="
+                  printf '%s\n' "$matches" | tail -n 80
+                  echo "Last 20 lines:"
+                  tail -n 20 "$log"
+                fi
+              done < <(find "$log_dir" -type f -print0 | sort -z)
+            else
+              echo "No log directory captured (failure before SDK extraction)."
+            fi
+            # feeds-install.log rarely matches the error patterns above (a
+            # missing/misnamed package prints a WARNING, not an error) but is
+            # exactly what explains a later "No rule to make target
+            # package/<name>/..." failure, so always show its tail regardless
+            # of match.
+            feeds_install_log="$log_dir/feeds-install.log"
+            if [ -f "$feeds_install_log" ]; then
+              echo "==> $feeds_install_log (full) <=="
+              cat "$feeds_install_log"
+            fi
+          } | tee "${RUNNER_TEMP}/openwrt-sdk-failure.txt"
+
+          message=$(
+            tail -n 400 "${RUNNER_TEMP}/openwrt-sdk-failure.txt" |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' |
+              awk 'BEGIN { ORS="%0A" } { print }'
+          )
+          echo "::error title=OpenWrt SDK ${{ matrix.name }}::$message"
+          exit 1
+
+      - name: Collect and verify package
         id: package_outputs
         if: steps.toolchain.outputs.ready == 'true'
         run: |
-          mapfile -t packages < <(
-            find "${{ steps.entware_feed.outputs.artifacts_dir }}" \
-              -type f -name 'magitrickle_*.ipk' | sort
-          )
-          if [ "${#packages[@]}" -ne 1 ]; then
-            echo "Expected exactly one magitrickle IPK, found ${#packages[@]}" >&2
-            printf '%s\n' "${packages[@]}" >&2
-            exit 1
-          fi
-
-          . .build/entware-package.env
-          package=".build/magitrickle_${PKG_VERSION}-${PKG_REVISION}_entware_${{ matrix.name }}.ipk"
-          cp "${packages[0]}" "$package"
-
-          data_archive=$(mktemp)
-          binary=$(mktemp)
-          if ar t "$package" >/dev/null 2>&1; then
-            ar p "$package" data.tar.gz > "$data_archive"
-          else
-            data_member=$(
-              tar -tf "$package" |
-                awk '$0 == "data.tar.gz" || $0 == "./data.tar.gz" { print; exit }'
+          set -eu
+          if [ -n "${{ steps.toolchain.outputs.entware_config }}" ]; then
+            mapfile -t packages < <(
+              find "${{ steps.entware_feed.outputs.artifacts_dir }}" \
+                -type f -name 'magitrickle_*.ipk' | sort
             )
-            if [ -z "$data_member" ]; then
-              echo "No data.tar.gz member in $package" >&2
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "Expected exactly one magitrickle IPK, found ${#packages[@]}" >&2
+              printf '%s\n' "${packages[@]}" >&2
               exit 1
             fi
-            tar -xOf "$package" "$data_member" > "$data_archive"
-          fi
-          binary_member=$(
-            tar -tzf "$data_archive" |
-              awk '$0 == "opt/bin/magitrickled" || $0 == "./opt/bin/magitrickled" { print; exit }'
-          )
-          if [ -z "$binary_member" ]; then
-            echo "No /opt/bin/magitrickled in $package" >&2
-            exit 1
-          fi
-          tar -xzOf "$data_archive" "$binary_member" > "$binary"
 
-          readelf -h "$binary"
-          readelf -l "$binary"
-          case "${{ matrix.name }}" in
-            aarch64-*)
-              readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
-              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
-              readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
-              ;;
-            mips-*)
-              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
-              readelf -h "$binary" | grep -Eq 'Data:.*big endian'
-              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
-              ;;
-            mipsel-*)
-              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
-              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
-              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
-              ;;
-          esac
+            . .build/entware-package.env
+            package=".build/magitrickle_${PKG_VERSION}-${PKG_REVISION}_entware_${{ matrix.name }}.ipk"
+            cp "${packages[0]}" "$package"
 
-          echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
-          echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
+            data_archive=$(mktemp)
+            binary=$(mktemp)
+            if ar t "$package" >/dev/null 2>&1; then
+              ar p "$package" data.tar.gz > "$data_archive"
+            else
+              data_member=$(
+                tar -tf "$package" |
+                  awk '$0 == "data.tar.gz" || $0 == "./data.tar.gz" { print; exit }'
+              )
+              if [ -z "$data_member" ]; then
+                echo "No data.tar.gz member in $package" >&2
+                exit 1
+              fi
+              tar -xOf "$package" "$data_member" > "$data_archive"
+            fi
+            binary_member=$(
+              tar -tzf "$data_archive" |
+                awk '$0 == "opt/bin/magitrickled" || $0 == "./opt/bin/magitrickled" { print; exit }'
+            )
+            if [ -z "$binary_member" ]; then
+              echo "No /opt/bin/magitrickled in $package" >&2
+              exit 1
+            fi
+            tar -xzOf "$data_archive" "$binary_member" > "$binary"
+
+            readelf -h "$binary"
+            readelf -l "$binary"
+            case "${{ matrix.name }}" in
+              aarch64-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
+                ;;
+              mips-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                ;;
+              mipsel-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                ;;
+            esac
+
+            echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
+            echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ steps.toolchain.outputs.openwrt_target }}" ]; then
+            sdk_dir="${{ steps.openwrt_sdk.outputs.sdk_dir }}"
+            mapfile -t packages < <(
+              find "$sdk_dir/bin/packages" -type f -name 'magitrickle_*.ipk' 2>/dev/null | sort
+            )
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "Expected exactly one magitrickle IPK under $sdk_dir/bin/packages, found ${#packages[@]}" >&2
+              printf '%s\n' "${packages[@]}" >&2
+              exit 1
+            fi
+
+            . .build/openwrt-package.env
+            package=".build/magitrickle_${PKG_VERSION}-${PKG_REVISION}_openwrt_${{ matrix.name }}.ipk"
+            cp "${packages[0]}" "$package"
+
+            data_archive=$(mktemp)
+            binary=$(mktemp)
+            if ar t "$package" >/dev/null 2>&1; then
+              ar p "$package" data.tar.gz > "$data_archive"
+            else
+              data_member=$(
+                tar -tf "$package" |
+                  awk '$0 == "data.tar.gz" || $0 == "./data.tar.gz" { print; exit }'
+              )
+              if [ -z "$data_member" ]; then
+                echo "No data.tar.gz member in $package" >&2
+                exit 1
+              fi
+              tar -xOf "$package" "$data_member" > "$data_archive"
+            fi
+            binary_member=$(
+              tar -tzf "$data_archive" |
+                awk '$0 == "usr/bin/magitrickled" || $0 == "./usr/bin/magitrickled" { print; exit }'
+            )
+            if [ -z "$binary_member" ]; then
+              echo "No /usr/bin/magitrickled in $package" >&2
+              exit 1
+            fi
+            tar -xzOf "$data_archive" "$binary_member" > "$binary"
+
+            readelf -h "$binary"
+            readelf -l "$binary"
+            case "${{ matrix.name }}" in
+              aarch64_*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                ;;
+              mips_*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+                ;;
+              mipsel_*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                ;;
+              x86_64)
+                readelf -h "$binary" | grep -Eq 'Machine:.*X86-64'
+                ;;
+            esac
+
+            echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
+            echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
+
+            # .apk (OpenWrt >=25.12, apk-tools) is best-effort: it reuses
+            # the .ipk's own data.tar.gz as its file tree (same install
+            # layout, no separate Package/install logic needed) and the
+            # apk-tools binary built by the apk_tools job. If it fails,
+            # don't take down an otherwise-successful .ipk build with it
+            # -- report a warning and move on with .ipk only.
+            #
+            # NOTE: deliberately not `if ( set -eu; ...; ); then`. Bash's
+            # errexit suppression for commands tested by `if` can extend
+            # into a subshell that re-enables `set -e` inside it (a real,
+            # confirmed-the-hard-way gotcha -- the first real CI run hit
+            # exactly this: the apk mkpkg call inside such a subshell
+            # failed, but the `if` still took its "success" branch and
+            # package_2_path got set to a file that didn't exist,
+            # breaking the artifact upload for an otherwise-fine .ipk
+            # build). Capture the exit code explicitly instead.
+            set +e
+            (
+              set -eu
+              apk_root=$(mktemp -d)
+              tar -xzf "$data_archive" -C "$apk_root"
+              mkdir -p "$apk_root/lib/apk/packages"
+              if [ -f files/openwrt/_apk/conffiles ]; then
+                cp files/openwrt/_apk/conffiles "$apk_root/lib/apk/packages/magitrickle.conffiles"
+                while IFS= read -r cf; do
+                  cf="${cf#/}"
+                  [ -n "$cf" ] && [ -f "$apk_root/$cf" ] || continue
+                  csum=$(sha256sum "$apk_root/$cf" | cut -d' ' -f1)
+                  echo "$cf $csum" >> "$apk_root/lib/apk/packages/magitrickle.conffiles_static"
+                done < files/openwrt/_apk/conffiles
+              fi
+              (cd "$apk_root" && find . -type f,l -printf "/%P\n") > "$apk_root/lib/apk/packages/magitrickle.list"
+
+              apk_key=$(mktemp)
+              openssl ecparam -name prime256v1 -genkey -noout -out "$apk_key"
+
+              apk_package=".build/magitrickle_${PKG_VERSION_APK}-r${PKG_REVISION}_openwrt_${{ matrix.name }}.apk"
+              LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apk-tools-bin" "$GITHUB_WORKSPACE/apk-tools-bin/apk" mkpkg \
+                -I "name:magitrickle" \
+                -I "version:${PKG_VERSION_APK}-r${PKG_REVISION}" \
+                -I "description:DNS-based routing application" \
+                -I "arch:${{ matrix.name }}" \
+                -I "license:GPL-3.0-or-later" \
+                -I "origin:feeds/packages/feeds/magitrickle/net/magitrickle" \
+                -I "maintainer:Vladimir Avtsenov <vladimir.lsk.cool@gmail.com>" \
+                -I "url:https://magitrickle.dev" \
+                -I "provider-priority:100" \
+                -I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft libyaml libpcre2 libmnl libcurl libcjson" \
+                -s "post-install:files/openwrt/_apk/post-install.sh" \
+                -s "pre-deinstall:files/openwrt/_apk/pre-deinstall.sh" \
+                -s "post-upgrade:files/openwrt/_apk/post-upgrade.sh" \
+                -F "$apk_root" \
+                -o "$apk_package" \
+                --sign "$apk_key"
+
+              # Belt-and-suspenders: only report success if the file is
+              # genuinely there, regardless of apk mkpkg's own exit code.
+              test -s "$apk_package"
+
+              echo "package_2_path=$apk_package" >> "$GITHUB_OUTPUT"
+              echo "package_2_name=$(basename "$apk_package")" >> "$GITHUB_OUTPUT"
+            )
+            apk_status=$?
+            set -e
+            if [ "$apk_status" -ne 0 ]; then
+              echo "::warning title=.apk packaging (${{ matrix.name }})::Failed to build the .apk package for this target (exit $apk_status); .ipk is still produced above. See docs/c-rewrite/decisions.md D-52."
+            fi
+          fi
 
       - name: Upload package artifact 1
         if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_1_path != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package_outputs.outputs.package_1_name }}
           path: ${{ steps.package_outputs.outputs.package_1_path }}
@@ -231,23 +780,25 @@ jobs:
 
       - name: Upload package artifact 2
         if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_2_path != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package_outputs.outputs.package_2_name }}
           path: ${{ steps.package_outputs.outputs.package_2_path }}
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload package asset 1 to release
-        if: ${{ github.event_name == 'release' && steps.package_outputs.outputs.package_1_path != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.package_outputs.outputs.package_1_path }}
-          token: ${{ secrets.RELEASE_TOKEN }}
-
-      - name: Upload package asset 2 to release
-        if: ${{ github.event_name == 'release' && steps.package_outputs.outputs.package_2_path != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.package_outputs.outputs.package_2_path }}
-          token: ${{ secrets.RELEASE_TOKEN }}
+      - name: Upload package assets to release
+        if: ${{ github.event_name == 'release' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PACKAGE_1: ${{ steps.package_outputs.outputs.package_1_path }}
+          PACKAGE_2: ${{ steps.package_outputs.outputs.package_2_path }}
+        run: |
+          for package in "$PACKAGE_1" "$PACKAGE_2"; do
+            if [ -n "$package" ]; then
+              gh release upload "$RELEASE_TAG" "$package" \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber
+            fi
+          done
