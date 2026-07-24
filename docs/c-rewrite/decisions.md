@@ -2572,3 +2572,59 @@ checksum downloads use curl's retry-all-errors mode, and
 `scripts/feeds update -a` is retried four times with increasing backoff.
 No target is dropped or silently skipped: an exhausted retry budget still
 fails the corresponding job and publishes its captured feed log.
+
+## D-56: Netfilter table writes on `_kn` move to a committer thread that restarts rather than reports
+
+**Status: accepted.** Keenetic firmware's own userspace netfilter
+implementation replaces a table whole and atomically, then runs the
+`netfilter.d` hook, which POSTs `/api/v1/system/hooks/netfilterd`.
+Answering that hook the way the Go original did — commit in place,
+chain by chain, on the thread handling the request — races with the
+firmware's next rewrite: some of what was written is gone before the
+rest lands, and the iptables errors that produces come back as an HTTP
+failure the caller can do nothing with.
+
+On `-DMT_ENTWARE_KN` builds the write is owned by a dedicated thread
+(`netfilter/committer.c`, `nfcommit.h`):
+
+- The hook handler calls `mt_nfcommit_request()` and returns. It never
+  waits and never reports: requests arriving during a rebuild fold into
+  a single following pass, so one firmware rewrite (one event per table)
+  costs one rebuild rather than three.
+- A request arriving mid-write aborts it. The cancellation token
+  (`cancel.h`) is polled by `mt_ipt_commit` between transfers and joins
+  the `poll()` set in `executable_real.c`, so a raised token also kills
+  the running `iptables-save`/`iptables-restore`. `iptables-restore`
+  applies each table in one `setsockopt` at its `COMMIT` line, so a
+  killed child leaves whole tables applied or not applied.
+- A pass drops every chain and jump of ours from the kernel *first* and
+  only then stages the port remap and each enabled group, writing the
+  result in one commit per family. The outcome therefore depends only on
+  the current group set, never on what an aborted pass left behind.
+- Nothing fails outward. `MT_ERR_CANCELED` and `MT_ERR_AGAIN` (raced
+  writes, classified from iptables' stderr in `executable_real.c`) are
+  logged at debug and retried immediately; anything else is logged at
+  warn and retried with a growing backoff.
+
+Other platforms keep committing in place: nothing rewrites the tables
+there, and the in-place path stays both correct and simpler.
+
+**Relationship to D-19.** D-19 put all netfilter mutation on the loop
+thread and gave `mt_ipt_t`/`mt_ruleset_t` no internal locking. That
+premise is narrowed, not abandoned: the committer thread only ever
+*reads* the ruleset registry, and the loop thread remains its only
+writer. The `nf_mu` mutex in `api/app.c` (recursive, taken by every
+mutating `mt_app_*` entry point and by the rebuild) exists so the
+registry cannot be rewritten, or an iptables engine driven, while a
+rebuild is in flight. The DNS hot path is the other reader and stays
+lock-free exactly as D-17 requires — two readers never conflict.
+A mutating entry point asks the committer to restart *before* taking the
+lock, so the loop thread waits for an abort rather than for a whole
+rebuild, and the pass that follows picks up the change it just made.
+
+**Tested by** `test_cancel.c` (token semantics), `test_nfcommit.c`
+(request coalescing, mid-write abort and restart, retry-until-quiet,
+shutdown while a write is parked) and `test_nfrebuild.c` (recovery after
+a simulated firmware wipe, no duplicated jumps across repeated passes,
+removal of chains left by a previous run, other writers' rules
+preserved, aborted pass writes nothing and converges on the next one).

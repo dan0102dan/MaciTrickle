@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "magitrickle/cancel.h"
 #include "magitrickle/err.h"
 
 typedef enum mt_ipt_proto {
@@ -67,6 +68,11 @@ typedef struct mt_ipt_executable_ops {
     mt_err_t (*restore)(mt_ipt_executable_t *self, const uint8_t *data, size_t len);
     mt_ipt_proto_t (*proto)(mt_ipt_executable_t *self);
     void (*destroy)(mt_ipt_executable_t *self);
+    /* Optional (may be NULL): hands the backend a token to abort an
+     * in-flight transfer on. The real backend polls it alongside the
+     * child's pipes and kills the child when it is raised; backends with
+     * nothing to interrupt (the test fake) leave this NULL. */
+    void (*set_cancel)(mt_ipt_executable_t *self, mt_cancel_t *cancel);
 } mt_ipt_executable_ops_t;
 
 struct mt_ipt_executable {
@@ -137,6 +143,14 @@ mt_ipt_t *mt_ipt_new(mt_ipt_executable_t *exe);
 void mt_ipt_free(mt_ipt_t *ipt);
 mt_ipt_proto_t mt_ipt_proto(const mt_ipt_t *ipt);
 
+/* Attaches a cancellation token (borrowed, nullable to detach), making
+ * commits abortable: mt_ipt_commit checks it before reading the current
+ * table and again before writing, and the executable backend kills an
+ * already-running iptables-save/restore when it is raised. An aborted
+ * commit returns MT_ERR_CANCELED and leaves the staged rules untouched,
+ * so the caller can simply build again from scratch. */
+void mt_ipt_set_cancel(mt_ipt_t *ipt, mt_cancel_t *cancel);
+
 /* Registering a table/chain twice replaces the previous registration
  * (matches Go: rules[table][chainName] = &chainX{}), discarding any
  * staged-but-uncommitted rules for the old registration. */
@@ -197,7 +211,12 @@ void mt_ipt_rules_snapshot_free(mt_ipt_rules_snapshot_t *snap);
  * output (grouped and ordered by priority, see engine.c) and executes it
  * via the Executable backend. No-op (does not even call Save/Restore) if
  * every chain compiles to zero commands, matching Go's `buf.Len() == 0`
- * early return. */
+ * early return.
+ *
+ * MT_ERR_CANCELED when an attached cancellation token was raised (see
+ * mt_ipt_set_cancel); MT_ERR_AGAIN when the write failed because someone
+ * else changed the table underneath us (see executable_real.c) -- both
+ * mean "nothing durable happened, build it again", not "give up". */
 mt_err_t mt_ipt_commit(mt_ipt_t *ipt);
 
 #endif /* MAGITRICKLE_IPTABLES_H */

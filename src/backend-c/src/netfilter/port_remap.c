@@ -50,7 +50,9 @@ void mt_port_remap_free(mt_port_remap_t *p) {
     free(p);
 }
 
-static mt_err_t insert_rules(mt_port_remap_t *p, mt_ipt_t *ipt) {
+/* Stages the remap chain without writing it -- see
+ * mt_ipset_to_link_prepare_iptables for why the write is separate. */
+static mt_err_t build_rules(mt_port_remap_t *p, mt_ipt_t *ipt) {
     if (!ipt) { return MT_OK; }
     mt_ipt_proto_t proto = mt_ipt_proto(ipt);
 
@@ -86,7 +88,23 @@ static mt_err_t insert_rules(mt_port_remap_t *p, mt_ipt_t *ipt) {
     err = mt_ipt_insert(ipt, "nat", "PREROUTING", 1, pre_args, 2);
     if (err != MT_OK) { return err; }
 
+    return MT_OK;
+}
+
+static mt_err_t insert_rules(mt_port_remap_t *p, mt_ipt_t *ipt) {
+    if (!ipt) { return MT_OK; }
+
+    mt_err_t err = build_rules(p, ipt);
+    if (err != MT_OK) { return err; }
     return mt_ipt_commit(ipt);
+}
+
+mt_err_t mt_port_remap_prepare_iptables(mt_port_remap_t *p) {
+    if (!p || !p->enabled) { return MT_OK; }
+
+    mt_err_t e4 = build_rules(p, p->ipt4);
+    mt_err_t e6 = build_rules(p, p->ipt6);
+    return e4 != MT_OK ? e4 : e6;
 }
 
 static mt_err_t delete_rules(mt_port_remap_t *p, mt_ipt_t *ipt) {

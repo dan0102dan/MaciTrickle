@@ -26,6 +26,7 @@ struct mt_ipt {
     table_reg_t *tables;
     size_t n_tables, cap_tables;
     mt_ipt_executable_t *exe;
+    mt_cancel_t *cancel; /* borrowed, nullable */
 };
 
 mt_ipt_t *mt_ipt_new(mt_ipt_executable_t *exe) {
@@ -702,7 +703,18 @@ static mt_err_t write_command(mt_bytebuf_t *buf, const mt_ipt_command_t *cmd) {
     return err;
 }
 
+void mt_ipt_set_cancel(mt_ipt_t *ipt, mt_cancel_t *cancel) {
+    ipt->cancel = cancel;
+    if (ipt->exe->ops->set_cancel) { ipt->exe->ops->set_cancel(ipt->exe, cancel); }
+}
+
 mt_err_t mt_ipt_commit(mt_ipt_t *ipt) {
+    /* Checked here as well as inside the executable so an abort that
+     * lands between the two transfers still stops the write: reading the
+     * table we are about to diff against is pointless once we know the
+     * result is going to be thrown away. */
+    if (mt_cancel_raised(ipt->cancel)) { return MT_ERR_CANCELED; }
+
     mt_ipt_rules_snapshot_t *cur = NULL;
     mt_err_t err = mt_ipt_get_current_rules(ipt, &cur);
     if (err != MT_OK) { return err; }
@@ -784,6 +796,11 @@ mt_err_t mt_ipt_commit(mt_ipt_t *ipt) {
     if (buf.len == 0) {
         mt_bytebuf_free(&buf);
         return MT_OK;
+    }
+
+    if (mt_cancel_raised(ipt->cancel)) {
+        mt_bytebuf_free(&buf);
+        return MT_ERR_CANCELED;
     }
 
     err = ipt->exe->ops->restore(ipt->exe, buf.data, buf.len);

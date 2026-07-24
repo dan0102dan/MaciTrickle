@@ -61,7 +61,9 @@ void mt_ipset_to_link_free(mt_ipset_to_link_t *l) {
 
 /* ---- iptables chain rules ------------------------------------------------ */
 
-static mt_err_t insert_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name) {
+/* Stages the group's chains and rules without writing them: a full table
+ * rebuild stages every group first and writes the result in one commit.  */
+static mt_err_t build_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name) {
     if (!ipt) { return MT_OK; }
 
     mt_err_t err = mt_ipt_register_chain_override(ipt, "filter", l->chain_name);
@@ -107,7 +109,23 @@ static mt_err_t insert_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, cons
     err = mt_ipt_append(ipt, "nat", "POSTROUTING", post_args, 2);
     if (err != MT_OK) { return err; }
 
+    return MT_OK;
+}
+
+static mt_err_t insert_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name) {
+    if (!ipt) { return MT_OK; }
+
+    mt_err_t err = build_iptables_rules(l, ipt, ipset_name);
+    if (err != MT_OK) { return err; }
     return mt_ipt_commit(ipt);
+}
+
+mt_err_t mt_ipset_to_link_prepare_iptables(mt_ipset_to_link_t *l) {
+    if (!l || !l->enabled) { return MT_OK; }
+
+    mt_err_t e4 = build_iptables_rules(l, l->ipt4, mt_ipset_name4(l->ipset));
+    mt_err_t e6 = build_iptables_rules(l, l->ipt6, mt_ipset_name6(l->ipset));
+    return e4 != MT_OK ? e4 : e6;
 }
 
 static mt_err_t delete_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt) {

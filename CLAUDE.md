@@ -62,7 +62,7 @@ sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh   # regression suites
 | `src/dns/` | DNS wire parser/packer + MITM proxy transport + pipeline (cache + rule matching hookup) |
 | `src/dns_cache/` | In-memory DNS A/AAAA/CNAME cache with TTL cleanup |
 | `src/iptables/` | iptables Rule/chain-patch/chain-override/chain-delete engine + real fork/exec executable |
-| `src/netfilter/` | ipset CRUD via libmnl, ipset-to-link wiring, port remap (53→3553), cleanup |
+| `src/netfilter/` | ipset CRUD via libmnl, ipset-to-link wiring, port remap (53→3553), cleanup, table committer thread |
 | `src/netlink/` | rtnetlink link/address watcher |
 | `src/api/` | JSON helpers (cJSON), bounded HTTP/1.1 server + router + Unix socket, auth/JWT, group/rule/subscription CRUD handlers, static skin serving |
 | `src/crypto/` | MD5/SHA-256/SHA-512, crypt, HMAC, JWT, base64 |
@@ -76,6 +76,31 @@ sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh   # regression suites
 3. The response pipeline processes A/AAAA/CNAME records
 4. Matching IPs are added to the group's ipset with TTL = DNS TTL + `AdditionalTTL` (default 3600s)
 5. iptables routes packets from the ipset through the group's configured interface
+
+### Netfilter rebuilds on `_kn`
+
+Keenetic firmware rewrites a netfilter table whole and atomically, then calls the
+`netfilter.d` hook, which POSTs to `/api/v1/system/hooks/netfilterd`. Patching our
+rules back one chain at a time races with that rewrite, so on `-DMT_ENTWARE_KN`
+builds the write belongs to a committer thread (`src/netfilter/committer.c`,
+started from `mt_app_start_netfilter_committer`):
+
+- The hook handler calls `mt_nfcommit_request()` and returns — it never waits and
+  never reports an error. Requests arriving during a rebuild fold into one
+  following pass, so one firmware rewrite costs one rebuild, not one per table.
+- A request arriving mid-write aborts it: the cancellation token (`cancel.h`) is
+  polled by `mt_ipt_commit` and joins `poll()` in `executable_real.c`, so it also
+  kills the running `iptables-restore`.
+- A pass (`mt_app_rebuild_netfilter`) drops everything of ours from the kernel
+  first and only then refills the tables, so the result never depends on what an
+  aborted pass left behind.
+- Nothing fails outward: `MT_ERR_CANCELED` and `MT_ERR_AGAIN` (a raced write,
+  classified from iptables' stderr) retry at debug level, anything else retries
+  with a growing backoff.
+
+Other platforms commit in place — nothing rewrites the tables there. See
+`docs/c-rewrite/decisions.md` D-56, and D-19 for how this narrows the
+single-threaded-netfilter rule without touching the lock-free DNS hot path.
 
 ### Rule types
 

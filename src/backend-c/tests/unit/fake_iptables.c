@@ -510,9 +510,7 @@ static mt_ipt_proto_t fake_proto(mt_ipt_executable_t *self) {
     return ((mt_fake_ipt_t *)self)->proto;
 }
 
-static void fake_destroy(mt_ipt_executable_t *self) {
-    mt_fake_ipt_t *f = (mt_fake_ipt_t *)self;
-    if (!f) { return; }
+static void fake_clear(mt_fake_ipt_t *f) {
     for (size_t ti = 0; ti < f->n_tables; ti++) {
         fake_table_t *t = &f->tables[ti];
         for (size_t ci = 0; ci < t->n_chains; ci++) {
@@ -525,6 +523,19 @@ static void fake_destroy(mt_ipt_executable_t *self) {
         free(t->name);
     }
     free(f->tables);
+    f->tables = NULL;
+    f->n_tables = 0;
+    f->cap_tables = 0;
+}
+
+void mt_fake_ipt_reset(mt_fake_ipt_t *f) {
+    if (f) { fake_clear(f); }
+}
+
+static void fake_destroy(mt_ipt_executable_t *self) {
+    mt_fake_ipt_t *f = (mt_fake_ipt_t *)self;
+    if (!f) { return; }
+    fake_clear(f);
     free(f);
 }
 

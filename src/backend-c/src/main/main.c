@@ -95,6 +95,12 @@ static int64_t now_unix(void)
  * loop must outlive the watcher/proxy fds registered on it too. */
 static void daemon_teardown(struct daemon *d)
 {
+    /* First of all: the committer thread reads the ruleset registry and
+     * drives the iptables engines, so nothing it touches may be torn down
+     * while it still runs. Stopping it also aborts a write in flight, so
+     * this does not wait out a full rebuild. */
+    mt_app_stop_netfilter_committer(d->app);
+
     mt_httpd_destroy(d->http_tcp);
     d->http_tcp = NULL;
     mt_httpd_destroy(d->http_unix);
@@ -600,22 +606,12 @@ int main(int argc, char **argv)
         }
     }
 
-    mt_ipt_t *ipts[2] = {d.ipt4, d.ipt6};
-    for (size_t i = 0; i < 2; i++) {
-        if (!ipts[i]) {
-            continue;
-        }
-        mt_err_t perr = MT_OK;
-        if (perr == MT_OK) { perr = mt_ipt_register_chain_patch(ipts[i], "filter", "FORWARD"); }
-        if (perr == MT_OK) { perr = mt_ipt_register_chain_patch(ipts[i], "mangle", "PREROUTING"); }
-        if (perr == MT_OK) { perr = mt_ipt_register_chain_patch(ipts[i], "nat", "PREROUTING"); }
-        if (perr == MT_OK) { perr = mt_ipt_register_chain_patch(ipts[i], "nat", "POSTROUTING"); }
-        if (perr != MT_OK) {
-            MT_ERROR("failed to register chain patches: %s", mt_err_str(perr));
-            daemon_teardown(&d);
-            mt_config_clear(&cfg);
-            return 1;
-        }
+    err = mt_netfilter_register_base_chains(d.ipt4, d.ipt6);
+    if (err != MT_OK) {
+        MT_ERROR("failed to register chain patches: %s", mt_err_str(err));
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
     }
 
     err = mt_netfilter_clean_iptables(d.ipt4, d.ipt6,
@@ -864,6 +860,19 @@ int main(int argc, char **argv)
                 cfg.app.http_web.host.port);
     } else {
         MT_INFO("HTTP WebUI disabled by configuration");
+    }
+
+    /* Started last, once everything a rebuild reaches is up: the port
+     * remap, every group's chains, and the API that can change them. On
+     * builds without a committer this is a no-op and the netfilter.d hook
+     * keeps committing in place. */
+    mt_app_set_port_remap(d.app, d.port_remap);
+    err = mt_app_start_netfilter_committer(d.app);
+    if (err != MT_OK) {
+        MT_ERROR("failed to start netfilter committer: %s", mt_err_str(err));
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
     }
 
     MT_INFO("service started");

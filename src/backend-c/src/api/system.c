@@ -78,8 +78,11 @@ static void handle_netfilterd_hook(mt_http_req_t *req, mt_http_res_t *res, void 
             cJSON_IsString(table_j) ? table_j->valuestring : "");
     cJSON_Delete(json);
 
-    /* Matches Go exactly: ForceCommitIPTables' error is only logged, never
-     * turned into an HTTP error response. */
+    /* Never turned into an HTTP error response: the firmware fires this
+     * hook while it is still rewriting tables and has nothing to do with
+     * a failure. Where a committer runs (Keenetic `_kn`), the call only
+     * queues a rebuild and cannot fail at all -- see
+     * mt_app_force_commit_iptables. */
     mt_err_t err = mt_app_force_commit_iptables(ctx->app);
     if (err != MT_OK) { MT_ERROR("error fixing iptables after netfilter.d: %s", mt_err_str(err)); }
     mt_http_res_write(res, 200, NULL, NULL, 0);

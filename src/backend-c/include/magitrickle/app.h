@@ -27,12 +27,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "magitrickle/cancel.h"
 #include "magitrickle/dns_cache.h"
 #include "magitrickle/dnspipeline.h"
 #include "magitrickle/err.h"
 #include "magitrickle/id.h"
 #include "magitrickle/iptables.h"
 #include "magitrickle/models.h"
+#include "magitrickle/port_remap.h"
 #include "magitrickle/rtnl.h"
 #include "magitrickle/ruleset.h"
 #include "magitrickle/yamlio.h"
@@ -276,8 +278,38 @@ bool mt_iface_is_ignored_for_test(const char *name);
  * groups per the header comment above) to its file path. */
 mt_err_t mt_app_save_config(mt_app_t *app, const char *path, const char *version);
 
-/* Commits ipt4/ipt6 (whichever are non-NULL) -- matches
- * App.ForceCommitIPTables, called from the netfilterd webhook. */
+/* Called from the netfilterd webhook to bring the netfilter tables back
+ * in line with the live groups.
+ *
+ * With a committer running (Keenetic `_kn` builds, see
+ * mt_app_start_netfilter_committer) this only asks the committer thread
+ * to abort whatever it is writing and rebuild from scratch, and returns
+ * MT_OK immediately: the caller is a webhook the firmware fires while it
+ * is still rewriting tables, so there is nothing useful for it to wait
+ * for and nothing it could do with a failure. Everywhere else it commits
+ * in place, as before.  */
 mt_err_t mt_app_force_commit_iptables(mt_app_t *app);
+
+/* Lets the rebuild reach the port-53 DNAT chain, which main() owns.
+ * NULL (remap53 disabled) is fine. */
+void mt_app_set_port_remap(mt_app_t *app, mt_port_remap_t *remap);
+
+/* Writes the netfilter tables whole: drops every chain and jump of ours
+ * from the kernel first, then stages the port remap and every enabled
+ * group and writes the result in one commit per family. Returns
+ * MT_ERR_CANCELED as soon as `cancel` is raised. Public for tests; the
+ * committer thread calls it through mt_nfcommit_t. */
+mt_err_t mt_app_rebuild_netfilter(mt_app_t *app, mt_cancel_t *cancel);
+
+/* Starts the netfilter committer thread (see nfcommit.h). No-op unless
+ * built with -DMT_ENTWARE_KN: only Keenetic firmware rewrites the tables
+ * underneath us, and elsewhere committing in place stays both correct and
+ * simpler. Call once everything the rebuild touches is up. */
+mt_err_t mt_app_start_netfilter_committer(mt_app_t *app);
+
+/* Stops and joins the committer thread, aborting a write in flight.
+ * Idempotent; must run before anything the rebuild touches is torn
+ * down. */
+void mt_app_stop_netfilter_committer(mt_app_t *app);
 
 #endif /* MAGITRICKLE_APP_H */

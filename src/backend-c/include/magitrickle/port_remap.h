@@ -29,4 +29,9 @@ void mt_port_remap_free(mt_port_remap_t *p);
 mt_err_t mt_port_remap_enable(mt_port_remap_t *p);
 mt_err_t mt_port_remap_disable(mt_port_remap_t *p);
 
+/* Re-stages the remap chain and its PREROUTING jump for a full table
+ * rebuild, leaving the write to the caller's single commit. No-op when
+ * the remap is disabled (or p is NULL, i.e. remap53 turned off). */
+mt_err_t mt_port_remap_prepare_iptables(mt_port_remap_t *p);
+
 #endif /* MAGITRICKLE_PORT_REMAP_H */
