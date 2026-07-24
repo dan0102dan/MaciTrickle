@@ -10,6 +10,12 @@ on:
       - '!.github/workflows/build.yml'
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild and populate
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -770,7 +776,7 @@ jobs:
           fi
 
       - name: Upload package artifact 1
-        if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_1_path != '' }}
+        if: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' && steps.package_outputs.outputs.package_1_path != '' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package_outputs.outputs.package_1_name }}
@@ -779,7 +785,7 @@ jobs:
           compression-level: 0
 
       - name: Upload package artifact 2
-        if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_2_path != '' }}
+        if: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' && steps.package_outputs.outputs.package_2_path != '' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package_outputs.outputs.package_2_name }}
@@ -788,10 +794,10 @@ jobs:
           compression-level: 0
 
       - name: Upload package assets to release
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
           PACKAGE_1: ${{ steps.package_outputs.outputs.package_1_path }}
           PACKAGE_2: ${{ steps.package_outputs.outputs.package_2_path }}
         run: |
