@@ -1,11 +1,21 @@
 <p align="center">
-  <img src="img/logo.jpg" alt="mt-c logo" width="600"/>
+  <img src="img/logo.png" alt="mt-c" width="360"/>
 </p>
 
-mt-c
-=======
+<p align="center">
+  <strong>Точная маршрутизация. Меньше памяти. Больше пропускной способности.</strong>
+  <br/>
+  <sub>C11-движок для MagiTrickle · Entware / Keenetic · OpenWrt</sub>
+</p>
 
-**mt-c** — форк [MagiTrickle](https://magitrickle.dev), переписанный с Go на **C11**. Полностью совместим по конфигу, HTTP API и поведению с оригиналом (см. [«Почему mt-c»](#почему-mt-c) ниже), но заметно быстрее, легче и экономнее по памяти — то, что особенно важно на слабом железе роутера.
+<p align="center">
+  <a href="#почему-mt-c">Почему mt-c</a> ·
+  <a href="#установка">Установка</a> ·
+  <a href="#описание-типов-правил">Типы правил</a> ·
+  <a href="docs/swagger.yaml">HTTP API</a>
+</p>
+
+**mt-c** — [MagiTrickle](https://magitrickle.dev), полностью переписанный с Go на **C11**. Тот же конфиг, HTTP API и поведение — но заметно меньше накладных расходов на слабом железе роутера.
 
 ## Назначение
 
@@ -59,6 +69,20 @@ service magitrickle start
   | RPS | ~20 800 | **~42 000** (≈2×) |
   | CPU | ~148% | **~66%** (меньше половины) |
   | RSS под нагрузкой | ~17.3 МБ | **~11.3 МБ** |
+
+### Go vs mt-c — в динамике
+
+Одинаковый full-pipeline сценарий на одном хосте: namespace-правила, совпадающий домен, UDP, 10 параллельных клиентов. Каждая точка — медиана трёх прогонов.
+
+<p align="center">
+  <img src="img/benchmark-throughput.svg" alt="Сравнение пропускной способности Go MagiTrickle и mt-c" width="900"/>
+</p>
+
+<p align="center">
+  <img src="img/benchmark-cpu.svg" alt="Сравнение загрузки CPU Go MagiTrickle и mt-c" width="900"/>
+</p>
+
+Сырые результаты: [Go](docs/c-rewrite/baseline-raw/results.jsonl) · [mt-c](docs/c-rewrite/baseline-raw-c/results.jsonl) · [методология](docs/c-rewrite/benchmark-methodology.md).
 
 - **Не деградирует с ростом числа правил.** На 10 000 правил Go проседает до ~12 500 rps при ~193% CPU (правил больше — процессор дороже), у mt-c пропускная способность и загрузка CPU остаются практически на том же уровне (~40 000 rps, ~67% CPU) — сопоставление доменов построено на обратном trie по меткам, а не линейном переборе.
 - **Проверено на устойчивость, а не только на скорость.** Непрерывный прогон (180 с, 500 правил) — свыше 3.4 млн запросов (UDP+TCP), ноль ошибок и таймаутов, RSS не растёт ни на килобайт на всей дистанции (ASan/LeakSanitizer подтверждают отсутствие утечек). Плюс: `clang-tidy`/`cppcheck` без замечаний, 400 000+ итераций фаззинга (`libFuzzer`) без единого краша.
