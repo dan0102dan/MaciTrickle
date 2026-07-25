@@ -2628,3 +2628,82 @@ shutdown while a write is parked) and `test_nfrebuild.c` (recovery after
 a simulated firmware wipe, no duplicated jumps across repeated passes,
 removal of chains left by a previous run, other writers' rules
 preserved, aborted pass writes nothing and converges on the next one).
+
+## D-57: "Everything except" is a group mode, not a negated matcher
+
+**Status: accepted.** Routing "everything through wg0 except the LAN, SSH
+and example.com" was requested as a rule-level inversion. It is
+implemented as a *group* mode instead, for two reasons.
+
+**Where the decision lives.** In this codebase a rule is only a matcher; the
+interface, the fwmark, the routing table and the ipset all belong to the
+group. The requested JSON (`interface`, `exceptions[]`, `on_exception` on
+one object) is therefore shaped exactly like a group, and putting the mode
+anywhere else would mean a rule could name an interface — a much larger
+change with no user visible upside. `mt_group_t` gains `mode`
+(`normal`|`except`), `onException` (`continue`|`mainroute`) and
+`routeLocal`; all three are absent from YAML and JSON for normal groups, so
+every existing config keeps its meaning byte for byte and the differential
+goldens are untouched.
+
+**What the chain evaluates.** `NOT(exception₁ OR exception₂ OR …)`, exactly
+as specified, and never a per-condition negation. An except-group's ipset
+holds the exceptions rather than the destinations, and its mangle chain
+leaves on any of them before marking what is left:
+
+```
+-m conntrack --ctdir REPLY -j RETURN
+-p tcp --dport 22 -j RETURN            # port exceptions
+-d 192.168.0.0/16 -j RETURN            # local networks, unless routeLocal
+-m set --match-set mt_<id>_4 dst -j RETURN   # domain/subnet exceptions
+-j MARK --set-mark <mark>
+-j CONNMARK --save-mark
+```
+
+The DNS side needs no changes at all: resolved addresses already land in
+the group's set, and for an except-group that set *is* the exception list.
+
+**Ordering.** The requested precedence (specific rules first, catch-all
+second) is achieved by the opposite iptables order: an except-group's jump
+is *inserted at position 1* of `mangle PREROUTING` while normal groups are
+appended after it. `MARK` is last-write-wins, so a specific group
+traversed later overrides the catch-all — put the catch-all last and it
+would instead override every specific group, which is precisely the bug the
+requested ordering is meant to avoid.
+
+**`onException`.** `continue` is a plain `RETURN`: our chain ends, the
+remaining groups still get their say. `mainroute` uses `ACCEPT`, which ends
+the packet's traversal of `mangle` altogether so nothing downstream can
+mark it. The cost is that `ACCEPT` also skips *foreign* mangle-PREROUTING
+rules sitting after our jump; there is no iptables verdict that means "skip
+only the rest of my own vendor's chains", so this is inherent to the
+feature rather than a choice.
+
+**`routeLocal` defaults to off.** An except-group marks everything, and a
+group's routing table holds only a default route via its interface plus a
+blackhole. Marking locally-destined traffic therefore sends the LAN into
+the tunnel and — since the tunnel endpoint itself usually sits in one of
+these ranges — routes the tunnel's own packets into the tunnel. The carve
+out is emitted as visible chain rules rather than hidden set entries so it
+shows up in `iptables -S`. The field is phrased as an opt-in because the
+YAML contract makes an absent bool false, which here is the safe answer.
+
+**`port` rules.** A port lives in the transport header, which the packet
+path can only inspect in a chain — an ordinary group routes purely by
+address-set membership and has nowhere to attach one. So `port` is offered
+only inside an except-group (the UI hides it elsewhere); in a normal group
+it is inert, like any unrecognized type, and is reported once at enable
+time rather than silently doing nothing.
+
+**Known limitation.** An exception on a *domain* only takes effect once
+that name has been resolved through our DNS proxy, because that is when its
+addresses enter the set. This is the same property ordinary groups already
+have, but it is more surprising for an exception: until first resolution the
+traffic goes through the tunnel. Subnet and port exceptions have no such
+delay.
+
+**Tested by** `test_except.c` (port grammar, mode accessors, exact chain
+contents for both modes, the local-network carve out and its opt out, the
+`ACCEPT` form of a terminal exception, and jump ordering against a normal
+group) and `tests/unit/group-mode.test.ts` (absent keys read as a normal
+group, except-group round trip, port type offered only where it works).

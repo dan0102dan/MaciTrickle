@@ -102,9 +102,37 @@ Other platforms commit in place — nothing rewrites the tables there. See
 `docs/c-rewrite/decisions.md` D-56, and D-19 for how this narrows the
 single-threaded-netfilter rule without touching the lock-free DNS hot path.
 
+### Routing groups: normal and "everything except"
+
+A group either selects what to route through its interface (`mode` absent or
+`normal`) or what to leave alone (`mode: except`). In except mode the group's
+ipset holds the *exceptions* and its mangle chain leaves on any of them
+before marking everything else — the chain evaluates
+`NOT(exception₁ OR exception₂ OR …)`, never a per-condition negation:
+
+```
+-m conntrack --ctdir REPLY -j RETURN
+-p tcp --dport 22 -j RETURN                   # `port` rules (except mode only)
+-d 192.168.0.0/16 -j RETURN                   # local networks, unless routeLocal
+-m set --match-set mt_<id>_4 dst -j RETURN    # domain/subnet exceptions
+-j MARK --set-mark <mark>
+```
+
+Group fields (`mode`, `onException`, `routeLocal`) are written to YAML/JSON
+only for except-groups, so normal groups serialize exactly as before.
+An except-group's jump is inserted *first* in `mangle PREROUTING` so the
+specific groups appended after it override its mark (MARK is
+last-write-wins). `onException: mainroute` swaps the exceptions' `RETURN`
+for `ACCEPT`, ending mangle traversal so nothing else can claim the packet.
+`routeLocal` defaults off because a catch-all group would otherwise route
+the LAN and the tunnel's own endpoint into the tunnel. See
+`docs/c-rewrite/decisions.md` D-57.
+
 ### Rule types
 
-`domain` (exact), `namespace` (domain + subdomains), `wildcard` (`*`/`?`), `regex` (PCRE2, with a handful of documented divergences from the original dlclark/regexp2 behavior — see `docs/c-rewrite/decisions.md` D-07), `subnet` (IPv4 CIDR), `subnet6` (IPv6 CIDR).
+`domain` (exact), `namespace` (domain + subdomains), `wildcard` (`*`/`?`), `regex` (PCRE2, with a handful of documented divergences from the original dlclark/regexp2 behavior — see `docs/c-rewrite/decisions.md` D-07), `subnet` (IPv4 CIDR), `subnet6` (IPv6 CIDR), and `port` (`tcp/22`,
+`udp/53`, `tcp/1000-2000` — matched in the chain, so only meaningful inside
+an except-group).
 
 ## Frontend
 

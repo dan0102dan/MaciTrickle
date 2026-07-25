@@ -108,6 +108,7 @@ CONFIG_SRCS := \
     src/config/yaml_load.c \
     src/config/yaml_save.c \
     src/rules/wildcard.c \
+    src/rules/port.c \
     src/rules/match.c \
     src/rules/snapshot.c \
     src/subscriptions/subparse.c \

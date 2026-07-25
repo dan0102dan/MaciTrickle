@@ -17,6 +17,7 @@
 #include "magitrickle/err.h"
 #include "magitrickle/ipset.h"
 #include "magitrickle/iptables.h"
+#include "magitrickle/portrule.h"
 #include "magitrickle/rtnl.h"
 
 #define MT_IPSET_TO_LINK_BLACKHOLE "blackhole"
@@ -33,6 +34,37 @@ mt_ipset_to_link_t *mt_ipset_to_link_new(const char *chain_name, const char *ifa
                                          mt_ipset_t *ipset, mt_ipt_t *ipt4, mt_ipt_t *ipt6,
                                          mt_rtnl_t *rtnl, uint32_t start_idx);
 void mt_ipset_to_link_free(mt_ipset_to_link_t *l);
+
+/* Routing mode for the chain this object builds.
+ *
+ * With except=false the chain marks packets whose destination is in the
+ * group's set -- the set says what to route. With except=true the set says
+ * what *not* to route: the chain returns for those destinations (and for
+ * the port conditions and, unless route_local is set, for locally-destined
+ * traffic) and marks everything else.
+ *
+ * The expression the chain evaluates is NOT(exception1 OR exception2 OR
+ * ...), never a per-condition negation -- see decisions.md D-57.
+ *
+ * ports is copied; terminal_exception makes excluded traffic leave on the
+ * main route instead of being offered to the other groups. */
+typedef struct mt_ipset_to_link_mode {
+    bool except;
+    bool terminal_exception;
+    bool route_local;
+    const mt_port_rule_t *ports;
+    size_t n_ports;
+} mt_ipset_to_link_mode_t;
+
+/* Must be called before enable/prepare; the mode is part of the chain's
+ * shape, not something that can change under a live chain. Copies ports. */
+mt_err_t mt_ipset_to_link_set_mode(mt_ipset_to_link_t *l, const mt_ipset_to_link_mode_t *mode);
+
+/* Marks the object enabled with a fixed mark, without touching netlink.
+ * Tests only: it lets the chain builder be exercised on a host with no
+ * rtnetlink access, which is the only reason enable() is unavailable
+ * there. */
+void mt_ipset_to_link_force_enabled_for_test(mt_ipset_to_link_t *l, uint32_t mark);
 
 mt_err_t mt_ipset_to_link_enable(mt_ipset_to_link_t *l);
 mt_err_t mt_ipset_to_link_disable(mt_ipset_to_link_t *l);

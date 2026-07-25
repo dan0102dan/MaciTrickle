@@ -54,7 +54,22 @@ void mt_group_free(mt_group_t *g)
     free(g->name);
     free(g->color);
     free(g->iface);
+    free(g->mode);
+    free(g->on_exception);
     free(g);
+}
+
+bool mt_group_is_except(const mt_group_t *g)
+{
+    return g != NULL && g->mode != NULL && strcmp(g->mode, MT_GROUP_MODE_EXCEPT) == 0;
+}
+
+bool mt_group_exception_is_terminal(const mt_group_t *g)
+{
+    if (!mt_group_is_except(g)) {
+        return false;
+    }
+    return g->on_exception != NULL && strcmp(g->on_exception, MT_GROUP_ONEXC_MAINROUTE) == 0;
 }
 
 static mt_err_t grow_array(void ***arr, size_t n)

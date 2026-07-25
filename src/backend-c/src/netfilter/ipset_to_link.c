@@ -29,6 +29,38 @@ struct mt_ipset_to_link {
     uint32_t mark;
     uint32_t table;
     family_state_t v4, v6;
+
+    /* Chain shape; see mt_ipset_to_link_set_mode. */
+    bool except;
+    bool terminal_exception;
+    bool route_local;
+    mt_port_rule_t *ports; /* owned copy */
+    size_t n_ports;
+};
+
+/* Destinations an except-group must never pull into its interface unless
+ * asked to. Its routing table holds only a default route and a blackhole,
+ * so marking these would send the LAN, the loopback and the link-local
+ * traffic into the tunnel -- and, with the tunnel endpoint itself usually
+ * living in one of these ranges, would route the tunnel's own packets into
+ * the tunnel. Kept as explicit chain rules rather than set entries so they
+ * are visible in `iptables -S` when someone is working out why a packet
+ * went where it did. */
+static const char *const k_local_v4[] = {
+    "0.0.0.0/8",      /* this host */
+    "10.0.0.0/8",     "172.16.0.0/12", "192.168.0.0/16", /* RFC1918 */
+    "100.64.0.0/10",                                     /* CGNAT (RFC6598) */
+    "127.0.0.0/8",                                       /* loopback */
+    "169.254.0.0/16",                                    /* link-local */
+    "224.0.0.0/4",                                       /* multicast */
+    "255.255.255.255/32",                                /* broadcast */
+};
+
+static const char *const k_local_v6[] = {
+    "::1/128",   /* loopback */
+    "fe80::/10", /* link-local */
+    "fc00::/7",  /* unique-local */
+    "ff00::/8",  /* multicast */
 };
 
 mt_ipset_to_link_t *mt_ipset_to_link_new(const char *chain_name, const char *iface_name,
@@ -56,23 +88,95 @@ void mt_ipset_to_link_free(mt_ipset_to_link_t *l) {
     if (!l) { return; }
     free(l->chain_name);
     free(l->iface_name);
+    free(l->ports);
     free(l);
 }
 
+void mt_ipset_to_link_force_enabled_for_test(mt_ipset_to_link_t *l, uint32_t mark) {
+    if (!l) { return; }
+    l->enabled = true;
+    l->mark = mark;
+    l->table = mark;
+}
+
+mt_err_t mt_ipset_to_link_set_mode(mt_ipset_to_link_t *l, const mt_ipset_to_link_mode_t *mode) {
+    if (!l || !mode) { return MT_ERR_INVAL; }
+
+    mt_port_rule_t *ports = NULL;
+    if (mode->n_ports > 0) {
+        ports = calloc(mode->n_ports, sizeof(*ports));
+        if (!ports) { return MT_ERR_NOMEM; }
+        memcpy(ports, mode->ports, mode->n_ports * sizeof(*ports));
+    }
+
+    free(l->ports);
+    l->ports = ports;
+    l->n_ports = mode->n_ports;
+    l->except = mode->except;
+    l->terminal_exception = mode->terminal_exception;
+    l->route_local = mode->route_local;
+    return MT_OK;
+}
+
 /* ---- iptables chain rules ------------------------------------------------ */
+
+/* Emits the rules that carve the exceptions out of an except-group's mangle
+ * chain: the port conditions, the local networks unless the group opted
+ * into them, and the group's own exception set. Whatever survives them the
+ * caller marks. Order among them does not matter -- together they are one
+ * OR, and any single hit is enough. */
+static mt_err_t build_exception_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name,
+                                      bool v6) {
+    /* ACCEPT ends the packet's journey through mangle entirely, so no later
+     * group can mark it and it leaves on the main route. RETURN ends only
+     * our own chain, leaving the remaining groups their say. */
+    const char *verdict = l->terminal_exception ? "ACCEPT" : "RETURN";
+    mt_err_t err;
+
+    for (size_t i = 0; i < l->n_ports; i++) {
+        char dport[16];
+        mt_port_rule_dport(&l->ports[i], dport, sizeof(dport));
+        const char *args[] = {"-p", l->ports[i].proto, "--dport", dport, "-j", verdict};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, args, 6);
+        if (err != MT_OK) { return err; }
+    }
+
+    if (!l->route_local) {
+        const char *const *nets = v6 ? k_local_v6 : k_local_v4;
+        size_t n_nets = v6 ? sizeof(k_local_v6) / sizeof(k_local_v6[0])
+                           : sizeof(k_local_v4) / sizeof(k_local_v4[0]);
+        for (size_t i = 0; i < n_nets; i++) {
+            const char *args[] = {"-d", nets[i], "-j", verdict};
+            err = mt_ipt_append(ipt, "mangle", l->chain_name, args, 4);
+            if (err != MT_OK) { return err; }
+        }
+    }
+
+    const char *set_args[] = {"-m", "set", "--match-set", ipset_name, "dst", "-j", verdict};
+    return mt_ipt_append(ipt, "mangle", l->chain_name, set_args, 7);
+}
 
 /* Stages the group's chains and rules without writing them: a full table
  * rebuild stages every group first and writes the result in one commit.  */
 static mt_err_t build_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name) {
     if (!ipt) { return MT_OK; }
 
+    const bool v6 = mt_ipt_proto(ipt) == MT_IPT_PROTO_IPV6;
     mt_err_t err = mt_ipt_register_chain_override(ipt, "filter", l->chain_name);
     if (err != MT_OK) { return err; }
 
     if (strcmp(l->iface_name, MT_IPSET_TO_LINK_BLACKHOLE) != 0) {
-        const char *args[] = {"-o", l->iface_name, "-m", "set", "--match-set",
-                              ipset_name,          "dst", "-j", "ACCEPT"};
-        err = mt_ipt_append(ipt, "filter", l->chain_name, args, 9);
+        if (l->except) {
+            /* Nothing reaches this interface unless our mangle chain marked
+             * it, so the outgoing interface is the whole condition here --
+             * no need to restate the exceptions. */
+            const char *args[] = {"-o", l->iface_name, "-j", "ACCEPT"};
+            err = mt_ipt_append(ipt, "filter", l->chain_name, args, 4);
+        } else {
+            const char *args[] = {"-o", l->iface_name, "-m", "set", "--match-set",
+                                  ipset_name,          "dst", "-j", "ACCEPT"};
+            err = mt_ipt_append(ipt, "filter", l->chain_name, args, 9);
+        }
         if (err != MT_OK) { return err; }
     }
     const char *fwd_args[] = {"-j", l->chain_name};
@@ -87,23 +191,54 @@ static mt_err_t build_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const
     const char *mangle1[] = {"-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN"};
     err = mt_ipt_append(ipt, "mangle", l->chain_name, mangle1, 6);
     if (err != MT_OK) { return err; }
-    const char *mangle2[] = {"-m", "set", "--match-set", ipset_name,
-                             "dst", "-j", "MARK",        "--set-mark", mark_str};
-    err = mt_ipt_append(ipt, "mangle", l->chain_name, mangle2, 9);
-    if (err != MT_OK) { return err; }
-    /* Without this rule, routing on Keenetic routers did not work; DO NOT REMOVE! */
-    const char *mangle3[] = {"-m", "set", "--match-set", ipset_name,
-                             "dst", "-j", "CONNMARK",    "--save-mark"};
-    err = mt_ipt_append(ipt, "mangle", l->chain_name, mangle3, 8);
-    if (err != MT_OK) { return err; }
+    if (l->except) {
+        /* NOT(exception1 OR exception2 OR ...): leave on any exception,
+         * then mark whatever survived them. */
+        err = build_exception_rules(l, ipt, ipset_name, v6);
+        if (err != MT_OK) { return err; }
+
+        const char *mark_args[] = {"-j", "MARK", "--set-mark", mark_str};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, mark_args, 4);
+        if (err != MT_OK) { return err; }
+        /* Without this rule, routing on Keenetic routers did not work; DO NOT REMOVE! */
+        const char *save_args[] = {"-j", "CONNMARK", "--save-mark"};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, save_args, 3);
+        if (err != MT_OK) { return err; }
+    } else {
+        const char *mangle2[] = {"-m", "set", "--match-set", ipset_name,
+                                 "dst", "-j", "MARK",        "--set-mark", mark_str};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, mangle2, 9);
+        if (err != MT_OK) { return err; }
+        /* Without this rule, routing on Keenetic routers did not work; DO NOT REMOVE! */
+        const char *mangle3[] = {"-m", "set", "--match-set", ipset_name,
+                                 "dst", "-j", "CONNMARK",    "--save-mark"};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, mangle3, 8);
+        if (err != MT_OK) { return err; }
+    }
+
     const char *pre_args[] = {"-j", l->chain_name};
-    err = mt_ipt_append(ipt, "mangle", "PREROUTING", pre_args, 2);
+    if (l->except) {
+        /* An except-group's jump goes first so the ordinary, more specific
+         * groups appended after it overwrite its mark -- MARK is
+         * last-write-wins, so "everything except X through wg0" never
+         * overrides an explicit "example.com through WAN". */
+        err = mt_ipt_insert(ipt, "mangle", "PREROUTING", 1, pre_args, 2);
+    } else {
+        err = mt_ipt_append(ipt, "mangle", "PREROUTING", pre_args, 2);
+    }
     if (err != MT_OK) { return err; }
 
     err = mt_ipt_register_chain_override(ipt, "nat", l->chain_name);
     if (err != MT_OK) { return err; }
-    const char *nat1[] = {"-m", "set", "--match-set", ipset_name, "dst", "-j", "MASQUERADE"};
-    err = mt_ipt_append(ipt, "nat", l->chain_name, nat1, 7);
+    if (l->except) {
+        /* Same reasoning as the filter rule: only traffic this group marked
+         * ever leaves via its interface. */
+        const char *nat1[] = {"-o", l->iface_name, "-j", "MASQUERADE"};
+        err = mt_ipt_append(ipt, "nat", l->chain_name, nat1, 4);
+    } else {
+        const char *nat1[] = {"-m", "set", "--match-set", ipset_name, "dst", "-j", "MASQUERADE"};
+        err = mt_ipt_append(ipt, "nat", l->chain_name, nat1, 7);
+    }
     if (err != MT_OK) { return err; }
     const char *post_args[] = {"-j", l->chain_name};
     err = mt_ipt_append(ipt, "nat", "POSTROUTING", post_args, 2);

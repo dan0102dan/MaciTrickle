@@ -29,7 +29,7 @@
     SortNeutral,
   } from "../../../components/ui/icons";
   import { draggable, droppable } from "../../../lib/dnd";
-  import { type Rule } from "../../../types";
+  import { GROUP_MODES, isExceptGroup, ON_EXCEPTION_MODES, type Rule } from "../../../types";
   import { defaultRule } from "../../../utils/defaults";
   import { toast } from "../../../utils/events";
   import { type SortDirection, type SortField } from "../../../utils/rule-sorter";
@@ -486,6 +486,68 @@
 
       <Collapsible.Content>
         <div transition:slide={searchActive ? { duration: 0 } : {}}>
+          <div class="group-mode">
+            <div class="group-mode-row">
+              <span class="group-mode-label">{t("Rule type")}</span>
+              <div class="group-mode-options">
+                {#each GROUP_MODES as option}
+                  <label class="group-mode-option">
+                    <input
+                      type="radio"
+                      name={`mode-${group.id}`}
+                      value={option.value}
+                      checked={(group.mode ?? "normal") === option.value}
+                      onchange={() => (group.mode = option.value)}
+                    />
+                    <span>{t(option.label)}</span>
+                  </label>
+                {/each}
+              </div>
+            </div>
+
+            {#if isExceptGroup(group)}
+              <p class="group-mode-summary">
+                {t("Routes everything through")}
+                <strong>{group.interface}</strong>
+                {t("except the conditions listed below.")}
+              </p>
+
+              <div class="group-mode-row">
+                <span class="group-mode-label">{t("Excepted traffic")}</span>
+                <div class="group-mode-options">
+                  {#each ON_EXCEPTION_MODES as option}
+                    <label class="group-mode-option">
+                      <input
+                        type="radio"
+                        name={`onexception-${group.id}`}
+                        value={option.value}
+                        checked={(group.onException ?? "continue") === option.value}
+                        onchange={() => (group.onException = option.value)}
+                      />
+                      <span>{t(option.label)}</span>
+                    </label>
+                  {/each}
+                </div>
+              </div>
+
+              <label class="group-mode-option group-mode-check">
+                <input type="checkbox" bind:checked={group.routeLocal} />
+                <span>{t("Route local networks too")}</span>
+              </label>
+
+              {#if group.routeLocal}
+                <p class="group-mode-warning">
+                  {t(
+                    "With this on, traffic to your LAN and to the tunnel's own endpoint is routed into the tunnel as well. That usually breaks both.",
+                  )}
+                </p>
+              {/if}
+              <p class="group-mode-warning">
+                {t("Below this group, only its exceptions are processed further.")}
+              </p>
+            {/if}
+          </div>
+
           {#if totalRulesCount > 0}
             <div class="group-rules-header">
               <div class="group-rules-header-column total">
@@ -540,6 +602,7 @@
                   group_id={group.id}
                   isDuplicate={store.isRuleDuplicate(rule.id)}
                   isHighlighted={store.isRuleHighlighted(rule.id)}
+                  allowPortType={isExceptGroup(group)}
                   style={i % 2 ? "" : "background-color: var(--bg-light)"}
                 />
               {/each}
@@ -739,6 +802,67 @@
     }
   }
 
+  .group-mode {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
+  }
+
+  .group-mode-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 1rem;
+  }
+
+  .group-mode-label {
+    min-width: 9rem;
+    font-weight: 600;
+    opacity: 0.75;
+  }
+
+  .group-mode-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1.25rem;
+  }
+
+  .group-mode-option {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+  }
+
+  .group-mode-check {
+    margin-left: 9rem;
+  }
+
+  .group-mode-summary {
+    margin: 0;
+    margin-left: 9rem;
+    opacity: 0.8;
+  }
+
+  .group-mode-warning {
+    margin: 0;
+    margin-left: 9rem;
+    font-size: 0.9em;
+    opacity: 0.75;
+  }
+
+  @media (max-width: 640px) {
+    .group-mode-label,
+    .group-mode-check,
+    .group-mode-summary,
+    .group-mode-warning {
+      min-width: 0;
+      margin-left: 0;
+    }
+  }
+
   .group-rules-header {
     display: grid;
     grid-template-columns: 4rem 2.1fr 1fr 3fr 1fr;
@@ -860,6 +984,67 @@
 
     :global(.group-actions > *:nth-child(2)) {
       margin-left: auto;
+    }
+
+    .group-mode {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
+    }
+
+    .group-mode-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.25rem 1rem;
+    }
+
+    .group-mode-label {
+      min-width: 9rem;
+      font-weight: 600;
+      opacity: 0.75;
+    }
+
+    .group-mode-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem 1.25rem;
+    }
+
+    .group-mode-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      cursor: pointer;
+    }
+
+    .group-mode-check {
+      margin-left: 9rem;
+    }
+
+    .group-mode-summary {
+      margin: 0;
+      margin-left: 9rem;
+      opacity: 0.8;
+    }
+
+    .group-mode-warning {
+      margin: 0;
+      margin-left: 9rem;
+      font-size: 0.9em;
+      opacity: 0.75;
+    }
+
+    @media (max-width: 640px) {
+      .group-mode-label,
+      .group-mode-check,
+      .group-mode-summary,
+      .group-mode-warning {
+        min-width: 0;
+        margin-left: 0;
+      }
     }
 
     .group-rules-header {

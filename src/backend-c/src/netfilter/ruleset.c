@@ -203,6 +203,58 @@ bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs) {
 
 /* ---- enable / disable ----------------------------------------------------- */
 
+/* Hands the chain builder the group's routing mode plus the port
+ * conditions, which are the one kind of exception the ipset cannot carry
+ * (see portrule.h). A port rule outside an except-group has nothing to
+ * attach itself to, so it is reported once and ignored rather than
+ * silently doing nothing. */
+static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link) {
+    const mt_group_t *g = rs->group;
+    const bool except = mt_group_is_except(g);
+
+    mt_port_rule_t *ports = NULL;
+    size_t n_ports = 0;
+
+    for (size_t i = 0; i < g->n_rules; i++) {
+        const mt_rule_t *r = g->rules[i];
+        if (!r->enable || r->type == NULL || strcmp(r->type, MT_RULE_PORT) != 0) { continue; }
+
+        if (!except) {
+            MT_WARN("group %s: `port` rule %s ignored -- port conditions only apply to "
+                    "\"everything except\" groups",
+                    g->name ? g->name : "", r->rule ? r->rule : "");
+            continue;
+        }
+
+        mt_port_rule_t parsed;
+        if (!mt_port_rule_parse(r->rule ? r->rule : "", &parsed)) {
+            MT_WARN("group %s: malformed `port` rule %s ignored -- expected tcp/22, udp/53 or "
+                    "tcp/1000-2000",
+                    g->name ? g->name : "", r->rule ? r->rule : "");
+            continue;
+        }
+
+        mt_port_rule_t *grown = realloc(ports, (n_ports + 1) * sizeof(*grown));
+        if (!grown) {
+            free(ports);
+            return MT_ERR_NOMEM;
+        }
+        ports = grown;
+        ports[n_ports++] = parsed;
+    }
+
+    mt_ipset_to_link_mode_t mode = {
+        .except = except,
+        .terminal_exception = mt_group_exception_is_terminal(g),
+        .route_local = g->route_local,
+        .ports = ports,
+        .n_ports = n_ports,
+    };
+    mt_err_t err = mt_ipset_to_link_set_mode(link, &mode);
+    free(ports);
+    return err;
+}
+
 static mt_err_t ruleset_enable_locked(mt_ruleset_t *rs) {
     if (rs->enabled) { return MT_OK; }
     rs->enabled = true;
@@ -229,7 +281,14 @@ static mt_err_t ruleset_enable_locked(mt_ruleset_t *rs) {
         return MT_ERR_NOMEM;
     }
 
-    mt_err_t err = mt_ipset_to_link_clear_if_disabled(link);
+    mt_err_t err = apply_group_mode(rs, link);
+    if (err != MT_OK) {
+        mt_ipset_to_link_free(link);
+        mt_ipset_free(ipset);
+        return err;
+    }
+
+    err = mt_ipset_to_link_clear_if_disabled(link);
     if (err != MT_OK) {
         mt_ipset_to_link_free(link);
         mt_ipset_free(ipset);
