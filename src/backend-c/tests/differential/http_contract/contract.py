@@ -91,19 +91,25 @@ def _redact_live_timestamps(obj):
     return obj
 
 
+# Reserved destinations that are part of the contract and must stay
+# asserted; only the runner's real device names get collapsed below.
+_RESERVED_INTERFACES = [{"id": "blackhole"}, {"id": "direct"}]
+
+
 def _normalize_host_interfaces(obj):
     """Preserve the response contract without freezing runner device names."""
     if not isinstance(obj, dict) or set(obj.keys()) != {"interfaces"}:
         return obj
     interfaces = obj["interfaces"]
+    n_reserved = len(_RESERVED_INTERFACES)
     if (
         not isinstance(interfaces, list)
-        or len(interfaces) < 2
-        or interfaces[0] != {"id": "blackhole"}
+        or len(interfaces) < n_reserved + 1
+        or interfaces[:n_reserved] != _RESERVED_INTERFACES
         or not all(isinstance(item, dict) and isinstance(item.get("id"), str) for item in interfaces)
     ):
         return obj
-    return {"interfaces": [{"id": "blackhole"}, {"id": "<HOST-INTERFACES>"}]}
+    return {"interfaces": _RESERVED_INTERFACES + [{"id": "<HOST-INTERFACES>"}]}
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):

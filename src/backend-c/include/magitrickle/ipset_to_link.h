@@ -7,6 +7,12 @@
  * "blackhole" as the interface name (MT_IPSET_TO_LINK_BLACKHOLE) skips
  * the filter-FORWARD accept rule and the interface route, leaving only
  * the always-drop blackhole route -- matches Go's `Blackhole` constant.
+ *
+ * "direct" (MT_IPSET_TO_LINK_DIRECT) goes further: the group builds no
+ * chains, no mark, no ip rule and no route at all. Its only product is the
+ * ipset, which exists to be named as a bypass by an except-group -- the
+ * equivalent of a Shadowrocket rule-set whose action is DIRECT. Traffic it
+ * matches is left entirely alone and follows the main route.
  */
 #ifndef MAGITRICKLE_IPSET_TO_LINK_H
 #define MAGITRICKLE_IPSET_TO_LINK_H
@@ -21,6 +27,9 @@
 #include "magitrickle/rtnl.h"
 
 #define MT_IPSET_TO_LINK_BLACKHOLE "blackhole"
+/* Reserved interface name: "leave this traffic alone" (see the header
+ * comment). Valid for groups and subscriptions alike. */
+#define MT_IPSET_TO_LINK_DIRECT "direct"
 
 typedef struct mt_ipset_to_link mt_ipset_to_link_t;
 
@@ -46,14 +55,25 @@ void mt_ipset_to_link_free(mt_ipset_to_link_t *l);
  * The expression the chain evaluates is NOT(exception1 OR exception2 OR
  * ...), never a per-condition negation -- see decisions.md D-57.
  *
- * ports is copied; terminal_exception makes excluded traffic leave on the
- * main route instead of being offered to the other groups. */
+ * bypass_sets names the ipsets of every enabled "direct" group and
+ * subscription: an except-group has to leave their traffic alone too, or a
+ * downloaded bypass list would be pointless as soon as one group claimed
+ * everything. Passing them in (rather than having this module hunt for
+ * them) keeps the ordering explicit -- they are consulted before the mark,
+ * exactly like the group's own exceptions.
+ *
+ * ports and bypass_sets are copied; terminal_exception makes excluded
+ * traffic leave on the main route instead of being offered to the other
+ * groups. */
 typedef struct mt_ipset_to_link_mode {
     bool except;
     bool terminal_exception;
     bool route_local;
     const mt_port_rule_t *ports;
     size_t n_ports;
+    /* Base ipset names, without the _4/_6 family suffix. */
+    const char *const *bypass_sets;
+    size_t n_bypass_sets;
 } mt_ipset_to_link_mode_t;
 
 /* Must be called before enable/prepare; the mode is part of the chain's

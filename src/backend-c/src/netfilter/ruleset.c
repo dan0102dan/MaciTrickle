@@ -17,7 +17,15 @@ struct mt_ruleset {
     bool enabled; /* runtime flag, mirrors Go's RuleSet.enabled atomic.Bool */
     mt_ipset_t *ipset;
     mt_ipset_to_link_t *ipset_to_link;
+    /* Set once the group is enabled; the app needs it to name this group as
+     * a bypass in somebody else's chain. */
+    char ipset_base_name[128];
+    /* Bypass lists this group must leave alone (except-groups only). */
+    char **bypass_sets;
+    size_t n_bypass_sets;
 };
+
+static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link);
 
 static bool configured_enabled(const mt_ruleset_t *rs) {
     return rs->group->enable;
@@ -186,6 +194,8 @@ void mt_ruleset_free(mt_ruleset_t *rs) {
     if (!rs) { return; }
     mt_ipset_to_link_free(rs->ipset_to_link);
     mt_ipset_free(rs->ipset);
+    for (size_t i = 0; i < rs->n_bypass_sets; i++) { free(rs->bypass_sets[i]); }
+    free(rs->bypass_sets);
     free(rs);
 }
 
@@ -208,6 +218,54 @@ bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs) {
  * (see portrule.h). A port rule outside an except-group has nothing to
  * attach itself to, so it is reported once and ignored rather than
  * silently doing nothing. */
+/* Kept on the ruleset (not just handed to the chain builder) because the
+ * builder is re-run on every full table rebuild, long after whoever
+ * collected the list has returned. */
+static char **dup_names(const char *const *names, size_t n) {
+    if (n == 0) { return NULL; }
+    char **out = calloc(n, sizeof(*out));
+    if (!out) { return NULL; }
+    for (size_t i = 0; i < n; i++) {
+        out[i] = strdup(names[i]);
+        if (!out[i]) {
+            for (size_t j = 0; j < i; j++) { free(out[j]); }
+            free(out);
+            return NULL;
+        }
+    }
+    return out;
+}
+
+static void free_names(char **names, size_t n) {
+    for (size_t i = 0; i < n; i++) { free(names[i]); }
+    free(names);
+}
+
+bool mt_ruleset_is_direct(const mt_ruleset_t *rs) {
+    if (!rs || !rs->group || !rs->group->iface) { return false; }
+    return strcmp(rs->group->iface, MT_IPSET_TO_LINK_DIRECT) == 0;
+}
+
+const char *mt_ruleset_ipset_base_name(const mt_ruleset_t *rs) {
+    return rs && rs->ipset_base_name[0] != '\0' ? rs->ipset_base_name : NULL;
+}
+
+mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, size_t n) {
+    if (!rs) { return MT_ERR_INVAL; }
+
+    char **copy = dup_names(names, n);
+    if (n > 0 && !copy) { return MT_ERR_NOMEM; }
+
+    free_names(rs->bypass_sets, rs->n_bypass_sets);
+    rs->bypass_sets = copy;
+    rs->n_bypass_sets = n;
+
+    /* A live chain has to be re-staged for the change to reach the kernel;
+     * the caller commits (or the committer rebuilds). */
+    if (rs->ipset_to_link) { return apply_group_mode(rs, rs->ipset_to_link); }
+    return MT_OK;
+}
+
 static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link) {
     const mt_group_t *g = rs->group;
     const bool except = mt_group_is_except(g);
@@ -249,6 +307,8 @@ static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link) {
         .route_local = g->route_local,
         .ports = ports,
         .n_ports = n_ports,
+        .bypass_sets = (const char *const *)rs->bypass_sets,
+        .n_bypass_sets = rs->n_bypass_sets,
     };
     mt_err_t err = mt_ipset_to_link_set_mode(link, &mode);
     free(ports);
@@ -265,6 +325,7 @@ static mt_err_t ruleset_enable_locked(mt_ruleset_t *rs) {
     char ipset_name[128];
     char chain_name[128];
     snprintf(ipset_name, sizeof(ipset_name), "%s%s", rs->deps.ipset_prefix, id_buf);
+    snprintf(rs->ipset_base_name, sizeof(rs->ipset_base_name), "%s", ipset_name);
     snprintf(chain_name, sizeof(chain_name), "%s%s", rs->deps.chain_prefix, id_buf);
 
     mt_ipset_nl_t *nl = mt_ipset_nl_real_new();

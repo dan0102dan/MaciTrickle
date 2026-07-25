@@ -81,6 +81,22 @@ mt_err_t mt_ruleset_disable(mt_ruleset_t *rs);
  * here. */
 mt_err_t mt_ruleset_prepare_iptables(mt_ruleset_t *rs);
 
+/* Names the ipsets (base names, no _4/_6 suffix) of every enabled "direct"
+ * group and subscription, so an except-group can leave their traffic alone
+ * too. Borrowed for the duration of the call; the chain builder copies what
+ * it needs. Ignored by anything that is not an except-group. Must be set
+ * before enable/prepare, and re-set whenever the direct lists change --
+ * mt_app_* does both. */
+mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, size_t n);
+
+/* True when this group is a bypass list rather than a route: its interface
+ * is the reserved name "direct". */
+bool mt_ruleset_is_direct(const mt_ruleset_t *rs);
+
+/* Base ipset name of this group, or NULL when it has none yet (never
+ * enabled). Lets the app collect the bypass-set list above. */
+const char *mt_ruleset_ipset_base_name(const mt_ruleset_t *rs);
+
 /* Rebuilds ipset contents from the group's subnet/subnet6 rules (static
  * CIDRs, including the "0.0.0.0/0"/"::/0" two-halves split -- see
  * decisions.md) plus domain-type rules matched against the cache's known

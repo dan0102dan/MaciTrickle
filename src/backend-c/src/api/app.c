@@ -71,6 +71,64 @@ struct mt_app {
     mt_nfcommit_t *committer;
 };
 
+/* Collects the ipsets of every enabled "direct" list -- groups and
+ * subscriptions alike -- and hands them to each except-group, which has to
+ * leave their traffic alone. Without this a downloaded bypass list would be
+ * pointless the moment one group claimed everything, which is the whole
+ * shape of a Shadowrocket config: several RULE-SETs whose action is DIRECT
+ * plus a FINAL that catches the rest.
+ *
+ * Called after every mutation that can change either side of that relation
+ * (a direct list appearing or going away, or a group becoming an
+ * except-group), so the two never drift apart. */
+static mt_err_t refresh_bypass_sets(mt_app_t *app) {
+    const char **names = NULL;
+    size_t n_names = 0, cap = 0;
+
+    mt_ruleset_t *const *lists[2] = {app->rulesets, app->sub_rulesets};
+    const size_t counts[2] = {app->n_rulesets, app->n_sub_rulesets};
+
+    for (size_t l = 0; l < 2; l++) {
+        for (size_t i = 0; i < counts[l]; i++) {
+            mt_ruleset_t *rs = lists[l][i];
+            if (!mt_ruleset_is_direct(rs)) { continue; }
+            const char *name = mt_ruleset_ipset_base_name(rs);
+            /* No set name yet means the list was never enabled, so there is
+             * nothing in the kernel to bypass. */
+            if (!name) { continue; }
+
+            if (n_names == cap) {
+                size_t new_cap = cap ? cap * 2 : 8;
+                const char **grown = realloc((void *)names, new_cap * sizeof(*grown));
+                if (!grown) {
+                    free((void *)names);
+                    return MT_ERR_NOMEM;
+                }
+                names = grown;
+                cap = new_cap;
+            }
+            names[n_names++] = name;
+        }
+    }
+
+    mt_err_t err = MT_OK;
+    for (size_t l = 0; l < 2 && err == MT_OK; l++) {
+        for (size_t i = 0; i < counts[l] && err == MT_OK; i++) {
+            mt_ruleset_t *rs = lists[l][i];
+            if (!mt_group_is_except(mt_ruleset_group(rs))) { continue; }
+            err = mt_ruleset_set_bypass_sets(rs, (const char *const *)names, n_names);
+        }
+    }
+
+    free((void *)names);
+    return err;
+}
+
+mt_err_t mt_app_refresh_bypass_sets(mt_app_t *app) {
+    if (!app) { return MT_ERR_INVAL; }
+    return refresh_bypass_sets(app);
+}
+
 /* Taken by every entry point that mutates the ruleset registry or drives
  * an iptables engine. Interrupting a pass in flight first means this
  * thread waits for an abort rather than for a whole rebuild; the pass
@@ -81,7 +139,23 @@ static void app_nf_enter(mt_app_t *app) {
     pthread_mutex_lock(&app->nf_mu);
 }
 
+/* Re-links the bypass lists and pushes the result to the kernel, then
+ * releases the lock. Every mutating entry point leaves through here, so an
+ * except-group's chain can never be left referring to a stale set of
+ * direct lists. Failures are logged rather than propagated: the caller's
+ * own operation already succeeded, and on _kn the committer will rebuild
+ * the table from scratch anyway. */
 static void app_nf_leave(mt_app_t *app) {
+    mt_err_t err = refresh_bypass_sets(app);
+    if (err == MT_OK && app->nf_mu_ready == false) {
+        /* No committer to pick it up: commit here. */
+        if (app->ipt4) { err = mt_ipt_commit(app->ipt4); }
+        if (err == MT_OK && app->ipt6) { err = mt_ipt_commit(app->ipt6); }
+    }
+    if (err != MT_OK) {
+        MT_WARN("failed to refresh direct-list bypasses: %s", mt_err_str(err));
+    }
+
     if (!app->nf_mu_ready) { return; }
     pthread_mutex_unlock(&app->nf_mu);
 }
@@ -919,6 +993,12 @@ static mt_err_t rebuild_netfilter_locked(mt_app_t *app, mt_cancel_t *cancel) {
     if (mt_cancel_raised(cancel)) { return MT_ERR_CANCELED; }
 
     err = mt_netfilter_register_base_chains(app->ipt4, app->ipt6);
+    if (err != MT_OK) { return err; }
+
+    /* Re-link before staging: an except-group's chain has to name the
+     * direct lists that exist right now, not the ones that existed when it
+     * was enabled. */
+    err = refresh_bypass_sets(app);
     if (err != MT_OK) { return err; }
 
     err = mt_port_remap_prepare_iptables(app->port_remap);

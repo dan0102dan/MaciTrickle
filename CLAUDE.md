@@ -118,6 +118,13 @@ before marking everything else — the chain evaluates
 -j MARK --set-mark <mark>
 ```
 
+A group or subscription whose interface is the reserved name `direct` builds
+no chain, mark or route at all — it is only an ipset for except-groups to
+skip, which is how `RULE-SET <url> → DIRECT` from a Shadowrocket config maps
+onto a subscription. Every except-group's chain returns on every enabled
+direct list before its own exceptions (`refresh_bypass_sets` in
+`src/api/app.c` keeps the two linked).
+
 Group fields (`mode`, `onException`, `routeLocal`) are written to YAML/JSON
 only for except-groups, so normal groups serialize exactly as before.
 An except-group's jump is inserted *first* in `mangle PREROUTING` so the

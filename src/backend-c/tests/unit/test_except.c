@@ -294,6 +294,109 @@ TEST except_filter_and_nat_match_the_interface(void) {
     PASS();
 }
 
+/* The shape of the Shadowrocket config this feature exists for: several
+ * lists whose action is DIRECT, plus one group that takes everything
+ * else. */
+TEST bypass_sets_are_returned_before_the_mark(void) {
+    const char *bypass[] = {"mt_ru_cidr", "mt_sub_whitelist"};
+    mt_ipset_to_link_mode_t mode = {
+        .except = true,
+        .route_local = true,
+        .bypass_sets = bypass,
+        .n_bypass_sets = 2,
+    };
+    chain_fixture_t fx;
+    chain_fixture_up(&fx, &mode);
+    build_and_commit(&fx);
+
+    char buf[1024];
+    chain_text(fx.fake, "mangle", "MT_g1", buf, sizeof(buf));
+    ASSERT_STR_EQ("-m conntrack --ctdir REPLY -j RETURN"
+                  " | -m set --match-set mt_ru_cidr_4 dst -j RETURN"
+                  " | -m set --match-set mt_sub_whitelist_4 dst -j RETURN"
+                  " | -m set --match-set mt_g1_4 dst -j RETURN"
+                  " | -j MARK --set-mark 1234"
+                  " | -j CONNMARK --save-mark",
+                  buf);
+
+    chain_fixture_down(&fx);
+    PASS();
+}
+
+/* A direct list is a set and nothing else: no chain, no mark, no route. */
+TEST direct_list_builds_no_chain(void) {
+    mt_fake_ipt_t *fake = mt_fake_ipt_new(MT_IPT_PROTO_IPV4);
+    mt_ipt_t *ipt = mt_ipt_new(mt_fake_ipt_as_executable(fake));
+    mt_netfilter_register_base_chains(ipt, NULL);
+
+    mt_ipset_t *set = mt_ipset_new(NULL, "mt_direct");
+    mt_ipset_to_link_t *link =
+        mt_ipset_to_link_new("MT_direct", MT_IPSET_TO_LINK_DIRECT, set, ipt, NULL, NULL, 0);
+    mt_ipset_to_link_mode_t mode = {.except = false};
+    ASSERT_EQ(MT_OK, mt_ipset_to_link_set_mode(link, &mode));
+
+    /* enable() must not need netlink for a direct list -- there is no mark
+     * to allocate and no route to add, which is exactly why this works with
+     * rtnl == NULL. */
+    ASSERT_EQ(MT_OK, mt_ipset_to_link_enable(link));
+    ASSERT_EQ(MT_OK, mt_ipset_to_link_prepare_iptables(link));
+    ASSERT_EQ(MT_OK, mt_ipt_commit(ipt));
+
+    ASSERT_FALSE(mt_fake_ipt_chain_exists(fake, "mangle", "MT_direct"));
+    ASSERT_FALSE(mt_fake_ipt_chain_exists(fake, "filter", "MT_direct"));
+    ASSERT_FALSE(mt_fake_ipt_chain_exists(fake, "nat", "MT_direct"));
+
+    char buf[256];
+    chain_text(fake, "mangle", "PREROUTING", buf, sizeof(buf));
+    ASSERT_STR_EQ("", buf);
+
+    mt_ipset_to_link_free(link);
+    mt_ipset_free(set);
+    mt_ipt_free(ipt);
+    PASS();
+}
+
+/* Terminal exceptions have to cover the bypass lists too, or a DIRECT list
+ * would be offered to the remaining groups after all. */
+TEST bypass_sets_honour_terminal_exception(void) {
+    const char *bypass[] = {"mt_ru_cidr"};
+    mt_ipset_to_link_mode_t mode = {
+        .except = true,
+        .terminal_exception = true,
+        .route_local = true,
+        .bypass_sets = bypass,
+        .n_bypass_sets = 1,
+    };
+    chain_fixture_t fx;
+    chain_fixture_up(&fx, &mode);
+    build_and_commit(&fx);
+
+    char buf[1024];
+    chain_text(fx.fake, "mangle", "MT_g1", buf, sizeof(buf));
+    ASSERT(strstr(buf, "-m set --match-set mt_ru_cidr_4 dst -j ACCEPT") != NULL);
+
+    chain_fixture_down(&fx);
+    PASS();
+}
+
+/* A normal group ignores bypass lists: they only mean something to a chain
+ * that would otherwise claim everything. */
+TEST normal_group_ignores_bypass_sets(void) {
+    const char *bypass[] = {"mt_ru_cidr"};
+    mt_ipset_to_link_mode_t mode = {
+        .except = false, .bypass_sets = bypass, .n_bypass_sets = 1};
+    chain_fixture_t fx;
+    chain_fixture_up(&fx, &mode);
+    build_and_commit(&fx);
+
+    char buf[1024];
+    chain_text(fx.fake, "mangle", "MT_g1", buf, sizeof(buf));
+    ASSERT(strstr(buf, "mt_ru_cidr") == NULL);
+
+    chain_fixture_down(&fx);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -309,5 +412,9 @@ int main(int argc, char **argv) {
     RUN_TEST(except_jump_goes_before_normal_groups);
     RUN_TEST(normal_chain_is_unchanged);
     RUN_TEST(except_filter_and_nat_match_the_interface);
+    RUN_TEST(bypass_sets_are_returned_before_the_mark);
+    RUN_TEST(direct_list_builds_no_chain);
+    RUN_TEST(bypass_sets_honour_terminal_exception);
+    RUN_TEST(normal_group_ignores_bypass_sets);
     GREATEST_MAIN_END();
 }

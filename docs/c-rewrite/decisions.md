@@ -2702,8 +2702,44 @@ have, but it is more surprising for an exception: until first resolution the
 traffic goes through the tunnel. Subnet and port exceptions have no such
 delay.
 
+**`direct` lists, and why the group's own rules are not enough.** The
+config this feature exists to reproduce is a Shadowrocket one: several
+RULE-SETs whose action is DIRECT — one of them downloaded from a URL — plus
+a FINAL that sends the rest into a tunnel. Exceptions therefore cannot live
+only inside the catch-all group; they arrive from several places, including
+subscriptions.
+
+So `direct` joins `blackhole` as a reserved interface name (both are now
+offered by `GET /api/v1/system/interfaces`, which is why that response's
+golden changed). A group or subscription pointed at `direct` builds no
+chain, no mark, no ip rule and no route: its only product is its ipset,
+which exists to be named as a bypass. Since a subscription already carries
+an `interface` and is already turned into a full ruleset, `RULE-SET <url> →
+DIRECT` needs no subscription-specific code at all.
+
+An except-group's chain then leaves on every enabled direct list before its
+own exceptions and before the mark:
+
+```
+-m set --match-set mt_<direct-group>_4 dst -j RETURN
+-m set --match-set mt_<direct-sub>_4   dst -j RETURN
+-m set --match-set mt_<self>_4         dst -j RETURN
+-j MARK --set-mark <mark>
+```
+
+`refresh_bypass_sets` (api/app.c) re-links the two sides after every
+mutation that can change either of them, on every rebuild pass, and once at
+startup — main()'s own enable loop bypasses the mutators, which is a gap
+worth naming since nothing else would have caught it. Specific groups keep
+winning over both: their jumps are appended after the catch-all's and MARK
+is last-write-wins, which mirrors Shadowrocket evaluating `ai.list → USA`
+above `cidrwhitelist → DIRECT`.
+
 **Tested by** `test_except.c` (port grammar, mode accessors, exact chain
 contents for both modes, the local-network carve out and its opt out, the
-`ACCEPT` form of a terminal exception, and jump ordering against a normal
-group) and `tests/unit/group-mode.test.ts` (absent keys read as a normal
-group, except-group round trip, port type offered only where it works).
+`ACCEPT` form of a terminal exception, jump ordering against a normal
+group, bypass sets emitted before the mark and honouring a terminal
+exception, a direct list building no chain at all, and a normal group
+ignoring bypass sets) and `tests/unit/group-mode.test.ts` (absent keys read
+as a normal group, except-group round trip, port type offered only where it
+works).

@@ -290,6 +290,11 @@ mt_err_t mt_app_save_config(mt_app_t *app, const char *path, const char *version
  * in place, as before.  */
 mt_err_t mt_app_force_commit_iptables(mt_app_t *app);
 
+/* Re-links every "direct" list into every except-group's chain (see
+ * api/app.c). The mutating entry points do this themselves; main() must
+ * call it once after its own startup enable loop, which bypasses them. */
+mt_err_t mt_app_refresh_bypass_sets(mt_app_t *app);
+
 /* Lets the rebuild reach the port-53 DNAT chain, which main() owns.
  * NULL (remap53 disabled) is fine. */
 void mt_app_set_port_remap(mt_app_t *app, mt_port_remap_t *remap);

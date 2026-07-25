@@ -30,9 +30,17 @@ static void handle_list_interfaces(mt_http_req_t *req, mt_http_res_t *res, void 
 
     cJSON *out = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(out, "interfaces");
+    /* Two reserved destinations that are not real interfaces: "blackhole"
+     * drops the group's traffic, "direct" leaves it alone so the group
+     * becomes a bypass list for an "everything except" group to honour.
+     * Offering them here means groups and subscriptions get both for free,
+     * since they share this list. */
     cJSON *blackhole = cJSON_CreateObject();
     cJSON_AddStringToObject(blackhole, "id", "blackhole");
     cJSON_AddItemToArray(arr, blackhole);
+    cJSON *direct = cJSON_CreateObject();
+    cJSON_AddStringToObject(direct, "id", "direct");
+    cJSON_AddItemToArray(arr, direct);
     for (size_t i = 0; i < n; i++) {
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "id", ifaces[i].id);

@@ -4,7 +4,7 @@
   import Button from "../../../components/ui/Button.svelte";
   import GenericDialog from "../../../components/ui/GenericDialog.svelte";
   import Select from "../../../components/ui/Select.svelte";
-  import { interfaces } from "../../../data/interfaces.svelte";
+  import { describeInterface, interfaces } from "../../../data/interfaces.svelte";
   import { t } from "../../../data/locale.svelte";
   import { handleIntervalChange, intervals } from "../components/SubscriptionPanel.svelte";
   import { normalizeSubscriptionUrl, validateSubscriptionUrl } from "../subscriptions.svelte";
@@ -212,7 +212,7 @@
                 options={interfaces.list.map((item) => ({
                   value: item.id,
                   label: item.id,
-                  description: item.name,
+                  description: describeInterface(item),
                 }))}
                 bind:selected={selectedInterface}
                 class="interface-select"

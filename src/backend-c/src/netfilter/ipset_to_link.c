@@ -36,7 +36,14 @@ struct mt_ipset_to_link {
     bool route_local;
     mt_port_rule_t *ports; /* owned copy */
     size_t n_ports;
+    char **bypass_sets; /* owned copies of base names */
+    size_t n_bypass_sets;
 };
+
+/* True when this group only contributes an ipset for others to bypass. */
+static bool is_direct(const mt_ipset_to_link_t *l) {
+    return strcmp(l->iface_name, MT_IPSET_TO_LINK_DIRECT) == 0;
+}
 
 /* Destinations an except-group must never pull into its interface unless
  * asked to. Its routing table holds only a default route and a blackhole,
@@ -89,6 +96,8 @@ void mt_ipset_to_link_free(mt_ipset_to_link_t *l) {
     free(l->chain_name);
     free(l->iface_name);
     free(l->ports);
+    for (size_t i = 0; i < l->n_bypass_sets; i++) { free(l->bypass_sets[i]); }
+    free(l->bypass_sets);
     free(l);
 }
 
@@ -109,9 +118,32 @@ mt_err_t mt_ipset_to_link_set_mode(mt_ipset_to_link_t *l, const mt_ipset_to_link
         memcpy(ports, mode->ports, mode->n_ports * sizeof(*ports));
     }
 
+    char **bypass = NULL;
+    size_t n_bypass = 0;
+    if (mode->n_bypass_sets > 0) {
+        bypass = calloc(mode->n_bypass_sets, sizeof(*bypass));
+        if (!bypass) {
+            free(ports);
+            return MT_ERR_NOMEM;
+        }
+        for (; n_bypass < mode->n_bypass_sets; n_bypass++) {
+            bypass[n_bypass] = strdup(mode->bypass_sets[n_bypass]);
+            if (!bypass[n_bypass]) {
+                for (size_t i = 0; i < n_bypass; i++) { free(bypass[i]); }
+                free(bypass);
+                free(ports);
+                return MT_ERR_NOMEM;
+            }
+        }
+    }
+
     free(l->ports);
     l->ports = ports;
     l->n_ports = mode->n_ports;
+    for (size_t i = 0; i < l->n_bypass_sets; i++) { free(l->bypass_sets[i]); }
+    free(l->bypass_sets);
+    l->bypass_sets = bypass;
+    l->n_bypass_sets = n_bypass;
     l->except = mode->except;
     l->terminal_exception = mode->terminal_exception;
     l->route_local = mode->route_local;
@@ -152,6 +184,16 @@ static mt_err_t build_exception_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, cons
         }
     }
 
+    /* Every "direct" list, then this group's own exceptions. All of them
+     * are one OR: whichever hits first, the packet is left alone. */
+    for (size_t i = 0; i < l->n_bypass_sets; i++) {
+        char set_name[256];
+        snprintf(set_name, sizeof(set_name), "%s%s", l->bypass_sets[i], v6 ? "_6" : "_4");
+        const char *args[] = {"-m", "set", "--match-set", set_name, "dst", "-j", verdict};
+        err = mt_ipt_append(ipt, "mangle", l->chain_name, args, 7);
+        if (err != MT_OK) { return err; }
+    }
+
     const char *set_args[] = {"-m", "set", "--match-set", ipset_name, "dst", "-j", verdict};
     return mt_ipt_append(ipt, "mangle", l->chain_name, set_args, 7);
 }
@@ -160,6 +202,9 @@ static mt_err_t build_exception_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, cons
  * rebuild stages every group first and writes the result in one commit.  */
 static mt_err_t build_iptables_rules(mt_ipset_to_link_t *l, mt_ipt_t *ipt, const char *ipset_name) {
     if (!ipt) { return MT_OK; }
+    /* A direct group is only a set for others to bypass -- it marks
+     * nothing, so it needs no chain of its own. */
+    if (is_direct(l)) { return MT_OK; }
 
     const bool v6 = mt_ipt_proto(ipt) == MT_IPT_PROTO_IPV6;
     mt_err_t err = mt_ipt_register_chain_override(ipt, "filter", l->chain_name);
@@ -466,6 +511,16 @@ static mt_err_t teardown(mt_ipset_to_link_t *l) {
 
 mt_err_t mt_ipset_to_link_enable(mt_ipset_to_link_t *l) {
     if (l->enabled) { return MT_OK; }
+
+    /* A direct list routes nothing, so it needs no mark, no routing table,
+     * no ip rule and no chain -- just the ipset, which mt_ruleset_t has
+     * already created. Claiming a mark for it would waste a table and, more
+     * importantly, imply a route that must never exist. */
+    if (is_direct(l)) {
+        l->enabled = true;
+        MT_DEBUG("chain %s is a direct list: no mark, no route", l->chain_name);
+        return MT_OK;
+    }
 
     uint32_t idx;
     mt_err_t err = mt_rtnl_alloc_mark_table(l->rtnl, l->start_idx, &idx);

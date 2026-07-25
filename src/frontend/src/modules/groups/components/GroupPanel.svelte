@@ -9,7 +9,7 @@
   import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
-  import { interfaces } from "../../../data/interfaces.svelte";
+  import { describeInterface, interfaces } from "../../../data/interfaces.svelte";
   import { t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
   import GroupDuplicateMenu from "./GroupDuplicateMenu.svelte";
@@ -398,7 +398,7 @@
             options={interfaces.list.map((item) => ({
               value: item.id,
               label: item.id,
-              description: item.name,
+              description: describeInterface(item),
             }))}
             bind:selected={group.interface}
           />
@@ -505,11 +505,20 @@
               </div>
             </div>
 
+            {#if group.interface === "direct"}
+              <p class="group-mode-summary">
+                {t(
+                  'This group routes nothing: the traffic it matches is left alone and every "everything except" group skips it.',
+                )}
+              </p>
+            {/if}
+
             {#if isExceptGroup(group)}
               <p class="group-mode-summary">
                 {t("Routes everything through")}
                 <strong>{group.interface}</strong>
-                {t("except the conditions listed below.")}
+                {t("except the conditions listed below, and except every list set to")}
+                <strong>direct</strong>.
               </p>
 
               <div class="group-mode-row">

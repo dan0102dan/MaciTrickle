@@ -767,6 +767,24 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    /* Every "direct" list now has its ipset, so the except-groups can be
+     * told what to leave alone. The startup loop above enables rulesets
+     * directly rather than through mt_app_*, so nothing has done this yet. */
+    err = mt_app_refresh_bypass_sets(d.app);
+    if (err != MT_OK) {
+        MT_ERROR("failed to link direct lists: %s", mt_err_str(err));
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
+    }
+    err = mt_app_force_commit_iptables(d.app);
+    if (err != MT_OK) {
+        MT_ERROR("failed to commit direct-list bypasses: %s", mt_err_str(err));
+        daemon_teardown(&d);
+        mt_config_clear(&cfg);
+        return 1;
+    }
+
     /* Only now mark the app "running" -- matches Go's Start() CAS
      * happening before this same enable/sync loop, so a group added later
      * via the HTTP API (mt_app_add_group) gets its own immediate
