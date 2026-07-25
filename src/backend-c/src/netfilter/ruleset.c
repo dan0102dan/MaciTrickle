@@ -187,6 +187,13 @@ mt_ruleset_t *mt_ruleset_new(const mt_group_t *group, const mt_ruleset_deps_t *d
     if (!rs) { return NULL; }
     rs->group = group;
     rs->deps = *deps;
+
+    /* Derived purely from the prefix and the group id, so it is known from
+     * the start. Deferring it to enable() would have let a freshly rebuilt
+     * registry (a SIGHUP reload, say) hand out empty names for a moment. */
+    char id_buf[MT_ID_STR_LEN];
+    mt_id_format(group->id, id_buf);
+    snprintf(rs->ipset_base_name, sizeof(rs->ipset_base_name), "%s%s", deps->ipset_prefix, id_buf);
     return rs;
 }
 
@@ -213,11 +220,6 @@ bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs) {
 
 /* ---- enable / disable ----------------------------------------------------- */
 
-/* Hands the chain builder the group's routing mode plus the port
- * conditions, which are the one kind of exception the ipset cannot carry
- * (see portrule.h). A port rule outside an except-group has nothing to
- * attach itself to, so it is reported once and ignored rather than
- * silently doing nothing. */
 /* Kept on the ruleset (not just handed to the chain builder) because the
  * builder is re-run on every full table rebuild, long after whoever
  * collected the list has returned. */
@@ -236,18 +238,22 @@ static char **dup_names(const char *const *names, size_t n) {
     return out;
 }
 
-static void free_names(char **names, size_t n) {
-    for (size_t i = 0; i < n; i++) { free(names[i]); }
-    free(names);
-}
-
 bool mt_ruleset_is_direct(const mt_ruleset_t *rs) {
     if (!rs || !rs->group || !rs->group->iface) { return false; }
     return strcmp(rs->group->iface, MT_IPSET_TO_LINK_DIRECT) == 0;
 }
 
 const char *mt_ruleset_ipset_base_name(const mt_ruleset_t *rs) {
-    return rs && rs->ipset_base_name[0] != '\0' ? rs->ipset_base_name : NULL;
+    return rs ? rs->ipset_base_name : NULL;
+}
+
+/* Hands the chain builder the direct lists this group must leave alone. */
+static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link) {
+    mt_ipset_to_link_mode_t mode = {
+        .bypass_sets = (const char *const *)rs->bypass_sets,
+        .n_bypass_sets = rs->n_bypass_sets,
+    };
+    return mt_ipset_to_link_set_mode(link, &mode);
 }
 
 mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, size_t n) {
@@ -256,7 +262,8 @@ mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, 
     char **copy = dup_names(names, n);
     if (n > 0 && !copy) { return MT_ERR_NOMEM; }
 
-    free_names(rs->bypass_sets, rs->n_bypass_sets);
+    for (size_t i = 0; i < rs->n_bypass_sets; i++) { free(rs->bypass_sets[i]); }
+    free(rs->bypass_sets);
     rs->bypass_sets = copy;
     rs->n_bypass_sets = n;
 
@@ -264,55 +271,6 @@ mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, 
      * the caller commits (or the committer rebuilds). */
     if (rs->ipset_to_link) { return apply_group_mode(rs, rs->ipset_to_link); }
     return MT_OK;
-}
-
-static mt_err_t apply_group_mode(mt_ruleset_t *rs, mt_ipset_to_link_t *link) {
-    const mt_group_t *g = rs->group;
-    const bool except = mt_group_is_except(g);
-
-    mt_port_rule_t *ports = NULL;
-    size_t n_ports = 0;
-
-    for (size_t i = 0; i < g->n_rules; i++) {
-        const mt_rule_t *r = g->rules[i];
-        if (!r->enable || r->type == NULL || strcmp(r->type, MT_RULE_PORT) != 0) { continue; }
-
-        if (!except) {
-            MT_WARN("group %s: `port` rule %s ignored -- port conditions only apply to "
-                    "\"everything except\" groups",
-                    g->name ? g->name : "", r->rule ? r->rule : "");
-            continue;
-        }
-
-        mt_port_rule_t parsed;
-        if (!mt_port_rule_parse(r->rule ? r->rule : "", &parsed)) {
-            MT_WARN("group %s: malformed `port` rule %s ignored -- expected tcp/22, udp/53 or "
-                    "tcp/1000-2000",
-                    g->name ? g->name : "", r->rule ? r->rule : "");
-            continue;
-        }
-
-        mt_port_rule_t *grown = realloc(ports, (n_ports + 1) * sizeof(*grown));
-        if (!grown) {
-            free(ports);
-            return MT_ERR_NOMEM;
-        }
-        ports = grown;
-        ports[n_ports++] = parsed;
-    }
-
-    mt_ipset_to_link_mode_t mode = {
-        .except = except,
-        .terminal_exception = mt_group_exception_is_terminal(g),
-        .route_local = g->route_local,
-        .ports = ports,
-        .n_ports = n_ports,
-        .bypass_sets = (const char *const *)rs->bypass_sets,
-        .n_bypass_sets = rs->n_bypass_sets,
-    };
-    mt_err_t err = mt_ipset_to_link_set_mode(link, &mode);
-    free(ports);
-    return err;
 }
 
 static mt_err_t ruleset_enable_locked(mt_ruleset_t *rs) {
@@ -325,7 +283,6 @@ static mt_err_t ruleset_enable_locked(mt_ruleset_t *rs) {
     char ipset_name[128];
     char chain_name[128];
     snprintf(ipset_name, sizeof(ipset_name), "%s%s", rs->deps.ipset_prefix, id_buf);
-    snprintf(rs->ipset_base_name, sizeof(rs->ipset_base_name), "%s", ipset_name);
     snprintf(chain_name, sizeof(chain_name), "%s%s", rs->deps.chain_prefix, id_buf);
 
     mt_ipset_nl_t *nl = mt_ipset_nl_real_new();

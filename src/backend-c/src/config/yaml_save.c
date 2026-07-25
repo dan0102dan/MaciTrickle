@@ -188,18 +188,6 @@ static void emit_group(emitter_ctx_t *ctx, const mt_group_t *g)
     emit_string(ctx, g->iface != NULL ? g->iface : "");
     emit_plain(ctx, "enable");
     emit_bool(ctx, g->enable);
-    /* Written only for except-groups: a normal group's YAML stays
-     * byte-identical to what earlier versions produced, which keeps both
-     * the differential goldens and downgrade-to-older-daemon honest. */
-    if (mt_group_is_except(g)) {
-        emit_plain(ctx, "mode");
-        emit_string(ctx, MT_GROUP_MODE_EXCEPT);
-        emit_plain(ctx, "onException");
-        emit_string(ctx, mt_group_exception_is_terminal(g) ? MT_GROUP_ONEXC_MAINROUTE
-                                                          : MT_GROUP_ONEXC_CONTINUE);
-        emit_plain(ctx, "routeLocal");
-        emit_bool(ctx, g->route_local);
-    }
     emit_plain(ctx, "rules");
     seq_start(ctx, g->n_rules == 0);
     for (size_t i = 0; i < g->n_rules; i++) {

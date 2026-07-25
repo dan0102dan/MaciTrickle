@@ -15,7 +15,7 @@
 
   import { Delete, Grip, TriangleAlert } from "../../../components/ui/icons";
   import { dnd_state, draggable, droppable } from "../../../lib/dnd";
-  import { PORT_RULE_TYPE, RULE_TYPES, type Rule } from "../../../types";
+  import { RULE_TYPES, type Rule } from "../../../types";
   import { VALIDATOP_MAP } from "../../../utils/rule-validators";
 
   type Props = {
@@ -26,9 +26,6 @@
     group_id: string;
     isDuplicate?: boolean;
     isHighlighted?: boolean;
-    /* Only an "everything except" group has a chain to put a port
-       condition in, so the type is offered only there. */
-    allowPortType?: boolean;
     [key: string]: any;
   };
 
@@ -40,11 +37,8 @@
     group_id,
     isDuplicate = false,
     isHighlighted = false,
-    allowPortType = false,
     ...rest
   }: Props = $props();
-
-  const ruleTypes = $derived(allowPortType ? [...RULE_TYPES, PORT_RULE_TYPE] : RULE_TYPES);
 
   const store = getContext<GroupsStore>(GROUPS_STORE_CONTEXT);
   if (!store) {
@@ -237,7 +231,7 @@
     </div>
     <div class="type">
       <div class="label">{t("Type")}</div>
-      <Select options={ruleTypes} bind:selected={rule.type} onValueChange={patternValidation} />
+      <Select options={RULE_TYPES} bind:selected={rule.type} onValueChange={patternValidation} />
     </div>
     <div class="pattern">
       <div class="label">{t("Pattern")}</div>

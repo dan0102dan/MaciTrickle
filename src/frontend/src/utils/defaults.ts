@@ -10,11 +10,6 @@ export function defaultGroup(): Group {
     interface: interfaces.list.at(0)?.id ?? "",
     name: "",
     color: randomDarkishColor(),
-    /* A new group routes what its rules select; "everything except" is
-       always an explicit choice, never a default. */
-    mode: "normal",
-    onException: "continue",
-    routeLocal: false,
     rules: [],
   };
 }

@@ -433,12 +433,6 @@ static mt_err_t load_group(yaml_document_t *doc, node_t *n, mt_group_t *g)
     GET_OR_FAIL(get_string(map_get(doc, n, "color"), &g->color, &err));
     GET_OR_FAIL(get_string(map_get(doc, n, "interface"), &g->iface, &err));
     GET_OR_FAIL(get_bool(map_get(doc, n, "enable"), &g->enable, &err));
-    /* Absent leaves mode/onException NULL (== normal/continue) and
-     * routeLocal false, so a config written before these existed loads
-     * with exactly its previous meaning. */
-    GET_OR_FAIL(get_string(map_get(doc, n, "mode"), &g->mode, &err));
-    GET_OR_FAIL(get_string(map_get(doc, n, "onException"), &g->on_exception, &err));
-    GET_OR_FAIL(get_bool(map_get(doc, n, "routeLocal"), &g->route_local, &err));
     if (g->name == NULL && (err = mt_strset(&g->name, "")) != MT_OK) {
         return err;
     }

@@ -72,15 +72,17 @@ struct mt_app {
 };
 
 /* Collects the ipsets of every enabled "direct" list -- groups and
- * subscriptions alike -- and hands them to each except-group, which has to
- * leave their traffic alone. Without this a downloaded bypass list would be
- * pointless the moment one group claimed everything, which is the whole
- * shape of a Shadowrocket config: several RULE-SETs whose action is DIRECT
- * plus a FINAL that catches the rest.
+ * subscriptions alike -- and hands them to every routing group, which has
+ * to leave their traffic alone.
  *
- * Called after every mutation that can change either side of that relation
- * (a direct list appearing or going away, or a group becoming an
- * except-group), so the two never drift apart. */
+ * This is what makes a direct list mean anything. The DNS path adds a
+ * resolved address to *every* group whose rules match the name, so a group
+ * with a catch-all pattern would otherwise route the very domains a direct
+ * list names. Consulted ahead of the mark, so "these go direct" overrides a
+ * routing group rather than competing with it.
+ *
+ * Re-run after every mutation that can change either side, so the two never
+ * drift apart. */
 static mt_err_t refresh_bypass_sets(mt_app_t *app) {
     const char **names = NULL;
     size_t n_names = 0, cap = 0;
@@ -92,9 +94,10 @@ static mt_err_t refresh_bypass_sets(mt_app_t *app) {
         for (size_t i = 0; i < counts[l]; i++) {
             mt_ruleset_t *rs = lists[l][i];
             if (!mt_ruleset_is_direct(rs)) { continue; }
+            /* Only a list that is actually up has a set in the kernel;
+             * naming a missing one would make iptables-restore fail. */
+            if (!mt_ruleset_runtime_enabled(rs) || !mt_ruleset_group(rs)->enable) { continue; }
             const char *name = mt_ruleset_ipset_base_name(rs);
-            /* No set name yet means the list was never enabled, so there is
-             * nothing in the kernel to bypass. */
             if (!name) { continue; }
 
             if (n_names == cap) {
@@ -115,7 +118,8 @@ static mt_err_t refresh_bypass_sets(mt_app_t *app) {
     for (size_t l = 0; l < 2 && err == MT_OK; l++) {
         for (size_t i = 0; i < counts[l] && err == MT_OK; i++) {
             mt_ruleset_t *rs = lists[l][i];
-            if (!mt_group_is_except(mt_ruleset_group(rs))) { continue; }
+            /* A direct list has no chain to put them in. */
+            if (mt_ruleset_is_direct(rs)) { continue; }
             err = mt_ruleset_set_bypass_sets(rs, (const char *const *)names, n_names);
         }
     }

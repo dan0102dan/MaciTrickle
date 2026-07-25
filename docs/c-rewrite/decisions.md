@@ -2629,117 +2629,72 @@ a simulated firmware wipe, no duplicated jumps across repeated passes,
 removal of chains left by a previous run, other writers' rules
 preserved, aborted pass writes nothing and converges on the next one).
 
-## D-57: "Everything except" is a group mode, not a negated matcher
+## D-57: "direct" is a reserved interface, and every routing group skips it
 
-**Status: accepted.** Routing "everything through wg0 except the LAN, SSH
-and example.com" was requested as a rule-level inversion. It is
-implemented as a *group* mode instead, for two reasons.
+**Status: accepted.** Routing by exception went through two shapes before
+this one, and both are worth recording because the reasons they failed are
+what pins the final design.
 
-**Where the decision lives.** In this codebase a rule is only a matcher; the
-interface, the fwmark, the routing table and the ipset all belong to the
-group. The requested JSON (`interface`, `exceptions[]`, `on_exception` on
-one object) is therefore shaped exactly like a group, and putting the mode
-anywhere else would mean a rule could name an interface — a much larger
-change with no user visible upside. `mt_group_t` gains `mode`
-(`normal`|`except`), `onException` (`continue`|`mainroute`) and
-`routeLocal`; all three are absent from YAML and JSON for normal groups, so
-every existing config keeps its meaning byte for byte and the differential
-goldens are untouched.
+The first attempt made exceptions a property of one group (`mode: except`,
+its own rule list being the exception list, plus `onException`, `routeLocal`
+and a chain-level `port` rule type). It could not express the config it was
+meant to reproduce — a Shadowrocket setup is several rule-sets each with an
+action, one of them downloaded from a URL, and a subscription could not
+participate at all.
 
-**What the chain evaluates.** `NOT(exception₁ OR exception₂ OR …)`, exactly
-as specified, and never a per-condition negation. An except-group's ipset
-holds the exceptions rather than the destinations, and its mangle chain
-leaves on any of them before marking what is left:
+The second added `direct` as a bypass that except-groups honoured. That was
+the right primitive attached to the wrong thing: the except machinery on top
+of it earned nothing once `direct` existed.
+
+**What is left.** `direct` joins `blackhole` as a reserved interface name,
+offered for both groups and subscriptions by
+`GET /api/v1/system/interfaces`. A group or subscription pointed at it
+builds no chain, no mark, no ip rule and no route; its only product is its
+ipset. Every *routing* group's mangle chain then leaves on every enabled
+direct set before it marks anything:
 
 ```
 -m conntrack --ctdir REPLY -j RETURN
--p tcp --dport 22 -j RETURN            # port exceptions
--d 192.168.0.0/16 -j RETURN            # local networks, unless routeLocal
--m set --match-set mt_<id>_4 dst -j RETURN   # domain/subnet exceptions
--j MARK --set-mark <mark>
--j CONNMARK --save-mark
-```
-
-The DNS side needs no changes at all: resolved addresses already land in
-the group's set, and for an except-group that set *is* the exception list.
-
-**Ordering.** The requested precedence (specific rules first, catch-all
-second) is achieved by the opposite iptables order: an except-group's jump
-is *inserted at position 1* of `mangle PREROUTING` while normal groups are
-appended after it. `MARK` is last-write-wins, so a specific group
-traversed later overrides the catch-all — put the catch-all last and it
-would instead override every specific group, which is precisely the bug the
-requested ordering is meant to avoid.
-
-**`onException`.** `continue` is a plain `RETURN`: our chain ends, the
-remaining groups still get their say. `mainroute` uses `ACCEPT`, which ends
-the packet's traversal of `mangle` altogether so nothing downstream can
-mark it. The cost is that `ACCEPT` also skips *foreign* mangle-PREROUTING
-rules sitting after our jump; there is no iptables verdict that means "skip
-only the rest of my own vendor's chains", so this is inherent to the
-feature rather than a choice.
-
-**`routeLocal` defaults to off.** An except-group marks everything, and a
-group's routing table holds only a default route via its interface plus a
-blackhole. Marking locally-destined traffic therefore sends the LAN into
-the tunnel and — since the tunnel endpoint itself usually sits in one of
-these ranges — routes the tunnel's own packets into the tunnel. The carve
-out is emitted as visible chain rules rather than hidden set entries so it
-shows up in `iptables -S`. The field is phrased as an opt-in because the
-YAML contract makes an absent bool false, which here is the safe answer.
-
-**`port` rules.** A port lives in the transport header, which the packet
-path can only inspect in a chain — an ordinary group routes purely by
-address-set membership and has nowhere to attach one. So `port` is offered
-only inside an except-group (the UI hides it elsewhere); in a normal group
-it is inert, like any unrecognized type, and is reported once at enable
-time rather than silently doing nothing.
-
-**Known limitation.** An exception on a *domain* only takes effect once
-that name has been resolved through our DNS proxy, because that is when its
-addresses enter the set. This is the same property ordinary groups already
-have, but it is more surprising for an exception: until first resolution the
-traffic goes through the tunnel. Subnet and port exceptions have no such
-delay.
-
-**`direct` lists, and why the group's own rules are not enough.** The
-config this feature exists to reproduce is a Shadowrocket one: several
-RULE-SETs whose action is DIRECT — one of them downloaded from a URL — plus
-a FINAL that sends the rest into a tunnel. Exceptions therefore cannot live
-only inside the catch-all group; they arrive from several places, including
-subscriptions.
-
-So `direct` joins `blackhole` as a reserved interface name (both are now
-offered by `GET /api/v1/system/interfaces`, which is why that response's
-golden changed). A group or subscription pointed at `direct` builds no
-chain, no mark, no ip rule and no route: its only product is its ipset,
-which exists to be named as a bypass. Since a subscription already carries
-an `interface` and is already turned into a full ruleset, `RULE-SET <url> →
-DIRECT` needs no subscription-specific code at all.
-
-An except-group's chain then leaves on every enabled direct list before its
-own exceptions and before the mark:
-
-```
 -m set --match-set mt_<direct-group>_4 dst -j RETURN
 -m set --match-set mt_<direct-sub>_4   dst -j RETURN
--m set --match-set mt_<self>_4         dst -j RETURN
--j MARK --set-mark <mark>
+-m set --match-set mt_<self>_4 dst -j MARK --set-mark <mark>
+-m set --match-set mt_<self>_4 dst -j CONNMARK --save-mark
 ```
 
-`refresh_bypass_sets` (api/app.c) re-links the two sides after every
-mutation that can change either of them, on every rebuild pass, and once at
-startup — main()'s own enable loop bypasses the mutators, which is a gap
-worth naming since nothing else would have caught it. Specific groups keep
-winning over both: their jumps are appended after the catch-all's and MARK
-is last-write-wins, which mirrors Shadowrocket evaluating `ai.list → USA`
-above `cidrwhitelist → DIRECT`.
+Two groups are therefore enough for the common case: one direct list naming
+what to ignore, one group with a catch-all pattern and the tunnel's
+interface.
 
-**Tested by** `test_except.c` (port grammar, mode accessors, exact chain
-contents for both modes, the local-network carve out and its opt out, the
-`ACCEPT` form of a terminal exception, jump ordering against a normal
-group, bypass sets emitted before the mark and honouring a terminal
-exception, a direct list building no chain at all, and a normal group
-ignoring bypass sets) and `tests/unit/group-mode.test.ts` (absent keys read
-as a normal group, except-group round trip, port type offered only where it
-works).
+**Why the leave-rules are load-bearing.** The DNS path adds a resolved
+address to *every* group whose rules match the name (D-18). A group with a
+`*.*` wildcard therefore also matches the domains a direct list names, and
+its chain would route them regardless. Without these rules a direct list
+would look configured and do nothing at all — the bug the second attempt was
+written to fix, and the reason this cannot simply be "a group with no
+chain".
+
+Consulted *before* the mark, so a direct list overrides a routing group
+rather than competing with it: "these go direct" reads as an override.
+
+`refresh_bypass_sets` (api/app.c) re-links the two sides after every
+mutation, on every rebuild pass, and once at startup — main()'s own enable
+loop bypasses the mutators, which is a gap nothing else would have caught.
+
+**What this design does not need.** No local-network carve-out: nothing
+marks unconditionally any more, so a catch-all group still only routes
+DNS-resolved addresses and LAN traffic never enters a set. No jump
+reordering: with no unconditional mark there is no catch-all to keep out of
+the way of specific groups. No `port` rule type: it existed only to put a
+condition in an except-group's chain.
+
+**Known limitation.** A direct entry for a *domain* takes effect once that
+name has been resolved through our proxy, since that is when its addresses
+enter the set — the same property ordinary groups have. Subnet entries have
+no such delay.
+
+**Tested by** `test_direct.c` (a direct list building no chain at all and
+needing no netlink, the leave-rules emitted before the mark and in order, a
+wildcard group still skipping the list, an unchanged chain when no direct
+lists exist, re-setting the lists re-staging the chain, and `blackhole`
+keeping its old behaviour) and `tests/unit/direct-list.test.ts` (the
+reserved name recognised for groups and subscriptions alike).

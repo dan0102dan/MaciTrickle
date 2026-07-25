@@ -48,11 +48,6 @@ export const GroupSchema = object({
   color: fallback(optional(string()), "#ffffff"),
   interface: string(),
   enable: fallback(boolean(), true),
-  /* Routing mode. The backend omits these keys for ordinary groups, so
-     absent must mean "normal" — see GROUP_MODES below. */
-  mode: fallback(optional(string()), "normal"),
-  onException: fallback(optional(string()), "continue"),
-  routeLocal: fallback(optional(boolean()), false),
   rules: array(RuleSchema),
 });
 export type Group = InferOutput<typeof GroupSchema>;
@@ -91,32 +86,14 @@ export const RULE_TYPES = [
   { value: "subnet6", label: "IPv6 subnet" },
 ];
 
-/* `port` matches on the transport header, which the packet path can only do
-   inside an "everything except" group's chain — an ordinary group routes by
-   address-set membership and has nowhere to put it. So it is offered only
-   where it does something. */
-export const PORT_RULE_TYPE = { value: "port", label: "Port" };
+/* The reserved interface that means "leave this traffic alone". A group or
+   subscription pointed at it routes nothing; every routing group skips the
+   addresses it collects. Two groups are enough for the usual setup: one
+   direct list naming what to ignore, one wildcard group taking the rest. */
+export const DIRECT_INTERFACE = "direct";
 
-export function ruleTypesForGroup(group: Pick<Group, "mode">) {
-  return isExceptGroup(group) ? [...RULE_TYPES, PORT_RULE_TYPE] : RULE_TYPES;
-}
-
-/* A group either selects what to route (normal) or what to leave alone
-   (except). Spelled out as a mode rather than an "invert" flag: reading
-   "route everything through wg0 except these" is unambiguous, while a
-   negated matcher is read wrong about as often as it is read right. */
-export const GROUP_MODES = [
-  { value: "normal", label: "Normal group" },
-  { value: "except", label: "Everything except the conditions below" },
-];
-
-export const ON_EXCEPTION_MODES = [
-  { value: "continue", label: "Keep checking the other groups" },
-  { value: "mainroute", label: "Use the main route" },
-];
-
-export function isExceptGroup(group: Pick<Group, "mode">): boolean {
-  return group.mode === "except";
+export function isDirectList(item: { interface: string }): boolean {
+  return item.interface === DIRECT_INTERFACE;
 }
 
 export type Interfaces = {

@@ -155,44 +155,6 @@ static mt_err_t group_from_req(const cJSON *req, const mt_group_t *existing, mt_
     get_optional_bool(req, "enable", &enable_val, &enable_present);
     group->enable = enable_present ? enable_val : true;
 
-    /* Routing mode. Absent keys keep the group normal, so a client that
-     * knows nothing about the mode cannot flip one by omission -- but when
-     * editing an existing group, absent keys must preserve what it already
-     * had rather than silently demoting it back to normal. */
-    const char *mode = get_string(req, "mode");
-    if (mode[0] == '\0' && existing) { mode = existing->mode ? existing->mode : ""; }
-    const char *on_exception = get_string(req, "onException");
-    if (on_exception[0] == '\0' && existing) {
-        on_exception = existing->on_exception ? existing->on_exception : "";
-    }
-    if (mode[0] != '\0' && strcmp(mode, MT_GROUP_MODE_NORMAL) != 0 &&
-        strcmp(mode, MT_GROUP_MODE_EXCEPT) != 0) {
-        mt_group_free(group);
-        *err_msg = "invalid mode";
-        return MT_ERR_INVAL;
-    }
-    if (on_exception[0] != '\0' && strcmp(on_exception, MT_GROUP_ONEXC_CONTINUE) != 0 &&
-        strcmp(on_exception, MT_GROUP_ONEXC_MAINROUTE) != 0) {
-        mt_group_free(group);
-        *err_msg = "invalid onException";
-        return MT_ERR_INVAL;
-    }
-    if (mode[0] != '\0' && strcmp(mode, MT_GROUP_MODE_NORMAL) != 0) {
-        err = mt_strset(&group->mode, mode);
-        if (err == MT_OK && on_exception[0] != '\0') {
-            err = mt_strset(&group->on_exception, on_exception);
-        }
-        if (err != MT_OK) {
-            mt_group_free(group);
-            return err;
-        }
-    }
-
-    bool route_local_present, route_local_val;
-    get_optional_bool(req, "routeLocal", &route_local_val, &route_local_present);
-    group->route_local = route_local_present ? route_local_val
-                                             : (existing ? existing->route_local : false);
-
     cJSON *rules_j = cJSON_GetObjectItemCaseSensitive(req, "rules");
     if (rules_j && !cJSON_IsNull(rules_j)) {
         if (!cJSON_IsArray(rules_j)) {
@@ -245,12 +207,7 @@ static void group_move_into(mt_group_t *into, mt_group_t *from) {
     into->color = from->color;
     free(into->iface);
     into->iface = from->iface;
-    free(into->mode);
-    into->mode = from->mode;
-    free(into->on_exception);
-    into->on_exception = from->on_exception;
     into->enable = from->enable;
-    into->route_local = from->route_local;
     for (size_t i = 0; i < into->n_rules; i++) { mt_rule_free(into->rules[i]); }
     free(into->rules);
     into->rules = from->rules;
@@ -295,18 +252,6 @@ static cJSON *group_to_json(const mt_group_t *g, bool with_rules) {
     cJSON_AddStringToObject(obj, "color", g->color ? g->color : "");
     cJSON_AddStringToObject(obj, "interface", g->iface ? g->iface : "");
     cJSON_AddBoolToObject(obj, "enable", g->enable);
-    /* Mode keys are emitted only for except-groups: a normal group's
-     * representation stays exactly what it was before the mode existed,
-     * which keeps the HTTP contract goldens (and any older client) intact.
-     * Absent means normal/continue on the way back in, so the round trip
-     * is lossless. */
-    if (mt_group_is_except(g)) {
-        cJSON_AddStringToObject(obj, "mode", MT_GROUP_MODE_EXCEPT);
-        cJSON_AddStringToObject(obj, "onException",
-                                mt_group_exception_is_terminal(g) ? MT_GROUP_ONEXC_MAINROUTE
-                                                                  : MT_GROUP_ONEXC_CONTINUE);
-        cJSON_AddBoolToObject(obj, "routeLocal", g->route_local);
-    }
     /* "rules" key omitted unless with_rules, matching GroupRes.RulesRes's
      * `omitempty` (a nil slice pointer when withRules is false). */
     if (with_rules) { cJSON_AddItemToObject(obj, "rules", rules_to_json_array(g->rules, g->n_rules)); }

@@ -27,36 +27,6 @@
 #define MT_RULE_REGEX     "regex"
 #define MT_RULE_SUBNET    "subnet"
 #define MT_RULE_SUBNET6   "subnet6"
-/* Exception-only rule type: a port/protocol condition cannot be expressed
- * as ipset membership (the packet path only ever sees addresses), so it is
- * matched in the group's iptables chain instead. Meaningful only inside a
- * MT_GROUP_MODE_EXCEPT group; in a normal group it is inert, exactly like
- * any unrecognized type (see match.h's RK_NEVER). */
-#define MT_RULE_PORT      "port"
-
-/* Group routing modes (yaml/json key `mode`; absent == normal).
- *
- * normal: the group's rules select what goes through its interface --
- *         resolved addresses land in the group's ipset and the chain marks
- *         packets whose destination is in that set.
- * except: the group's rules select what does NOT go through it. The same
- *         ipset now holds the exceptions, the chain returns for them and
- *         marks everything else. Reads as "route everything through wg0
- *         except example.com, the LAN, and SSH" rather than as a negated
- *         matcher -- see decisions.md D-57. */
-#define MT_GROUP_MODE_NORMAL "normal"
-#define MT_GROUP_MODE_EXCEPT "except"
-
-/* What happens to traffic an except-group excluded (key `onException`;
- * absent == continue).
- *
- * continue:  the packet is left unmarked by this group and other groups
- *            still get their say -- a later, more specific group can pick
- *            it up.
- * mainroute: the packet leaves on the system's main route, and no other
- *            group may claim it.  */
-#define MT_GROUP_ONEXC_CONTINUE  "continue"
-#define MT_GROUP_ONEXC_MAINROUTE "mainroute"
 
 typedef struct mt_rule {
     mt_id_t id;
@@ -72,28 +42,9 @@ typedef struct mt_group {
     char *color;
     char *iface; /* yaml key: interface */
     bool enable;
-    /* NULL == MT_GROUP_MODE_NORMAL, so every config written before this
-     * field existed keeps its meaning. */
-    char *mode;         /* yaml/json key: mode */
-    char *on_exception; /* yaml/json key: onException */
-    /* Route locally-destined traffic too. Deliberately phrased so that
-     * absent (false, per the yaml contract) is the safe answer: an
-     * except-group marks *everything*, and its routing table holds only a
-     * default route plus a blackhole, so without this exemption the LAN
-     * and the tunnel's own endpoint get routed into the tunnel and the
-     * router stops forwarding. Opt in only for a deliberate
-     * site-to-site setup. */
-    bool route_local; /* yaml/json key: routeLocal */
     mt_rule_t **rules;
     size_t n_rules;
 } mt_group_t;
-
-/* True when the group routes everything *except* what its rules match. */
-bool mt_group_is_except(const mt_group_t *g);
-/* True when this except-group's excluded traffic must take the main route
- * instead of being offered to the remaining groups. Always false for a
- * normal group. */
-bool mt_group_exception_is_terminal(const mt_group_t *g);
 
 typedef struct mt_sub_rule {
     mt_id_t id;

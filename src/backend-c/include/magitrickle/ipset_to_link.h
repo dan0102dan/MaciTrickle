@@ -23,7 +23,6 @@
 #include "magitrickle/err.h"
 #include "magitrickle/ipset.h"
 #include "magitrickle/iptables.h"
-#include "magitrickle/portrule.h"
 #include "magitrickle/rtnl.h"
 
 #define MT_IPSET_TO_LINK_BLACKHOLE "blackhole"
@@ -44,40 +43,23 @@ mt_ipset_to_link_t *mt_ipset_to_link_new(const char *chain_name, const char *ifa
                                          mt_rtnl_t *rtnl, uint32_t start_idx);
 void mt_ipset_to_link_free(mt_ipset_to_link_t *l);
 
-/* Routing mode for the chain this object builds.
+/* The ipsets of every enabled "direct" group and subscription. A routing
+ * group's chain leaves their traffic alone before marking anything, which
+ * is what makes a direct list mean something: without it a wildcard group
+ * would pull the very domains a direct list names into its own set and
+ * route them anyway.
  *
- * With except=false the chain marks packets whose destination is in the
- * group's set -- the set says what to route. With except=true the set says
- * what *not* to route: the chain returns for those destinations (and for
- * the port conditions and, unless route_local is set, for locally-destined
- * traffic) and marks everything else.
- *
- * The expression the chain evaluates is NOT(exception1 OR exception2 OR
- * ...), never a per-condition negation -- see decisions.md D-57.
- *
- * bypass_sets names the ipsets of every enabled "direct" group and
- * subscription: an except-group has to leave their traffic alone too, or a
- * downloaded bypass list would be pointless as soon as one group claimed
- * everything. Passing them in (rather than having this module hunt for
- * them) keeps the ordering explicit -- they are consulted before the mark,
- * exactly like the group's own exceptions.
- *
- * ports and bypass_sets are copied; terminal_exception makes excluded
- * traffic leave on the main route instead of being offered to the other
- * groups. */
+ * Passing the names in (rather than having this module hunt for them) keeps
+ * the ordering explicit -- they are consulted first, ahead of the mark.
+ * bypass_sets is copied. */
 typedef struct mt_ipset_to_link_mode {
-    bool except;
-    bool terminal_exception;
-    bool route_local;
-    const mt_port_rule_t *ports;
-    size_t n_ports;
     /* Base ipset names, without the _4/_6 family suffix. */
     const char *const *bypass_sets;
     size_t n_bypass_sets;
 } mt_ipset_to_link_mode_t;
 
-/* Must be called before enable/prepare; the mode is part of the chain's
- * shape, not something that can change under a live chain. Copies ports. */
+/* Re-settable at any time; the chain is re-staged on the next
+ * prepare/commit. Copies the names. */
 mt_err_t mt_ipset_to_link_set_mode(mt_ipset_to_link_t *l, const mt_ipset_to_link_mode_t *mode);
 
 /* Marks the object enabled with a fixed mark, without touching netlink.

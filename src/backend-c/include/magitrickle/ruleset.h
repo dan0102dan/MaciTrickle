@@ -93,8 +93,8 @@ mt_err_t mt_ruleset_set_bypass_sets(mt_ruleset_t *rs, const char *const *names, 
  * is the reserved name "direct". */
 bool mt_ruleset_is_direct(const mt_ruleset_t *rs);
 
-/* Base ipset name of this group, or NULL when it has none yet (never
- * enabled). Lets the app collect the bypass-set list above. */
+/* Base ipset name of this group (prefix + id), known from construction.
+ * Lets the app collect the bypass-set list above. */
 const char *mt_ruleset_ipset_base_name(const mt_ruleset_t *rs);
 
 /* Rebuilds ipset contents from the group's subnet/subnet6 rules (static
