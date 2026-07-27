@@ -2572,3 +2572,55 @@ checksum downloads use curl's retry-all-errors mode, and
 `scripts/feeds update -a` is retried four times with increasing backoff.
 No target is dropped or silently skipped: an exhausted retry budget still
 fails the corresponding job and publishes its captured feed log.
+
+## D-56: Package both OpenWrt release lines from their own SDKs
+
+**Status: accepted.** OpenWrt 25.12 replaced opkg/`.ipk` with apk/`.apk`,
+so one SDK can no longer produce a package both release lines can
+install. Each OpenWrt arch config is therefore built twice — once
+against the 24.10 SDK for `.ipk`, once against the 25.12 SDK for
+`.apk` — which retires the earlier scheme of repacking the `.ipk`
+payload with a host-built `apk-tools` (that produced a package no real
+25.12 router had ever verified, and needed a separate job just to build
+`apk mkpkg`).
+
+Four things this exposed, each fixed where it belongs:
+
+- **The project's `PKG_*` variables leaked into the SDK build.** The
+  packaging step exports `PKG_VERSION`, `PKG_REVISION` and friends from
+  `make _return_export_dynamic_env` to name the source tarball. Those
+  names are generic enough that OpenWrt's own recipes picked them up:
+  every kernel module inherited our `~git<date>.<sha>` suffix and apk
+  rejected the result outright (`info field 'version' has invalid
+  value`). They are unset again before make is invoked inside the SDK;
+  the values needed after that are re-read from
+  `.build/openwrt-package.env`.
+
+- **Release SDKs ship `CONFIG_AUTOREMOVE=y`.** It empties a package's
+  build directory the instant the package finishes compiling, so
+  verifying the freshly built ELF at
+  `<pkg>/src/backend-c/build/openwrt-<arch>/magitrickled-c` failed on
+  every arch even though the package itself was built correctly.
+  Verification reads `<pkg>/.pkgdir/magitrickle/usr/bin/magitrickled`
+  instead — the staged install tree AUTOREMOVE deliberately preserves,
+  and the exact bytes the package is packed from — falling back to the
+  build output for SDKs that keep their build directories.
+
+- **PCRE2 stays a normal shared runtime dependency.** Patching the feed
+  recipe to `-DBUILD_SHARED_LIBS=OFF` for a static link breaks the
+  recipe's own `Package/libpcre2/install`, which copies
+  `libpcre2-{8,posix}.so*`. cJSON remains the one vendored static
+  dependency, because no OpenWrt feed carries it (D-50).
+
+- **A missing SDK is a skip, not a failure.** A release only publishes
+  the targets it still supports, so a 404 on its `sha256sums` means the
+  arch-to-target mapping does not apply to that release — reported as a
+  warning naming the target/subtarget, consistent with how an unmapped
+  arch is already handled, instead of turning the whole matrix red.
+
+Doubling the matrix also doubled its wall-clock cost, so the feed setup
+was trimmed to what the package actually resolves against: `base` and
+`packages` only (no luci/routing/telephony/video), with `base` demoted
+from `src-git-full` to a shallow `src-git` clone. That removes a
+full-history clone of openwrt.git per job, which is what made D-55 hold
+the matrix to six concurrent jobs; it now runs twelve.

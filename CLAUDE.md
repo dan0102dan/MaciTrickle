@@ -32,7 +32,7 @@ Two supported platforms (set via `PLATFORM` in `.config`):
 - `entware` — Keenetic and similar; targets like `mipsel-3.4`, `aarch64-3.10`. The `_kn` suffix targets set `ENTWARE_KN=1` (Keenetic-specific ignored-interfaces list) and require `socat`.
 - `openwrt` — targets like `aarch64_cortex-a53`.
 
-`CROSS_COMPILE` (toolchain prefix, e.g. `mipsel-linux-gnu-`) and `SYSROOT` are empty by default, which builds natively for the host. Real per-target cross-toolchains + sysroots are not yet provisioned in CI (see `docs/c-rewrite/toolchains.md` and `decisions.md` D-45) — `build.yml`'s packaging matrix explicitly marks every target "not yet automated" rather than risk shipping a mislabeled host binary.
+`CROSS_COMPILE` (toolchain prefix, e.g. `mipsel-linux-gnu-`) and `SYSROOT` are empty by default, which builds natively for the host. CI never uses that host path for packaging: it builds each target inside a real prebuilt SDK (Entware's via `ownik/gh-action-entware-sdk`, OpenWrt's downloaded per release), so the toolchain and feed sysroot come from the SDK. Archs with no working SDK mapping are explicitly skipped with a notice rather than falling back to a mislabeled host binary — see `docs/c-rewrite/toolchains.md` and `decisions.md` D-45/D-51/D-53/D-56.
 
 ## Backend
 
@@ -115,7 +115,7 @@ Runtime config is YAML; filesystem paths (share dir, state dir, socket, passwd/s
 
 - `.github/workflows/check.yml` — frontend unit + e2e tests
 - `.github/workflows/check-c.yml` — C backend build (warnings-as-errors), unit tests, sanitizers, static analysis, fuzz smoke, differential/regression suites, mipsel cross-build skeleton
-- `.github/workflows/build.yml` — builds a matrix of all configs under `config/*/`; packaging is currently gated on a real per-target cross-toolchain + sysroot being provisioned (not yet done — see `docs/c-rewrite/toolchains.md` and `decisions.md` D-45), so every target is explicitly marked "not yet automated" rather than risk a mislabeled binary. To add a new target, add a `.config` file in the appropriate `config/<platform>/` directory.
+- `.github/workflows/build.yml` — builds a matrix of all configs under `config/*/`. Entware targets build in a prebuilt Entware SDK; each OpenWrt arch builds twice, against the 24.10 SDK (`.ipk`) and the 25.12 SDK (`.apk`). An arch with no known target/subtarget mapping, or one the release publishes no SDK for, is skipped with a notice instead of failing the run (`decisions.md` D-51/D-53/D-56). To add a new target, add a `.config` file in the appropriate `config/<platform>/` directory.
 
 ## History
 

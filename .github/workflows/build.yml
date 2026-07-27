@@ -1,4 +1,4 @@
-name: Build and Package OPKG
+name: Build OpenWrt and Entware packages
 
 on:
   push:
@@ -19,6 +19,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   prepare:
@@ -42,72 +46,44 @@ jobs:
           if not configs:
               raise SystemExit("No build configs found")
 
-          matrix = [
-              {
+          matrix = []
+          for config in configs:
+              item = {
                   "config": config.as_posix(),
                   "name": config.stem,
+                  "label": config.stem,
+                  "openwrt_version": "",
+                  "package_ext": "ipk",
               }
-              for config in configs
-          ]
+              if config.parent.name == "openwrt":
+                  for version, package_ext in (
+                      ("24.10.4", "ipk"),
+                      ("25.12.5", "apk"),
+                  ):
+                      matrix.append({
+                          **item,
+                          "label": f"{config.stem} / OpenWrt {version}",
+                          "openwrt_version": version,
+                          "package_ext": package_ext,
+                      })
+              else:
+                  matrix.append(item)
 
           print(f"configs={json.dumps(matrix, separators=(',', ':'))}")
           PY
 
-  apk_tools:
-    name: Build apk-tools (host, for mkpkg)
-    runs-on: ubuntu-latest
-    outputs:
-      cache-hit: ${{ steps.cache.outputs.cache-hit }}
-    steps:
-      - name: Cache apk-tools binary
-        id: cache
-        uses: actions/cache@v5
-        with:
-          path: apk-tools-bin
-          # Bump this key if the pinned ref below changes.
-          key: apk-tools-v3.0.0-ubuntu-latest-v2
-
-      - name: Build apk-tools from source
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -eu
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build pkg-config zlib1g-dev libssl-dev lua5.3 liblua5.3-dev
-          # OpenWrt's APKv3 packaging (the `mkpkg` subcommand our .apk
-          # packaging needs) was contributed upstream into Alpine's own
-          # apk-tools rather than staying a separate fork -- host-only
-          # tool, built natively for the runner, never cross-compiled.
-          git clone --depth 1 --branch v3.0.0 https://gitlab.alpinelinux.org/alpine/apk-tools.git apk-tools-src
-          cd apk-tools-src
-          meson setup build -Ddocs=disabled
-          ninja -C build
-          mkdir -p "$GITHUB_WORKSPACE/apk-tools-bin"
-          find build -maxdepth 3 -type f -name apk -exec cp {} "$GITHUB_WORKSPACE/apk-tools-bin/apk" \;
-          # `apk` dynamically links against its own libapk.so -- ship
-          # that alongside it (the first real-CI run confirmed this was
-          # missing: "error while loading shared libraries: libapk.so.*").
-          find build -maxdepth 3 -type f -name 'libapk.so*' -exec cp {} "$GITHUB_WORKSPACE/apk-tools-bin/" \;
-          test -x "$GITHUB_WORKSPACE/apk-tools-bin/apk"
-          ls -la "$GITHUB_WORKSPACE/apk-tools-bin"
-          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apk-tools-bin" "$GITHUB_WORKSPACE/apk-tools-bin/apk" mkpkg --version
-
-      - name: Upload apk-tools artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: apk-tools-bin
-          path: apk-tools-bin
-          retention-days: 7
-
   build:
-    name: Build packages (${{ matrix.name }})
-    needs: [prepare, apk_tools]
+    name: Build packages (${{ matrix.label }})
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       # Feed repositories rate-limit/fail when every OpenWrt architecture
       # clones them at once. Keep enough concurrency for useful throughput
-      # without creating a synchronized clone storm.
-      max-parallel: 6
+      # without creating a synchronized clone storm -- each job now clones
+      # only the two feeds it needs, so this can sit well above the six
+      # parallel jobs the full-feed setup had to be held to.
+      max-parallel: 12
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.configs) }}
     steps:
@@ -119,7 +95,7 @@ jobs:
       - name: Check cross-toolchain availability
         id: toolchain
         env:
-          OPENWRT_VERSION: "24.10.1"
+          OPENWRT_VERSION: "${{ matrix.openwrt_version || '24.10.4' }}"
         run: |
           cp "${{ matrix.config }}" .config
           . ./.config
@@ -328,17 +304,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Download apk-tools artifact
-        if: steps.toolchain.outputs.openwrt_target != ''
-        uses: actions/download-artifact@v7
-        with:
-          name: apk-tools-bin
-          path: apk-tools-bin
-
-      - name: Make apk-tools executable
-        if: steps.toolchain.outputs.openwrt_target != ''
-        run: chmod +x apk-tools-bin/apk
-
       - name: Prepare Entware package feed
         id: entware_feed
         if: steps.toolchain.outputs.entware_config != ''
@@ -437,11 +402,31 @@ jobs:
           mkdir -p "$log_dir"
           echo "log_dir=$log_dir" >> "$GITHUB_OUTPUT"
 
+          # A release only publishes the targets it still supports, so a
+          # 404 here means "this OpenWrt version has no SDK for the
+          # target/subtarget this package arch maps to", not a broken
+          # build. Report it and skip, the same way an unmapped arch is
+          # skipped above. Anything else (5xx, DNS, timeouts) is a real
+          # failure -- --retry covers the transient ones, and a 404 is
+          # deliberately not retried.
+          http_code=$(
+            curl --retry 5 --retry-delay 5 --connect-timeout 30 -sSL \
+              -o "$sdk_root/sha256sums" -w '%{http_code}' \
+              "${base_url}/sha256sums" 2>>"$log_dir/download.log" || echo 000
+          )
+          echo "GET ${base_url}/sha256sums -> $http_code" >> "$log_dir/download.log"
+          if [ "$http_code" = 404 ]; then
+            echo "::warning title=${{ matrix.name }}::OpenWrt ${version} publishes no SDK for ${target}/${subtarget}, so no package is built for this arch on this release. Update the arch-to-target mapping in build.yml if the target was renamed."
+            echo "sdk_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$http_code" != 200 ]; then
+            echo "Failed to fetch ${base_url}/sha256sums (HTTP $http_code)" >&2
+            exit 1
+          fi
+
           (
             cd "$sdk_root"
-            curl --retry 5 --retry-all-errors --retry-delay 5 \
-              --connect-timeout 30 -fsSL -o sha256sums \
-              "${base_url}/sha256sums" 2>&1 | tee "$log_dir/download.log"
             sdk_file=$(grep -oE 'openwrt-sdk-[^ ]+\.tar\.(zst|xz)' sha256sums | head -n1)
             if [ -z "$sdk_file" ]; then
               echo "Could not find an SDK archive name in ${base_url}/sha256sums" | tee -a "$log_dir/download.log" >&2
@@ -471,12 +456,17 @@ jobs:
           pkg_dir="$sdk_dir/package/net/magitrickle"
           mkdir -p "$pkg_dir"
           cp tools/ci/openwrt-package/Makefile "$pkg_dir/Makefile"
+          magitrickle_version="$PKG_VERSION"
+          if [ "${{ matrix.package_ext }}" = apk ]; then
+            magitrickle_version="$PKG_VERSION_APK"
+          fi
+          magitrickle_release="$PKG_REVISION"
           {
-            printf 'MAGITRICKLE_VERSION:=%s\n' "$PKG_VERSION"
-            printf 'MAGITRICKLE_RELEASE:=%s\n' "$PKG_REVISION"
+            printf 'MAGITRICKLE_VERSION:=%s\n' "$magitrickle_version"
+            printf 'MAGITRICKLE_RELEASE:=%s\n' "$magitrickle_release"
           } > "$pkg_dir/version.mk"
           tar -czf "$pkg_dir/magitrickle-source.tar.gz" \
-            --transform "s,^,magitrickle-${PKG_VERSION}/," \
+            --transform "s,^,magitrickle-${magitrickle_version}/," \
             LICENSE files src/backend-c src/frontend/dist
 
           # cJSON isn't in any OpenWrt feed for this release (confirmed via
@@ -488,8 +478,36 @@ jobs:
           mkdir -p "$cjson_pkg_dir"
           cp tools/ci/openwrt-package-libcjson/Makefile "$cjson_pkg_dir/Makefile"
 
+          # Project version variables use generic PKG_* names. Do not leak
+          # them into the SDK: OpenWrt make otherwise applies them to system
+          # packages too, producing invalid apk versions.
+          unset COMMIT COMMITS_SINCE_TAG PKG_REVISION PKG_VERSION PKG_VERSION_APK \
+            PKG_VERSION_DISPLAY PKG_VERSION_PRERELEASE PRERELEASE_DATE TAG
+
           (
             cd "$sdk_dir"
+            # Every dependency resolves out of `base` or `packages` (see
+            # feeds-install.log), so cloning luci/routing/telephony/video
+            # on top of those is pure cost. `base` is also declared
+            # src-git-full, i.e. the entire openwrt.git history, where a
+            # shallow clone builds the same packages. Together this is
+            # what lets the matrix run more jobs in parallel without the
+            # feed servers throttling. Fall back to the SDK's own list if
+            # the layout ever stops matching.
+            awk '
+              $1 ~ /^src-git(-full)?$/ && ($2 == "base" || $2 == "packages") {
+                # url;ref names a branch or tag, which clones shallow
+                # fine; url^sha needs a fetch by commit the server may
+                # refuse on a shallow clone, so leave those alone.
+                if ($3 !~ /\^/) { $1 = "src-git" }
+                print
+              }
+            ' feeds.conf.default > feeds.conf
+            if [ "$(wc -l < feeds.conf)" -ne 2 ]; then
+              echo "unexpected feeds.conf.default layout; using it unchanged" >&2
+              rm -f feeds.conf
+            fi
+
             : > "$log_dir/feeds-update.log"
             feeds_updated=false
             for attempt in 1 2 3 4; do
@@ -506,24 +524,15 @@ jobs:
               echo "feeds update failed after 4 attempts" >> "$log_dir/feeds-update.log"
               exit 1
             fi
-            ./scripts/feeds install libyaml libpcre2 libmnl libcurl \
+            ./scripts/feeds install libyaml pcre2 libmnl libcurl \
               iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft libatomic \
               > "$log_dir/feeds-install.log" 2>&1
+
             make defconfig > "$log_dir/defconfig.log" 2>&1
-            # `feeds install` only symlinks each recipe -- it does not build or
-            # stage its headers/libs into staging_dir. Our own package only
-            # needs libyaml/libpcre2/libmnl/curl(libcurl)/libcjson at compile
-            # time (the rest are runtime-only: kernel modules and iptables
-            # CLI binaries we fork/exec, never #include), so compile just
-            # those explicitly first, by package name (not physical
-            # subdirectory -- same name-based target the `magitrickle`
-            # package itself already resolves through). Note the make
-            # target is the SDK's real package name, which for some
-            # packages differs from the `+libX` DEPENDS/feeds-install
-            # name feeds install resolves as a virtual alias: `libyaml`
-            # installs the package named `yaml`, `libpcre2` installs
-            # `pcre2` (feeds-install.log confirmed both renames; `libmnl`
-            # and `curl` keep their DEPENDS names as-is).
+            # `feeds install` only exposes recipes; it does not stage their
+            # headers or libraries. Build compile-time dependencies first.
+            # cJSON installs a private static archive into staging. PCRE2,
+            # yaml, libmnl and curl remain normal runtime libraries.
             make package/yaml/{clean,compile} \
                  package/pcre2/{clean,compile} \
                  package/libmnl/{clean,compile} \
@@ -578,7 +587,7 @@ jobs:
 
       - name: Collect and verify package
         id: package_outputs
-        if: steps.toolchain.outputs.ready == 'true'
+        if: steps.toolchain.outputs.ready == 'true' && steps.openwrt_sdk.outputs.sdk_available != 'false'
         run: |
           set -eu
           if [ -n "${{ steps.toolchain.outputs.entware_config }}" ]; then
@@ -645,46 +654,50 @@ jobs:
             echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
           elif [ -n "${{ steps.toolchain.outputs.openwrt_target }}" ]; then
             sdk_dir="${{ steps.openwrt_sdk.outputs.sdk_dir }}"
+            package_ext="${{ matrix.package_ext }}"
+            case "$package_ext" in
+              ipk) package_glob='magitrickle_*.ipk' ;;
+              apk) package_glob='magitrickle-*.apk' ;;
+              *) echo "Unsupported package extension: $package_ext" >&2; exit 1 ;;
+            esac
             mapfile -t packages < <(
-              find "$sdk_dir/bin/packages" -type f -name 'magitrickle_*.ipk' 2>/dev/null | sort
+              find "$sdk_dir/bin/packages" -type f -name "$package_glob" 2>/dev/null | sort
             )
             if [ "${#packages[@]}" -ne 1 ]; then
-              echo "Expected exactly one magitrickle IPK under $sdk_dir/bin/packages, found ${#packages[@]}" >&2
+              echo "Expected exactly one magitrickle .$package_ext under $sdk_dir/bin/packages, found ${#packages[@]}" >&2
               printf '%s\n' "${packages[@]}" >&2
               exit 1
             fi
 
             . .build/openwrt-package.env
-            package=".build/magitrickle_${PKG_VERSION}-${PKG_REVISION}_openwrt_${{ matrix.name }}.ipk"
+            artifact_version="$PKG_VERSION"
+            if [ "$package_ext" = apk ]; then
+              artifact_version="$PKG_VERSION_APK"
+            fi
+            package=".build/magitrickle_${artifact_version}-${PKG_REVISION}_openwrt-${{ matrix.openwrt_version }}_${{ matrix.name }}.${package_ext}"
             cp "${packages[0]}" "$package"
 
-            data_archive=$(mktemp)
-            binary=$(mktemp)
-            if ar t "$package" >/dev/null 2>&1; then
-              ar p "$package" data.tar.gz > "$data_archive"
-            else
-              data_member=$(
-                tar -tf "$package" |
-                  awk '$0 == "data.tar.gz" || $0 == "./data.tar.gz" { print; exit }'
-              )
-              if [ -z "$data_member" ]; then
-                echo "No data.tar.gz member in $package" >&2
-                exit 1
-              fi
-              tar -xOf "$package" "$data_member" > "$data_archive"
-            fi
-            binary_member=$(
-              tar -tzf "$data_archive" |
-                awk '$0 == "usr/bin/magitrickled" || $0 == "./usr/bin/magitrickled" { print; exit }'
-            )
-            if [ -z "$binary_member" ]; then
-              echo "No /usr/bin/magitrickled in $package" >&2
+            # Release SDKs ship with CONFIG_AUTOREMOVE enabled, which wipes
+            # a package's build directory the moment it finishes compiling
+            # -- everything except .pkgdir, the staged install tree the
+            # package is packed from. Read the binary from there (it is the
+            # exact file that ends up in the package), and fall back to the
+            # raw build output for SDKs that keep their build directories.
+            binary=$(find "$sdk_dir/build_dir" -type f \( \
+              -path '*/magitrickle-*/.pkgdir/magitrickle/usr/bin/magitrickled' -o \
+              -path '*/magitrickle-*/src/backend-c/build/openwrt-*/magitrickled-c' \
+              \) -print -quit)
+            if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+              echo "Built magitrickled binary not found under $sdk_dir/build_dir" >&2
               exit 1
             fi
-            tar -xzOf "$data_archive" "$binary_member" > "$binary"
 
             readelf -h "$binary"
             readelf -l "$binary"
+            if readelf -d "$binary" | grep -Eq 'NEEDED.*libcjson'; then
+              echo "OpenWrt binary still has a dynamic cJSON dependency" >&2
+              exit 1
+            fi
             case "${{ matrix.name }}" in
               aarch64_*)
                 readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
@@ -705,74 +718,6 @@ jobs:
 
             echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
             echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
-
-            # .apk (OpenWrt >=25.12, apk-tools) is best-effort: it reuses
-            # the .ipk's own data.tar.gz as its file tree (same install
-            # layout, no separate Package/install logic needed) and the
-            # apk-tools binary built by the apk_tools job. If it fails,
-            # don't take down an otherwise-successful .ipk build with it
-            # -- report a warning and move on with .ipk only.
-            #
-            # NOTE: deliberately not `if ( set -eu; ...; ); then`. Bash's
-            # errexit suppression for commands tested by `if` can extend
-            # into a subshell that re-enables `set -e` inside it (a real,
-            # confirmed-the-hard-way gotcha -- the first real CI run hit
-            # exactly this: the apk mkpkg call inside such a subshell
-            # failed, but the `if` still took its "success" branch and
-            # package_2_path got set to a file that didn't exist,
-            # breaking the artifact upload for an otherwise-fine .ipk
-            # build). Capture the exit code explicitly instead.
-            set +e
-            (
-              set -eu
-              apk_root=$(mktemp -d)
-              tar -xzf "$data_archive" -C "$apk_root"
-              mkdir -p "$apk_root/lib/apk/packages"
-              if [ -f files/openwrt/_apk/conffiles ]; then
-                cp files/openwrt/_apk/conffiles "$apk_root/lib/apk/packages/magitrickle.conffiles"
-                while IFS= read -r cf; do
-                  cf="${cf#/}"
-                  [ -n "$cf" ] && [ -f "$apk_root/$cf" ] || continue
-                  csum=$(sha256sum "$apk_root/$cf" | cut -d' ' -f1)
-                  echo "$cf $csum" >> "$apk_root/lib/apk/packages/magitrickle.conffiles_static"
-                done < files/openwrt/_apk/conffiles
-              fi
-              (cd "$apk_root" && find . -type f,l -printf "/%P\n") > "$apk_root/lib/apk/packages/magitrickle.list"
-
-              apk_key=$(mktemp)
-              openssl ecparam -name prime256v1 -genkey -noout -out "$apk_key"
-
-              apk_package=".build/magitrickle_${PKG_VERSION_APK}-r${PKG_REVISION}_openwrt_${{ matrix.name }}.apk"
-              LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apk-tools-bin" "$GITHUB_WORKSPACE/apk-tools-bin/apk" mkpkg \
-                -I "name:magitrickle" \
-                -I "version:${PKG_VERSION_APK}-r${PKG_REVISION}" \
-                -I "description:DNS-based routing application" \
-                -I "arch:${{ matrix.name }}" \
-                -I "license:GPL-3.0-or-later" \
-                -I "origin:feeds/packages/feeds/magitrickle/net/magitrickle" \
-                -I "maintainer:Vladimir Avtsenov <vladimir.lsk.cool@gmail.com>" \
-                -I "url:https://magitrickle.dev" \
-                -I "provider-priority:100" \
-                -I "depends:libc iptables-nft iptables-mod-conntrack-extra kmod-ipt-nat kmod-ipt-ipset ip6tables-nft libyaml libpcre2 libmnl libcurl libcjson" \
-                -s "post-install:files/openwrt/_apk/post-install.sh" \
-                -s "pre-deinstall:files/openwrt/_apk/pre-deinstall.sh" \
-                -s "post-upgrade:files/openwrt/_apk/post-upgrade.sh" \
-                -F "$apk_root" \
-                -o "$apk_package" \
-                --sign "$apk_key"
-
-              # Belt-and-suspenders: only report success if the file is
-              # genuinely there, regardless of apk mkpkg's own exit code.
-              test -s "$apk_package"
-
-              echo "package_2_path=$apk_package" >> "$GITHUB_OUTPUT"
-              echo "package_2_name=$(basename "$apk_package")" >> "$GITHUB_OUTPUT"
-            )
-            apk_status=$?
-            set -e
-            if [ "$apk_status" -ne 0 ]; then
-              echo "::warning title=.apk packaging (${{ matrix.name }})::Failed to build the .apk package for this target (exit $apk_status); .ipk is still produced above. See docs/c-rewrite/decisions.md D-52."
-            fi
           fi
 
       - name: Upload package artifact 1
@@ -784,24 +729,14 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload package artifact 2
-        if: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' && steps.package_outputs.outputs.package_2_path != '' }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ steps.package_outputs.outputs.package_2_name }}
-          path: ${{ steps.package_outputs.outputs.package_2_path }}
-          if-no-files-found: error
-          compression-level: 0
-
       - name: Upload package assets to release
         if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
           PACKAGE_1: ${{ steps.package_outputs.outputs.package_1_path }}
-          PACKAGE_2: ${{ steps.package_outputs.outputs.package_2_path }}
         run: |
-          for package in "$PACKAGE_1" "$PACKAGE_2"; do
+          for package in "$PACKAGE_1"; do
             if [ -n "$package" ]; then
               gh release upload "$RELEASE_TAG" "$package" \
                 --repo "$GITHUB_REPOSITORY" \

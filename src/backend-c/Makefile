@@ -165,7 +165,9 @@ CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 CACHETOOL_OBJ := $(CACHETOOL_SRC:%.c=$(BUILDDIR)/%.o)
 
-DEP_LIBS := -lyaml -lpcre2-8 -lmnl -lcjson -lcurl
+PCRE2_LIB ?= -lpcre2-8
+CJSON_LIB ?= -lcjson
+DEP_LIBS := -lyaml $(PCRE2_LIB) -lmnl $(CJSON_LIB) -lm -lcurl
 
 # fake_iptables.c/fake_ipset_nl.c are test *support* (the former a port of
 # executable-fake.go, gated behind Go's `testing` build tag there; the

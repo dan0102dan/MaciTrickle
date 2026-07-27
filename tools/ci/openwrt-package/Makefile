@@ -14,6 +14,7 @@ PKG_HASH:=skip
 PKG_MIRROR_HASH:=skip
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_BUILD_PARALLEL:=1
+PKG_BUILD_DEPENDS:=pcre2 libcjson
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -22,7 +23,7 @@ define Package/magitrickle
   CATEGORY:=Network
   TITLE:=DNS-based routing application
   URL:=https://magitrickle.dev
-  DEPENDS:=+iptables-nft +iptables-mod-conntrack-extra +kmod-ipt-nat +kmod-ipt-ipset +ip6tables-nft +libatomic +libyaml +libpcre2 +libmnl +libcurl +libcjson
+  DEPENDS:=+iptables-nft +iptables-mod-conntrack-extra +kmod-ipt-nat +kmod-ipt-ipset +ip6tables-nft +libatomic +libyaml +libpcre2 +libmnl +libcurl
 endef
 
 define Package/magitrickle/description
@@ -42,7 +43,8 @@ define Build/Compile
 		PLATFORM=openwrt \
 		WITH_DEPS=1 \
 		CFLAGS_EXTRA="$(TARGET_CFLAGS)" \
-		LDFLAGS_EXTRA="$(TARGET_LDFLAGS)"
+		LDFLAGS_EXTRA="$(TARGET_LDFLAGS)" \
+		CJSON_LIB="$(STAGING_DIR)/usr/lib/libcjson.a"
 endef
 
 define Package/magitrickle/install

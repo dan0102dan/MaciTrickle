@@ -30,25 +30,19 @@ define Package/libcjson/description
 endef
 
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CFLAGS) -fPIC -c -o $(PKG_BUILD_DIR)/cJSON.o $(PKG_BUILD_DIR)/cJSON.c
-	$(TARGET_CC) $(TARGET_CFLAGS) -shared -Wl,-soname,libcjson.so.1 \
-		-o $(PKG_BUILD_DIR)/libcjson.so.$(PKG_VERSION) $(PKG_BUILD_DIR)/cJSON.o $(TARGET_LDFLAGS)
+	$(TARGET_CC) $(TARGET_CFLAGS) -c -o $(PKG_BUILD_DIR)/cJSON.o $(PKG_BUILD_DIR)/cJSON.c
+	$(TARGET_AR) rc $(PKG_BUILD_DIR)/libcjson.a $(PKG_BUILD_DIR)/cJSON.o
+	$(TARGET_RANLIB) $(PKG_BUILD_DIR)/libcjson.a
 endef
 
 define Package/libcjson/install
-	$(INSTALL_DIR) $(1)/usr/lib
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/libcjson.so.$(PKG_VERSION) $(1)/usr/lib/
-	ln -sf libcjson.so.$(PKG_VERSION) $(1)/usr/lib/libcjson.so.1
-	ln -sf libcjson.so.1 $(1)/usr/lib/libcjson.so
 endef
 
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/include/cjson
 	$(CP) $(PKG_BUILD_DIR)/cJSON.h $(1)/usr/include/cjson/
 	$(INSTALL_DIR) $(1)/usr/lib
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/libcjson.so.$(PKG_VERSION) $(1)/usr/lib/
-	ln -sf libcjson.so.$(PKG_VERSION) $(1)/usr/lib/libcjson.so.1
-	ln -sf libcjson.so.1 $(1)/usr/lib/libcjson.so
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libcjson.a $(1)/usr/lib/
 endef
 
 $(eval $(call BuildPackage,libcjson))

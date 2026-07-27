@@ -29,7 +29,7 @@ mt-c (произносится как *Мэджитрикл*, по назван�
 
 ## Установка
 
-Пакеты (`.ipk`) для Entware/Keenetic и OpenWrt собираются в GitHub Actions и публикуются на странице [Releases](https://github.com/dan0102dan/mt-c/releases). Скачайте `.ipk` под архитектуру роутера и установите:
+Пакеты для Entware/Keenetic и обеих актуальных веток OpenWrt собираются в GitHub Actions и публикуются на странице [Releases](https://github.com/dan0102dan/mt-c/releases). Скачайте пакет под версию OpenWrt и архитектуру роутера:
 
 **Entware/Keenetic:**
 ```shell
@@ -39,13 +39,17 @@ opkg install ./magitrickle_<версия>_entware_<архитектура>.ipk
 
 **OpenWrt (≤ 24.10, opkg):**
 ```shell
-opkg install ./magitrickle_<версия>_openwrt_<архитектура>.ipk
+opkg install ./magitrickle_<версия>_openwrt-24.10.4_<архитектура>.ipk
 service magitrickle start
 ```
 
-Обновление — тем же способом (скачать новую версию, установить, `restart` вместо `start`).
+**OpenWrt 25.12+ (apk):**
+```shell
+apk add --allow-untrusted ./magitrickle_<версия>_openwrt-25.12.5_<архитектура>.apk
+service magitrickle start
+```
 
-`.apk` (OpenWrt ≥ 25.12, apk) пока не собирается в CI — только через `make build && make package` из исходников (см. `CLAUDE.md`).
+Обновление — тем же способом (скачать новую версию, установить, `restart` вместо `start`). Пакеты `.ipk` и `.apk` собираются разными SDK (24.10 и 25.12 соответственно), поэтому формат нужно выбирать по версии установленной OpenWrt.
 
 ## Почему mt-c
 
