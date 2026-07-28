@@ -2624,3 +2624,246 @@ was trimmed to what the package actually resolves against: `base` and
 from `src-git-full` to a shallow `src-git` clone. That removes a
 full-history clone of openwrt.git per job, which is what made D-55 hold
 the matrix to six concurrent jobs; it now runs twelve.
+
+## D-57: Let the SDK state its own arch, and un-gate on that
+
+**Status: accepted.** Every OpenWrt arch here is reached through a
+hand-written package-arch-to-target/subtarget guess, and D-51/D-53/D-54
+established the two ways a guess goes wrong: it 404s, or it names a real
+target that builds a different architecture. Only the first was visible.
+The second produced `mipsel_24kc_24kf` as a big-endian binary (D-53),
+caught by luck — the readelf checks only cover `aarch64_*`, `mips_*`,
+`mipsel_*` and `x86_64`, so the same mistake on any other arch would
+have shipped silently.
+
+The SDK already answers the question authoritatively:
+`CONFIG_TARGET_ARCH_PACKAGES` in its own `.config` is the package arch
+it builds. Comparing that against the config's arch, immediately after
+extraction, covers every arch and fails in seconds instead of ten
+minutes. That check made the first real mismatch obvious by inspection:
+`mips64_mips64r2` and `mips64_octeonplus` were both mapped to
+`octeon/generic`, and one SDK cannot produce two package archs.
+
+With a wrong guess now either skipped (D-56's 404 handling) or rejected
+loudly, guessing became cheap enough to retry the archs D-51 left
+gated:
+
+- `mips64_mips64r2` → `malta/be64` and `mips64el_mips64r2` →
+  `malta/le64`. malta is OpenWrt's QEMU MIPS target and the only one
+  spanning all four word-size/endianness combinations, one per
+  subtarget. D-51's `loongson64/generic` guess for the little-endian
+  one 404'd.
+- `mipsel_mips32` → `bcm47xx/generic`. The same target's `mips74k`
+  subtarget already builds `mipsel_74kc` here, so the target is known
+  good and known little-endian; D-51 guessed `bcm63xx/generic` and
+  404'd.
+- `riscv64_generic` → `sifiveu/generic`. D-51 guessed
+  `riscv64/generic`, which is a package arch name, not a target name.
+
+`mipsel_24kc_24kf` stays gated. It is the one case where a wrong guess
+costs a whole job to reject rather than a 404 to skip, and no
+little-endian 24Kc-with-FPU target is known.
+
+A mismatch is reported and skipped rather than failed, for the same
+reason a 404 is: not shipping a package is the right outcome, and it is
+the mapping that is broken, not the build. This does cost coverage the
+matrix appeared to have. D-54 knowingly reused `ath79/generic` for
+`mips_4kec` and `mips_mips32` as a "best available" match, and ath79
+builds `mips_24kc` — so those two archs were publishing packages built
+with 24Kc flags under a 4KEc/mips32 name, exactly the illegal-
+instruction risk D-54 called out. They now report the mismatch and
+publish nothing until a real target is found. Three of this repo's
+mappings pointed a second arch at an SDK another arch already claimed
+(`mips_4kec`, `mips_mips32`, `mips64_mips64r2`); one SDK cannot produce
+two package archs, and nothing before this check could see that.
+
+## D-58: The guessed arch-to-target table was wrong 11 times out of 28
+
+**Status: accepted.** D-57's arch check made it safe to ask the release
+what it actually publishes, so D-58 asked. The `discover` job walks both
+release trees and reads `arch_packages` out of every subtarget's
+`profiles.json` — the field is the package arch that subtarget's SDK
+builds, so inverting it gives the table this workflow had been guessing
+since D-51.
+
+Eleven of the twenty-eight mapped archs were wrong, and not narrowly:
+
+| arch | guessed | actually builds | correct target |
+|---|---|---|---|
+| `arm_arm926ej-s` | `gemini/generic` | `arm_fa526` | `at91/sam9x` |
+| `arm_cortex-a7` | `mediatek/mt7623` | `arm_cortex-a7_neon-vfpv4` | `mediatek/mt7629` |
+| `arm_cortex-a7_vfpv4` | `realtek/rtl930x` | `mips_24kc` | `at91/sama7` |
+| `arm_cortex-a9` | `mvebu/cortexa9` | `arm_cortex-a9_vfpv3-d16` | `bcm53xx/generic` |
+| `arm_cortex-a9_neon` | `mvebu/cortexa9` | `arm_cortex-a9_vfpv3-d16` | `imx/cortexa9` |
+| `arm_cortex-a9_vfpv3-d16` | `bcm53xx/generic` | `arm_cortex-a9` | `mvebu/cortexa9` |
+| `arm_xscale` | `ixp4xx/generic` | `armeb_xscale` | `kirkwood/generic` |
+| `i386_pentium-mmx` | `x86/generic` | `i386_pentium4` | `x86/geode` |
+| `mips_4kec` | `ath79/generic` | `mips_24kc` | `realtek/rtl838x` |
+| `mips_mips32` | `ath79/generic` | `mips_24kc` | `bmips/bcm6368` |
+| `mips64_mips64r2` | `octeon/generic` | `mips64_octeonplus` | *(none)* |
+
+Three of them were shipping something categorically different from the
+name on the package: `arm_cortex-a7_vfpv4` was a MIPS binary, `arm_xscale`
+was big-endian ARM, and `arm_cortex-a9`/`arm_cortex-a9_vfpv3-d16` were
+each other's. The readelf checks could not see any of it — they only
+cover `aarch64_*`, `mips_*`, `mipsel_*` and `x86_64`, and every one of
+these is an `arm_*` or `i386_*` arch.
+
+D-57's own guesses scored 2 of 4: `mipsel_mips32` → `bcm47xx/generic`
+and `riscv64_generic` → `sifiveu/generic` were right; `malta` was not a
+lucky memory but a wrong one, since no release in either line publishes
+a malta target at all.
+
+Two archs differ between the release lines and are mapped to the release
+that has them, letting D-56's 404 handling skip the other:
+`mips_4kec` (`realtek/rtl838x`, 24.10 only) and `riscv64_generic`
+(`sifiveu/generic`, 25.12 only).
+
+`mipsel_24kc_24kf`, gated since D-53 for want of a candidate, is
+`pistachio/generic`. That leaves two archs with no mapping anywhere:
+`mips64_mips64r2` and `mips64el_mips64r2` are declared by no published
+subtarget in either release, so neither release SDK can build them.
+(They are built from snapshots instead — see D-60, which also corrects
+this entry's original claim that no router could install such a
+package.)
+
+## D-59: The arch check was a no-op, and two mislabeled packages shipped
+
+**Status: accepted.** D-57 added a check comparing the SDK's own
+`CONFIG_TARGET_ARCH_PACKAGES` against the arch the config is named for,
+and D-58 relied on it to handle archs that exist in only one release
+line. The first full run with both in place shows it never fired: the
+SDK's `.config` does not carry that symbol, `sdk_arch` came out empty,
+and `[ -n "$sdk_arch" ]` turned the mismatch test into a silent pass.
+
+Two packages in run 85 are wrong as a result:
+
+- `mips_4kec / 25.12.5` — `realtek/rtl838x` moved to `mips_24kc` in
+  25.12, so this is a `mips_24kc` binary in a package labeled
+  `mips_4kec`. It should have skipped.
+- `riscv64_generic / 24.10.4` — 24.10 calls the arch `riscv64_riscv64`
+  and renamed it to `riscv64_generic` only in 25.12. The binary is
+  right, but a 24.10 device's opkg looks for `riscv64_riscv64` and will
+  refuse a package labeled `riscv64_generic`.
+
+Both are exactly what the check was written to prevent, and both are
+per-release differences of the kind D-58 said it would delegate to it.
+
+The check now reads `staging_dir/target-<arch>_<libc>` when `.config`
+yields nothing — every SDK has that directory — normalizing its `+`
+separators to the `_` the package arch uses. It also prints the arch it
+found and which source it came from, and warns when neither source
+yields one instead of continuing quietly. No mapping changes are needed:
+with a working check, `mips_4kec` on 25.12 and `riscv64_generic` on
+24.10 skip on their own.
+
+The wider lesson is the one D-58 already paid for once: a check whose
+failure mode is silence is indistinguishable from a check that passes.
+Both of these had been reported here as protections that were working.
+
+### D-59a: the working check then rejected mips64_octeonplus
+
+The fix above did what it was meant to -- `mips_4kec / 25.12.5` and
+`riscv64_generic / 24.10.4` both skipped in run 87, the latter reporting
+`SDK sifiveu/generic builds package arch 'riscv64_riscv64', not
+'riscv64_generic'` after 83 seconds instead of building for ten minutes
+-- but it also cost two packages that had been building correctly.
+
+`staging_dir` spells the MIPS64 ABI into the path while the package arch
+omits it: octeon's directory is `target-mips64_octeonplus_64_musl`
+against a package arch of `mips64_octeonplus`, so stripping only the
+libc left `mips64_octeonplus_64` and the comparison failed. Dropping a
+bare `64` token instead is not an option -- it would eat the one in
+`x86_64` -- so the comparison accepts one trailing `_64`/`_32`/`_n32`
+when the value came from `staging_dir`, and nothing extra when it came
+from `.config`.
+
+Both the defect and its cause were visible only because the check now
+prints the arch it found and where it read it from. That line is the
+reason this took one run to diagnose rather than a bisect.
+
+## D-60: The last two archs come from snapshots, not from a static toolchain
+
+**Status: accepted.** D-58 said no router could install a package for
+`mips64_mips64r2` or `mips64el_mips64r2`. That conflated two separate
+things: no release publishes an SDK for those archs (true, and the
+reason nothing built them here), and no device accepts such a package
+(false). opkg installs a package whose `Architecture` matches what the
+device's own firmware was built for, and an image built from source for
+one of those archs lists exactly that in its arch list. The audience is
+people running self-built images — which is precisely who the Go-era
+packages for these archs served.
+
+That made the next question worth asking before reaching for a
+static-musl toolchain and building the five dependencies from source:
+does an SDK for them exist somewhere other than the release lines? It
+does. Snapshots build far more targets than releases, and the discovery
+job — extended to walk `/snapshots/targets` alongside both release
+trees — found both:
+
+| arch | 24.10.4 | 25.12.5 | snapshot |
+|---|---|---|---|
+| `mips64_mips64r2` | — | — | `malta/be64` |
+| `mips64el_mips64r2` | — | — | `malta/le64` |
+
+D-57's original guess of `malta/be64` and `malta/le64` was therefore
+right about the target and wrong only about the tree: malta is alive,
+just not published in any release line.
+
+These two archs build from the snapshot SDK and produce `.apk`, since
+snapshots follow the apk line. The matrix gives them a single snapshot
+job each rather than two release jobs that would only 404
+(`SNAPSHOT_ONLY_ARCHS`). The snapshot URL carries no version and cannot
+be pinned, so these packages move with the tree — acceptable here, since
+no release firmware has these archs to install them onto in the first
+place.
+
+The same run settled the other two per-release cases, which look alike
+and are not:
+
+`mips_4kec` is absent from 25.12 *and* from snapshots. It is genuinely
+retired: `realtek/rtl838x` declared it in 24.10 and builds `mips_24kc`
+in 25.12, so the devices that used it are served by the `mips_24kc`
+package this workflow already builds. Nothing is missing, and forcing a
+`mips_4kec` build on 25.12 would produce a copy of that package under a
+name no opkg will ever ask for — the mislabeling D-59 fixed.
+
+`riscv64_generic` is present in snapshots, confirming that 24.10's
+`riscv64_riscv64` is a rename rather than an absence — but a rename with
+consequences. 24.10's riscv64 devices (`d1`, `sifiveu`, `starfive`) ask
+opkg for `riscv64_riscv64`, and no config carried that name, so they had
+no package at all. `config/openwrt/riscv64_riscv64.config` closes that
+gap: both names map to `sifiveu/generic`, and the arch check skips
+whichever name the release line does not use.
+
+## D-61: A skipped job is a failure unless the absence is a known one
+
+**Status: accepted.** Every way of not producing a package used to end
+in `exit 0` with `sdk_available=false`: an unmapped config, a 404 on the
+SDK, an arch mismatch, an arch that could not be determined at all. The
+job went green and the run went green, so a package missing from a
+release looked exactly like a package that was never meant to exist.
+That is how D-58's eleven wrong mappings stayed invisible for as long as
+they did, and it is the wrong default for a workflow whose output is
+release assets.
+
+Only three absences are legitimate, and they are now named explicitly:
+
+| arch | line | why |
+|---|---|---|
+| `mips_4kec` | 25.12 | retired; `realtek/rtl838x` builds `mips_24kc` there, and those devices are served by that package |
+| `riscv64_generic` | 24.10 | the arch is called `riscv64_riscv64` on that line |
+| `riscv64_riscv64` | 25.12 | the arch is called `riscv64_generic` on that line |
+
+Those three report a notice and skip. Everything else now fails the job:
+a 404 for an arch that is not a known absence, an arch mismatch outside
+that list, an undeterminable arch (shipping unverified is the D-59
+failure), and a config with no mapping at all -- every config in
+`config/` has one, so hitting the default case means a config was added
+without it.
+
+This also answers the release question that prompted it: with skips
+loud, a run that stays green has produced every package it was supposed
+to, and a missing arch cannot reach a release quietly. The expected
+asset count is 68 -- 7 Entware, 59 from the release lines, 2 from
+snapshots -- against 71 jobs and the three absences above.

@@ -25,6 +25,109 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which OpenWrt target/subtarget builds a given package architecture is
+  # not guessable -- D-51/D-53/D-54 guessed it 4 times wrong out of 32 --
+  # but every release states it: each subtarget publishes a profiles.json
+  # whose arch_packages field is exactly the package arch its SDK builds.
+  # This job inverts that into the arch -> target/subtarget table the
+  # build job's case statement needs, and writes it to the run summary.
+  # It is advisory: it never gates the matrix, so a layout change or a
+  # slow mirror costs a missing report, not a failed run. Mappings are
+  # still applied by hand, from data instead of from memory.
+  discover:
+    name: Discover OpenWrt arch mappings
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve package arch for every published subtarget
+        env:
+          # "snapshot" is not a release: it builds far more targets than
+          # the release lines do, so it is the place to look for an arch
+          # no release publishes (D-60). Its packages suit self-built
+          # images rather than stock release firmware, since the tree
+          # moves and the SDK URL cannot be pinned.
+          OPENWRT_VERSIONS: 24.10.4 25.12.5 snapshot
+        run: |
+          set -eu
+
+          resolve_base() {
+            case "$1" in
+              snapshot) echo "https://downloads.openwrt.org/snapshots/targets" ;;
+              *) echo "https://downloads.openwrt.org/releases/$1/targets" ;;
+            esac
+          }
+
+          # Apache-style index: one <a href="name/"> per child directory.
+          list_dirs() {
+            curl --retry 3 --retry-delay 5 --connect-timeout 30 -sSL "$1/" |
+              sed -nE 's/.*href="([A-Za-z0-9._+-]+)\/".*/\1/p' |
+              grep -vx '\.\.' | sort -u
+          }
+
+          for version in $OPENWRT_VERSIONS; do
+            base=$(resolve_base "$version")
+            targets=$(list_dirs "$base" || true)
+            if [ -z "$targets" ]; then
+              echo "::warning::No target index for OpenWrt ${version} at ${base}/"
+              continue
+            fi
+            for target in $targets; do
+              for subtarget in $(list_dirs "$base/$target" || true); do
+                printf '%s %s %s %s\n' "$version" "$base" "$target" "$subtarget"
+              done
+            done
+          done > subtargets.txt
+          echo "Subtargets to probe: $(wc -l < subtargets.txt)"
+
+          fetch_arch() {
+            url="$2/$3/$4/profiles.json"
+            arch=$(
+              curl --retry 3 --retry-delay 5 --connect-timeout 30 -sSL "$url" |
+                grep -oE '"arch_packages"[[:space:]]*:[[:space:]]*"[^"]+"' |
+                head -n1 |
+                sed -E 's/.*"([^"]+)"$/\1/'
+            )
+            if [ -n "$arch" ]; then
+              printf '%s\t%s\t%s/%s\n' "$1" "$arch" "$3" "$4"
+            fi
+          }
+          export -f fetch_arch
+
+          # ~150 subtargets per release and more in snapshots, so probe
+          # them in parallel.
+          xargs -a subtargets.txt -P 8 -n 4 \
+            bash -c 'fetch_arch "$0" "$1" "$2" "$3"' > mappings.txt || true
+          sort -o mappings.txt mappings.txt
+          echo "Resolved mappings: $(wc -l < mappings.txt)"
+
+          {
+            echo "## OpenWrt package arch -> target/subtarget"
+            echo
+            echo "Authoritative, from each subtarget's own profiles.json."
+            echo
+            echo "| arch | release | target/subtarget |"
+            echo "|---|---|---|"
+            while IFS="$(printf '\t')" read -r version arch path; do
+              printf '| `%s` | %s | `%s` |\n' "$arch" "$version" "$path"
+            done < mappings.txt
+            echo
+            echo "### Architectures this repo has a config for"
+            echo
+            echo "| arch | 24.10.4 | 25.12.5 | snapshot |"
+            echo "|---|---|---|---|"
+            for cfg in config/openwrt/*.config; do
+              arch=$(basename "$cfg" .config)
+              old=$(awk -F'\t' -v a="$arch" '$1 ~ /^24\./ && $2 == a { printf "%s ", $3 }' mappings.txt)
+              new=$(awk -F'\t' -v a="$arch" '$1 ~ /^25\./ && $2 == a { printf "%s ", $3 }' mappings.txt)
+              snap=$(awk -F'\t' -v a="$arch" '$1 == "snapshot" && $2 == a { printf "%s ", $3 }' mappings.txt)
+              printf '| `%s` | %s | %s | %s |\n' "$arch" \
+                "${old:-**none**}" "${new:-**none**}" "${snap:-**none**}"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   prepare:
     name: Prepare build matrix
     runs-on: ubuntu-latest
@@ -41,6 +144,8 @@ jobs:
           import json
           from pathlib import Path
 
+          SNAPSHOT_ONLY_ARCHS = {"mips64_mips64r2", "mips64el_mips64r2"}
+
           configs = sorted(Path("config").glob("*/*.config"))
 
           if not configs:
@@ -56,10 +161,15 @@ jobs:
                   "package_ext": "ipk",
               }
               if config.parent.name == "openwrt":
-                  for version, package_ext in (
-                      ("24.10.4", "ipk"),
-                      ("25.12.5", "apk"),
-                  ):
+                  # No release line publishes a target for these, but
+                  # snapshots build malta, which does declare them
+                  # (D-60). Build them from there instead of twice
+                  # against release SDKs that 404.
+                  if config.stem in SNAPSHOT_ONLY_ARCHS:
+                      versions = (("snapshot", "apk"),)
+                  else:
+                      versions = (("24.10.4", "ipk"), ("25.12.5", "apk"))
+                  for version, package_ext in versions:
                       matrix.append({
                           **item,
                           "label": f"{config.stem} / OpenWrt {version}",
@@ -114,42 +224,19 @@ jobs:
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "entware_config=$TARGET" >> "$GITHUB_OUTPUT"
               ;;
-            # Well-known, stable target/subtarget for each package arch below
-            # (source: downloads.openwrt.org's own release layout for
-            # OPENWRT_VERSION). x86_64/mips_24kc/mipsel_24kc were verified
-            # via real CI (D-50); the rest below are best-effort mappings
-            # (D-51) from general OpenWrt hardware-target knowledge, not
-            # individually verified against a live feed/SDK index from this
-            # sandbox (proxy blocks downloads.openwrt.org) -- expect some to
-            # 404 or fail on first real CI run and need correction, exactly
-            # like D-50's aarch64_generic did. Package archs judged too
-            # ambiguous to guess with any confidence are left in the
-            # default gated case below rather than pick blindly.
-            openwrt/x86_64)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=64" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/mips_24kc)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=ath79" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/mipsel_24kc)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=ramips" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=mt7621" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/i386_pentium-mmx | openwrt/i386_pentium4)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/loongarch64_generic)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=loongarch64" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
+            # Package arch -> target/subtarget, taken from each
+            # subtarget's own profiles.json rather than guessed: the
+            # `discover` job above rebuilds this table from the release
+            # index on every run and prints it to the run summary. Re-read
+            # it before editing anything here. Guessing had produced 11
+            # wrong entries out of 28 (D-58), several of them not merely
+            # suboptimal but a different CPU family entirely.
+            #
+            # Two archs differ between the two releases and are mapped to
+            # the release that has them; the other release answers 404 on
+            # its SDK and the job skips with a warning:
+            #   mips_4kec        realtek/rtl838x  24.10 only
+            #   riscv64_generic  sifiveu/generic  25.12 only
             openwrt/aarch64_cortex-a53)
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
@@ -160,67 +247,29 @@ jobs:
               echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=bcm2711" >> "$GITHUB_OUTPUT"
               ;;
-            openwrt/arm_arm1176jzf-s_vfp)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=bcm2708" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_cortex-a15_neon-vfpv4)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=ipq806x" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_cortex-a9 | openwrt/arm_cortex-a9_neon)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=mvebu" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=cortexa9" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_xscale)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=ixp4xx" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_cortex-a7)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=mediatek" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=mt7623" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_cortex-a7_neon-vfpv4)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=sunxi" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=cortexa7" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_cortex-a9_vfpv3-d16)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=bcm53xx" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/mips64_octeonplus)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=octeon" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/mipsel_74kc)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=bcm47xx" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=mips74k" >> "$GITHUB_OUTPUT"
-              ;;
-            # D-53: second pass over the archs D-51 left gated as "too
-            # ambiguous" -- reconsidered with less conservatism per
-            # explicit user request. Real candidates found for 7 of the
-            # remaining 8 (see decisions.md D-53 for the per-arch
-            # reasoning); still no arm_* byte-order check in this step
-            # to worry about (only aarch64_*/mips_*/mipsel_*/x86_64 are
-            # checked below), so these carry no verification-time risk
-            # beyond "does the SDK download exist".
             openwrt/aarch64_cortex-a76)
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=bcm2712" >> "$GITHUB_OUTPUT"
               ;;
+            openwrt/aarch64_generic)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=armsr" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=armv8" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_arm1176jzf-s_vfp)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm27xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm2708" >> "$GITHUB_OUTPUT"
+              ;;
             openwrt/arm_arm926ej-s)
               echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=gemini" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=at91" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=sam9x" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a15_neon-vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ipq806x" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
               ;;
             openwrt/arm_cortex-a5_vfpv4)
@@ -228,72 +277,140 @@ jobs:
               echo "openwrt_target=at91" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=sama5" >> "$GITHUB_OUTPUT"
               ;;
+            openwrt/arm_cortex-a7)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=mediatek" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mt7629" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a7_neon-vfpv4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=sunxi" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa7" >> "$GITHUB_OUTPUT"
+              ;;
             openwrt/arm_cortex-a7_vfpv4)
               echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=realtek" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=rtl930x" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/mips64_mips64r2)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=octeon" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
-              ;;
-            openwrt/arm_fa526)
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=gemini" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=at91" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=sama7" >> "$GITHUB_OUTPUT"
               ;;
             openwrt/arm_cortex-a8_vfpv3)
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "openwrt_target=sunxi" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=cortexa8" >> "$GITHUB_OUTPUT"
               ;;
-            # D-54: retried aarch64_generic (D-50's one confirmed 404,
-            # armvirt/64) under the theory that OpenWrt renamed its
-            # generic/QEMU-class aarch64 target from "armvirt" to "armsr"
-            # (subtarget "armv8") at some point -- if that rename memory
-            # is right this fixes the 404; if wrong it just 404s again
-            # and reverts to gated same as before, no worse off either way.
-            openwrt/aarch64_generic)
+            openwrt/arm_cortex-a9)
               echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "openwrt_target=armsr" >> "$GITHUB_OUTPUT"
-              echo "openwrt_subtarget=armv8" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm53xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
               ;;
-            # mips_4kec/mips_mips32 (no "el") need a genuinely BIG-endian
-            # MIPS target per this step's own later `mips_*` byte-order
-            # assertion -- ramips/bcm47xx (the only other MIPS32 cores
-            # that came to mind) are little-endian, and no OpenWrt target
-            # for the older 4KEc-class AR71xx generation or a plain
-            # generic big-endian mips32 baseline came to mind either.
-            # Rather than leave these flatly gated, reuse ath79/generic
-            # (the one target confirmed big-endian in this project's own
-            # CI, via mips_24kc) on the theory that it at least produces
-            # a byte-order-correct, linkable binary -- caveat: ath79's
-            # actual -march default may assume 24Kc/74Kc-specific
-            # instruction extensions genuine 4KEc-class or plain-mips32
-            # hardware lacks, so this is a "best available" reuse, not a
-            # confirmed-correct match; if it fails or produces a broken
-            # binary on real hardware, revert to gated.
-            openwrt/mips_4kec | openwrt/mips_mips32)
+            openwrt/arm_cortex-a9_neon)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=imx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa9" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_cortex-a9_vfpv3-d16)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=mvebu" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=cortexa9" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_fa526)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=gemini" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/arm_xscale)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=kirkwood" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/i386_pentium-mmx)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=geode" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/i386_pentium4)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/loongarch64_generic)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=loongarch64" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips64_octeonplus)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=octeon" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips_24kc)
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "openwrt_target=ath79" >> "$GITHUB_OUTPUT"
               echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
               ;;
-            # riscv64_generic (riscv64/generic), mips64el_mips64r2
-            # (loongson64/generic), and mipsel_mips32 (bcm63xx/generic)
-            # were tried in D-51 and all three 404'd on their sha256sums
-            # lookup for OPENWRT_VERSION=24.10.1 (confirmed via real CI)
-            # -- reverted to gated rather than guess again blindly.
-            # mipsel_24kc_24kf (D-53) was tried as lantiq/xrx200: SDK
-            # downloaded and built fine, but the resulting binary is
-            # BIG-endian MIPS (confirmed via real CI's own readelf
-            # check) -- lantiq's whole MIPS lineup is apparently
-            # big-endian, contradicting the "mipsel_" package arch name.
-            # No better little-endian 24Kc+FPU candidate came to mind,
-            # so reverted to gated rather than guess again.
+            openwrt/mips_4kec)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=realtek" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=rtl838x" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips_mips32)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bmips" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=bcm6368" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_24kc)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=ramips" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mt7621" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_24kc_24kf)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=pistachio" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_74kc)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm47xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=mips74k" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mipsel_mips32)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=bcm47xx" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            # 24.10 calls this arch riscv64_riscv64 and 25.12 renamed it
+            # to riscv64_generic, so both names map to the same target
+            # and each is skipped on the line that does not use its name.
+            # Without the older name, 24.10 riscv64 devices get no
+            # package at all -- the rename is not cosmetic (D-60).
+            openwrt/riscv64_generic | openwrt/riscv64_riscv64)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=sifiveu" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=generic" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/x86_64)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=x86" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=64" >> "$GITHUB_OUTPUT"
+              ;;
+            # Snapshot-only, per SNAPSHOT_ONLY_ARCHS in the matrix above:
+            # no release line publishes a target declaring these, but
+            # snapshots build malta, which does (D-60).
+            openwrt/mips64_mips64r2)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=malta" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=be64" >> "$GITHUB_OUTPUT"
+              ;;
+            openwrt/mips64el_mips64r2)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "openwrt_target=malta" >> "$GITHUB_OUTPUT"
+              echo "openwrt_subtarget=le64" >> "$GITHUB_OUTPUT"
+              ;;
+            # Every config in config/ is mapped above, so reaching this
+            # means a config was added without one. That is a mistake to
+            # report, not a package to silently drop (D-61).
             *)
-              echo "::notice title=${{ matrix.name }}::Packaging for this target is not yet automated in CI: no real Entware/OpenWrt cross-toolchain + feed sysroot is provisioned for PLATFORM=$PLATFORM TARGET=$TARGET. See docs/c-rewrite/toolchains.md and decisions.md D-45. Skipping this job's build step."
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "No target/subtarget mapping for PLATFORM=$PLATFORM TARGET=$TARGET, so no package can be built for it. Add one to the case above -- the 'Discover OpenWrt arch mappings' job summary lists which target builds which package arch." >&2
+              exit 1
               ;;
           esac
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
@@ -394,7 +511,32 @@ jobs:
           version="${{ steps.toolchain.outputs.openwrt_version }}"
           target="${{ steps.toolchain.outputs.openwrt_target }}"
           subtarget="${{ steps.toolchain.outputs.openwrt_subtarget }}"
-          base_url="https://downloads.openwrt.org/releases/${version}/targets/${target}/${subtarget}"
+          # Snapshots are not a release: they live outside releases/ and
+          # carry no version in the path. The tree moves, so the SDK URL
+          # cannot be pinned -- acceptable for the archs only built there,
+          # whose users are running self-built images anyway (D-60).
+          # The only architectures a release line legitimately lacks, with
+          # the reason it lacks them. Every other way of not producing a
+          # package -- a 404, an arch mismatch, an arch that cannot be
+          # determined -- is a defect, and failing loudly is the point:
+          # a silent skip is a package quietly missing from a release
+          # while the run stays green (D-61).
+          expected_absent=false
+          case "${{ matrix.name }}/${version}" in
+            # rtl838x declared mips_4kec in 24.10 and builds mips_24kc in
+            # 25.12; the arch is retired and its devices are served by the
+            # mips_24kc package.
+            mips_4kec/25.12.5) expected_absent=true ;;
+            # The same arch is riscv64_riscv64 in 24.10 and riscv64_generic
+            # in 25.12, so each name is absent from the other line.
+            riscv64_generic/24.10.4 | riscv64_riscv64/25.12.5) expected_absent=true ;;
+          esac
+
+          if [ "$version" = snapshot ]; then
+            base_url="https://downloads.openwrt.org/snapshots/targets/${target}/${subtarget}"
+          else
+            base_url="https://downloads.openwrt.org/releases/${version}/targets/${target}/${subtarget}"
+          fi
 
           sdk_root="${RUNNER_TEMP}/openwrt-sdk-${{ matrix.name }}"
           mkdir -p "$sdk_root"
@@ -416,7 +558,11 @@ jobs:
           )
           echo "GET ${base_url}/sha256sums -> $http_code" >> "$log_dir/download.log"
           if [ "$http_code" = 404 ]; then
-            echo "::warning title=${{ matrix.name }}::OpenWrt ${version} publishes no SDK for ${target}/${subtarget}, so no package is built for this arch on this release. Update the arch-to-target mapping in build.yml if the target was renamed."
+            if [ "$expected_absent" != true ]; then
+              echo "OpenWrt ${version} publishes no SDK for ${target}/${subtarget} (HTTP 404), so no package would be built for ${{ matrix.name }}. This arch is not one of the known per-release absences, so the mapping is wrong or the target was renamed -- see the 'Discover OpenWrt arch mappings' job summary." >&2
+              exit 1
+            fi
+            echo "::notice title=${{ matrix.name }}::OpenWrt ${version} publishes no SDK for ${target}/${subtarget}. This arch is a known absence on this release line, so no package is built for it here."
             echo "sdk_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -452,6 +598,67 @@ jobs:
             exit 1
           fi
           echo "sdk_dir=$sdk_dir" >> "$GITHUB_OUTPUT"
+
+          # Every arch is reached through a hand-written target/subtarget
+          # guess, and a wrong guess that happens to hit a real SDK
+          # builds a perfectly good package for the wrong architecture.
+          # The SDK states which package arch it produces, so compare
+          # that against the arch this config is named for, right after
+          # extraction rather than ten minutes into the build. This
+          # covers every arch, unlike the per-arch readelf checks later,
+          # which only know about aarch64/mips/mipsel/x86_64.
+          #
+          # Treated as "no SDK for this arch" rather than a hard failure,
+          # for the same reason as the 404 above: not shipping a package
+          # is the correct outcome, and it is the mapping that needs
+          # fixing, not the build.
+          # Read from .config when it carries the symbol, and otherwise
+          # from staging_dir/target-<arch>_<libc>, which every SDK has.
+          # Relying on .config alone made this check a no-op: it found
+          # nothing, the empty value was treated as "unverified", and two
+          # mislabeled packages shipped (D-59). An arch that cannot be
+          # determined at all is now said out loud rather than passed.
+          sdk_arch=$(
+            sed -nE 's/^CONFIG_TARGET_ARCH_PACKAGES="(.*)"$/\1/p' "$sdk_dir/.config" 2>/dev/null |
+              head -n1
+          )
+          sdk_arch_source=".config"
+          if [ -z "$sdk_arch" ]; then
+            sdk_arch=$(
+              find "$sdk_dir/staging_dir" -mindepth 1 -maxdepth 1 -type d -name 'target-*' \
+                -printf '%f\n' 2>/dev/null |
+                head -n1 |
+                sed -E 's/^target-(.*)_(musl|glibc|uclibc)([_-].*)?$/\1/' |
+                tr '+' '_'
+            )
+            sdk_arch_source="staging_dir"
+          fi
+          if [ -z "$sdk_arch" ]; then
+            echo "Could not determine which package arch SDK ${target}/${subtarget} builds -- neither .config nor staging_dir/target-* yielded one. Shipping an unverified package is exactly the failure D-59 was about, so this stops here." >&2
+            exit 1
+          else
+            echo "SDK ${target}/${subtarget} builds package arch '$sdk_arch' (from $sdk_arch_source)"
+          fi
+          # staging_dir carries the MIPS64 ABI in the path but the package
+          # arch does not -- octeon's is target-mips64_octeonplus_64_musl
+          # against a package arch of mips64_octeonplus -- so accept one
+          # trailing ABI token from that source. Dropping a bare "64"
+          # token instead would eat the one in x86_64.
+          arch_matches=false
+          case "$sdk_arch" in
+            "${{ matrix.name }}") arch_matches=true ;;
+            "${{ matrix.name }}_64" | "${{ matrix.name }}_32" | "${{ matrix.name }}_n32")
+              [ "$sdk_arch_source" = staging_dir ] && arch_matches=true ;;
+          esac
+          if [ "$arch_matches" != true ]; then
+            if [ "$expected_absent" != true ]; then
+              echo "SDK ${target}/${subtarget} builds package arch '$sdk_arch', not '${{ matrix.name }}'. This arch is not one of the known per-release absences, so the mapping is wrong -- see the 'Discover OpenWrt arch mappings' job summary for what builds what." >&2
+              exit 1
+            fi
+            echo "::notice title=${{ matrix.name }}::SDK ${target}/${subtarget} builds '$sdk_arch' on OpenWrt ${version}, which is the known absence of '${{ matrix.name }}' on this release line, so no package is built for it here."
+            echo "sdk_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           pkg_dir="$sdk_dir/package/net/magitrickle"
           mkdir -p "$pkg_dir"
