@@ -697,8 +697,9 @@ int main(int argc, char **argv)
             mt_config_clear(&cfg);
             return 1;
         }
-        d.port_remap = mt_port_remap_new("DNSOR", 53, cfg.app.dns_proxy.host.port,
-                                         addrs, n_addrs, d.ipt4, d.ipt6);
+        d.port_remap =
+            mt_port_remap_new(cfg.app.netfilter.iptables.chain_prefix, 53,
+                              cfg.app.dns_proxy.host.port, addrs, n_addrs, d.ipt4, d.ipt6);
         free(addrs);
         if (d.port_remap == NULL) {
             MT_ERROR("failed to override DNS: out of memory");

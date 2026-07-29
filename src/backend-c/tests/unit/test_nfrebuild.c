@@ -58,7 +58,8 @@ static void fixture_up(fixture_t *fx) {
     mt_app_deps_t deps = {.cfg = &fx->cfg, .cache = fx->cache, .ipt4 = fx->ipt};
     fx->app = mt_app_create(&deps);
 
-    fx->remap = mt_port_remap_new("MT_DNSOR", 53, 3553, NULL, 0, fx->ipt, NULL);
+    fx->remap = mt_port_remap_new(fx->cfg.app.netfilter.iptables.chain_prefix, 53, 3553, NULL, 0,
+                                  fx->ipt, NULL);
     mt_port_remap_enable(fx->remap);
     mt_app_set_port_remap(fx->app, fx->remap);
 }
@@ -234,6 +235,24 @@ TEST force_commit_without_a_committer_commits_in_place(void) {
     PASS();
 }
 
+TEST port_remap_uses_the_configured_chain_prefix(void) {
+    mt_fake_ipt_t *fake = mt_fake_ipt_new(MT_IPT_PROTO_IPV4);
+    mt_ipt_t *ipt = mt_ipt_new(mt_fake_ipt_as_executable(fake));
+    mt_netfilter_register_base_chains(ipt, NULL);
+
+    mt_port_remap_t *remap = mt_port_remap_new("XX_", 53, 3553, NULL, 0, ipt, NULL);
+    ASSERT(remap != NULL);
+    ASSERT_EQ(MT_OK, mt_port_remap_enable(remap));
+    ASSERT(mt_fake_ipt_chain_exists(fake, "nat", "XX_DNSOR"));
+    static const char *const jump[] = {"-j", "XX_DNSOR"};
+    ASSERT(chain_has_rule(fake, "nat", "PREROUTING", jump, 2));
+
+    ASSERT_EQ(MT_OK, mt_port_remap_disable(remap));
+    mt_port_remap_free(remap);
+    mt_ipt_free(ipt);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -244,5 +263,6 @@ int main(int argc, char **argv) {
     RUN_TEST(rebuild_keeps_other_writers_rules);
     RUN_TEST(rebuild_aborts_on_a_raised_cancel);
     RUN_TEST(force_commit_without_a_committer_commits_in_place);
+    RUN_TEST(port_remap_uses_the_configured_chain_prefix);
     GREATEST_MAIN_END();
 }

@@ -18,10 +18,11 @@ typedef struct mt_remap_addr {
 
 typedef struct mt_port_remap mt_port_remap_t;
 
-/* ipt4/ipt6 borrowed, nullable; must already have "nat"/PREROUTING
- * registered as a patch chain by the caller (see start.go's ordering).
- * addrs is deep-copied. */
-mt_port_remap_t *mt_port_remap_new(const char *chain_name, uint16_t from, uint16_t to,
+/* The owned chain name is always "<chain_prefix>DNSOR", preserving the
+ * configured netfilter naming contract. ipt4/ipt6 are borrowed, nullable;
+ * they must already have "nat"/PREROUTING registered as a patch chain by
+ * the caller (see start.go's ordering). addrs is deep-copied. */
+mt_port_remap_t *mt_port_remap_new(const char *chain_prefix, uint16_t from, uint16_t to,
                                    const mt_remap_addr_t *addrs, size_t n_addrs, mt_ipt_t *ipt4,
                                    mt_ipt_t *ipt6);
 void mt_port_remap_free(mt_port_remap_t *p);

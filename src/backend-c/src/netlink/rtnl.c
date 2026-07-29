@@ -1,5 +1,6 @@
 /* See rtnl.h. */
 #include "magitrickle/rtnl.h"
+#include "magitrickle/nlattr_iter.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -287,12 +288,10 @@ static void gw_msg_cb(const struct nlmsghdr *h, void *ud) {
     uint8_t gw[16] = {0};
     uint8_t gwlen = 0;
 
-    struct nlattr *attr;
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(attr, h, sizeof(struct rtmsg))
-    #pragma GCC diagnostic pop
-    {
+    mt_nlattr_iter_t attr_it;
+    const struct nlattr *attr;
+    if (!mt_nlattr_iter_init_nlmsg(&attr_it, h, sizeof(struct rtmsg))) { return; }
+    while (mt_nlattr_iter_next(&attr_it, &attr)) {
         switch (mnl_attr_get_type(attr)) {
         case RTA_OIF:
             if (mnl_attr_get_payload_len(attr) == 4) {
@@ -387,12 +386,10 @@ static void rule_scan_cb(const struct nlmsghdr *h, void *ud) {
     const struct fib_rule_hdr *frh = mnl_nlmsg_get_payload(h);
     used_set_add(&ctx->tables, frh->table);
 
-    struct nlattr *attr;
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(attr, h, sizeof(struct fib_rule_hdr))
-    #pragma GCC diagnostic pop
-    {
+    mt_nlattr_iter_t attr_it;
+    const struct nlattr *attr;
+    if (!mt_nlattr_iter_init_nlmsg(&attr_it, h, sizeof(struct fib_rule_hdr))) { return; }
+    while (mt_nlattr_iter_next(&attr_it, &attr)) {
         uint16_t type = mnl_attr_get_type(attr);
         if (type == FRA_FWMARK && mnl_attr_get_payload_len(attr) == 4) {
             used_set_add(&ctx->marks, *(const uint32_t *)mnl_attr_get_payload(attr));
@@ -408,12 +405,10 @@ static void route_scan_cb(const struct nlmsghdr *h, void *ud) {
     const struct rtmsg *rtm = mnl_nlmsg_get_payload(h);
     used_set_add(&ctx->tables, rtm->rtm_table);
 
-    struct nlattr *attr;
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(attr, h, sizeof(struct rtmsg))
-    #pragma GCC diagnostic pop
-    {
+    mt_nlattr_iter_t attr_it;
+    const struct nlattr *attr;
+    if (!mt_nlattr_iter_init_nlmsg(&attr_it, h, sizeof(struct rtmsg))) { return; }
+    while (mt_nlattr_iter_next(&attr_it, &attr)) {
         if (mnl_attr_get_type(attr) == RTA_TABLE && mnl_attr_get_payload_len(attr) == 4) {
             used_set_add(&ctx->tables, *(const uint32_t *)mnl_attr_get_payload(attr));
         }

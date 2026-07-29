@@ -3018,3 +3018,42 @@ That preserves its documented invariant under concurrency: the fd is
 readable whenever the atomic flag is raised. Condition-variable
 initialization no longer destroys an uninitialized attribute object on
 its rare failure path.
+
+## D-65: Do not put diagnostic pragmas between libmnl loop macros and their bodies
+
+**Status: accepted after live Entware validation.** An on-device comparison
+against the original Go daemon on `mipsel-3.4_kn` found three failures that
+had appeared unrelated:
+
+- all 14 enabled groups reused the first fwmark/table instead of allocating
+  distinct values;
+- a ruleset sync read every existing IPv4/IPv6 ipset member as an all-zero
+  address, so obsolete members were not deleted;
+- link-up notifications could not recover the interface name and therefore
+  did not dispatch.
+
+The common cause was the placement of `#pragma GCC diagnostic pop` between
+`mnl_attr_for_each*()` and its following compound statement. The pragmas
+were intended only to suppress the macro's pointer-difference-to-int
+`-Wconversion`, and host GCC 13 executed the loops normally. The Entware
+GCC 8.4 MIPS binary instead contained an empty loop over every valid
+attribute and ran the apparent body only after `mnl_attr_ok()` had failed.
+Disassembly and a live netlink trace both confirmed that control flow.
+
+The production code no longer uses libmnl's iteration macros.
+`nlattr_iter.c` walks aligned attributes with `size_t` lengths and explicit
+structural validation; the ipset parser, rtnetlink gateway and mark/table
+scanners, and link watcher all share it. This is a platform-independent
+fix: those sources are compiled for every Entware and OpenWrt target, not
+only `_kn`.
+
+`test_nlattr_iter.c` covers complete top-level and nested traversal plus
+truncation. `test_ipset_nl_parser.c` now also uses the address-attribute
+shape observed in the kernel LIST reply (no `NLA_F_NET_BYTEORDER`) and
+checks multiple entries in one dump. The real router remains the final
+verification for allocator, sync deletion, and link reconnect behavior.
+
+The same audit found that main constructed the port-remap chain as literal
+`DNSOR`, bypassing the frozen `<ChainPrefix>DNSOR` contract. Port remap now
+accepts the configured prefix and owns the concatenation; a custom-prefix
+unit test prevents default-only coverage from hiding this again.

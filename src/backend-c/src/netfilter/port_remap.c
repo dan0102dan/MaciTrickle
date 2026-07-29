@@ -16,16 +16,27 @@ struct mt_port_remap {
     bool enabled;
 };
 
-mt_port_remap_t *mt_port_remap_new(const char *chain_name, uint16_t from, uint16_t to,
+mt_port_remap_t *mt_port_remap_new(const char *chain_prefix, uint16_t from, uint16_t to,
                                    const mt_remap_addr_t *addrs, size_t n_addrs, mt_ipt_t *ipt4,
                                    mt_ipt_t *ipt6) {
+    if (!chain_prefix) { return NULL; }
     mt_port_remap_t *p = calloc(1, sizeof(*p));
     if (!p) { return NULL; }
-    p->chain_name = strdup(chain_name);
+
+    static const char suffix[] = "DNSOR";
+    size_t prefix_len = strlen(chain_prefix);
+    if (prefix_len > SIZE_MAX - sizeof(suffix)) {
+        free(p);
+        return NULL;
+    }
+    p->chain_name = malloc(prefix_len + sizeof(suffix));
     if (!p->chain_name) {
         free(p);
         return NULL;
     }
+    memcpy(p->chain_name, chain_prefix, prefix_len);
+    memcpy(p->chain_name + prefix_len, suffix, sizeof(suffix));
+
     if (n_addrs > 0) {
         p->addrs = calloc(n_addrs, sizeof(*p->addrs));
         if (!p->addrs) {

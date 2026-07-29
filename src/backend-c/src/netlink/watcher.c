@@ -1,6 +1,7 @@
 /* See netlink_watcher.h. */
 #include "magitrickle/netlink_watcher.h"
 #include "magitrickle/log.h"
+#include "magitrickle/nlattr_iter.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -32,12 +33,10 @@ static void handle_link_msg(mt_nl_watcher_t *w, const struct nlmsghdr *h) {
     if (!up) { return; /* matches Go: linkAttrs.Flags&net.FlagUp == 0 -> no dispatch */ }
 
     char name[IFNAMSIZ] = {0};
-    struct nlattr *attr;
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(attr, h, sizeof(struct ifinfomsg))
-    #pragma GCC diagnostic pop
-    {
+    mt_nlattr_iter_t attr_it;
+    const struct nlattr *attr;
+    if (!mt_nlattr_iter_init_nlmsg(&attr_it, h, sizeof(struct ifinfomsg))) { return; }
+    while (mt_nlattr_iter_next(&attr_it, &attr)) {
         if (mnl_attr_get_type(attr) == IFLA_IFNAME) {
             const char *v = mnl_attr_get_str(attr);
             snprintf(name, sizeof(name), "%s", v);

@@ -6,6 +6,7 @@
 #include "magitrickle/ipset.h"
 #include "magitrickle/ipset_nl_parser.h"
 #include "magitrickle/log.h"
+#include "magitrickle/nlattr_iter.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -246,15 +247,10 @@ static void parse_one_entry(const struct nlattr *entry_attr, list_ctx_t *ctx) {
     uint32_t timeout = 0;
     uint8_t cidr = (uint8_t)(ctx->iplen == 4 ? 32 : 128);
 
-    struct nlattr *child;
-    /* mnl_attr_for_each_nested's pointer-difference-to-int cast is inside
-     * the libmnl macro itself (not something this project's code does),
-     * so -Wconversion is suppressed only around the loop header. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each_nested(child, entry_attr)
-#pragma GCC diagnostic pop
-    {
+    mt_nlattr_iter_t child_it;
+    const struct nlattr *child;
+    if (!mt_nlattr_iter_init_nested(&child_it, entry_attr)) { return; }
+    while (mt_nlattr_iter_next(&child_it, &child)) {
         uint16_t ctype = mnl_attr_get_type(child);
         /* mnl_attr_get_type() intentionally strips NLA_F_NESTED and
          * NLA_F_NET_BYTEORDER. Inspect the raw UAPI field when a flag is
@@ -308,18 +304,18 @@ static void list_msg_cb(const struct nlmsghdr *h, void *ud) {
     list_ctx_t *ctx = ud;
     if (ctx->oom) { return; }
 
-    struct nlattr *top;
-    /* See parse_one_entry: the pointer-difference-to-int narrowing lives
-     * inside libmnl's own macro expansion, not in this project's code. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wconversion"
-    mnl_attr_for_each(top, h, sizeof(struct nfgenmsg)) {
+    mt_nlattr_iter_t top_it;
+    const struct nlattr *top;
+    if (!mt_nlattr_iter_init_nlmsg(&top_it, h, sizeof(struct nfgenmsg))) { return; }
+    while (mt_nlattr_iter_next(&top_it, &top)) {
         uint16_t ttype = mnl_attr_get_type(top);
         bool nested = (top->nla_type & NLA_F_NESTED) != 0;
         if (ttype != IPSET_ATTR_ADT || !nested) { continue; }
 
-        struct nlattr *entry;
-        mnl_attr_for_each_nested(entry, top) {
+        mt_nlattr_iter_t entry_it;
+        const struct nlattr *entry;
+        if (!mt_nlattr_iter_init_nested(&entry_it, top)) { continue; }
+        while (mt_nlattr_iter_next(&entry_it, &entry)) {
             uint16_t etype = mnl_attr_get_type(entry);
             bool enested = (entry->nla_type & NLA_F_NESTED) != 0;
             if (etype != IPSET_ATTR_DATA || !enested) { continue; }
@@ -327,7 +323,6 @@ static void list_msg_cb(const struct nlmsghdr *h, void *ud) {
             if (ctx->oom) { return; }
         }
     }
-#pragma GCC diagnostic pop
 }
 
 mt_err_t mt_ipset_nl_parse_list_message(const struct nlmsghdr *h, uint8_t iplen,
