@@ -2996,3 +2996,25 @@ shutdown while a write is parked) and `test_nfrebuild.c` (recovery after
 a simulated firmware wipe, no duplicated jumps across repeated passes,
 removal of chains left by a previous run, other writers' rules
 preserved, aborted pass writes nothing and converges on the next one).
+
+## D-64: Parse ipset nesting flags from the raw netlink attribute type
+
+**Status: accepted.** `mnl_attr_get_type()` returns a normalized type
+with `NLA_F_NESTED` and `NLA_F_NET_BYTEORDER` removed. The original C
+list parser tested `NLA_F_NESTED` on that normalized value, so it
+discarded every `IPSET_ATTR_ADT`, `IPSET_ATTR_DATA`, and
+`IPSET_ATTR_IP` container. Both IPv4 and IPv6 sets consequently appeared
+empty even when the kernel dump contained entries.
+
+Nesting is now detected through the raw `struct nlattr::nla_type` field,
+while attribute identity continues to use libmnl's normalized accessor.
+`test_ipset_nl_parser.c` constructs real nested libmnl messages for both
+families, including CIDR and network-byte-order timeout attributes, and
+passes them through the production parser without requiring an ipset
+kernel module.
+
+The committer cancellation token is also serialized across raise/clear.
+That preserves its documented invariant under concurrency: the fd is
+readable whenever the atomic flag is raised. Condition-variable
+initialization no longer destroys an uninitialized attribute object on
+its rare failure path.

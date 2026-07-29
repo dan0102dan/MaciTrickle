@@ -1,9 +1,9 @@
 /* Unit tests for the high-level mt_ipset_t wrapper (src/netfilter/ipset.c)
  * against the fake in-memory transport (fake_ipset_nl.c). Exercises the
  * Enable/Disable/Add/Del/List gating logic ported from
- * utils/netfilterTools/ipset.go; the real libmnl transport
- * (ipset_nl_real.c) cannot be exercised here at all -- this sandbox has
- * no `ip_set` kernel module (see ipset.h / phase-5-report.md).
+ * utils/netfilterTools/ipset.go. The real socket path cannot be exercised
+ * here because this sandbox has no `ip_set` kernel module; its wire parser
+ * is covered separately by test_ipset_nl_parser.c.
  */
 #include "greatest.h"
 

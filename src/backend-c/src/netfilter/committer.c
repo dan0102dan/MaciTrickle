@@ -55,10 +55,13 @@ mt_nfcommit_t *mt_nfcommit_new(mt_nfcommit_rebuild_fn fn, void *ud) {
     }
 
     pthread_condattr_t attr;
-    bool cv_ok = pthread_condattr_init(&attr) == 0 &&
-                 pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
-                 pthread_cond_init(&c->cv, &attr) == 0;
-    pthread_condattr_destroy(&attr);
+    int attr_rc = pthread_condattr_init(&attr);
+    bool cv_ok = false;
+    if (attr_rc == 0) {
+        cv_ok = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
+                pthread_cond_init(&c->cv, &attr) == 0;
+        pthread_condattr_destroy(&attr);
+    }
     if (!cv_ok) {
         pthread_mutex_destroy(&c->mu);
         mt_cancel_free(c->cancel);

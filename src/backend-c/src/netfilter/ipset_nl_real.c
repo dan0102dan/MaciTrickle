@@ -4,6 +4,7 @@
  * documented "cannot be exercised in this sandbox" limitation).
  */
 #include "magitrickle/ipset.h"
+#include "magitrickle/ipset_nl_parser.h"
 #include "magitrickle/log.h"
 
 #include <arpa/inet.h>
@@ -229,7 +230,7 @@ static bool list_ctx_grow(list_ctx_t *ctx) {
 
 static int parse_ip_attr_cb(const struct nlattr *attr, void *data) {
     uint8_t *out_addr = data;
-    uint16_t type = (uint16_t)(mnl_attr_get_type(attr) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
+    uint16_t type = mnl_attr_get_type(attr);
     if (type == IPSET_ATTR_IPADDR_IPV4 && mnl_attr_get_payload_len(attr) == 4) {
         memcpy(out_addr, mnl_attr_get_payload(attr), 4);
     } else if (type == IPSET_ATTR_IPADDR_IPV6 && mnl_attr_get_payload_len(attr) == 16) {
@@ -254,8 +255,12 @@ static void parse_one_entry(const struct nlattr *entry_attr, list_ctx_t *ctx) {
     mnl_attr_for_each_nested(child, entry_attr)
 #pragma GCC diagnostic pop
     {
-        uint16_t ctype = (uint16_t)(mnl_attr_get_type(child) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
-        bool nested = (mnl_attr_get_type(child) & NLA_F_NESTED) != 0;
+        uint16_t ctype = mnl_attr_get_type(child);
+        /* mnl_attr_get_type() intentionally strips NLA_F_NESTED and
+         * NLA_F_NET_BYTEORDER. Inspect the raw UAPI field when a flag is
+         * required; checking the normalized type made every IP child look
+         * non-nested and silently produced an all-zero address. */
+        bool nested = (child->nla_type & NLA_F_NESTED) != 0;
         switch (ctype) {
         case IPSET_ATTR_IP:
             if (nested) { mnl_attr_parse_nested(child, parse_ip_attr_cb, addr); }
@@ -309,20 +314,45 @@ static void list_msg_cb(const struct nlmsghdr *h, void *ud) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
     mnl_attr_for_each(top, h, sizeof(struct nfgenmsg)) {
-        uint16_t ttype = (uint16_t)(mnl_attr_get_type(top) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
-        bool nested = (mnl_attr_get_type(top) & NLA_F_NESTED) != 0;
+        uint16_t ttype = mnl_attr_get_type(top);
+        bool nested = (top->nla_type & NLA_F_NESTED) != 0;
         if (ttype != IPSET_ATTR_ADT || !nested) { continue; }
 
         struct nlattr *entry;
         mnl_attr_for_each_nested(entry, top) {
-            uint16_t etype = (uint16_t)(mnl_attr_get_type(entry) & ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER));
-            bool enested = (mnl_attr_get_type(entry) & NLA_F_NESTED) != 0;
+            uint16_t etype = mnl_attr_get_type(entry);
+            bool enested = (entry->nla_type & NLA_F_NESTED) != 0;
             if (etype != IPSET_ATTR_DATA || !enested) { continue; }
             parse_one_entry(entry, ctx);
             if (ctx->oom) { return; }
         }
     }
 #pragma GCC diagnostic pop
+}
+
+mt_err_t mt_ipset_nl_parse_list_message(const struct nlmsghdr *h, uint8_t iplen,
+                                        mt_ipset_entry4_t **out4, mt_ipset_entry6_t **out6,
+                                        size_t *out_n) {
+    if (!h || (iplen != 4 && iplen != 16) || !out4 || !out6 || !out_n) {
+        return MT_ERR_INVAL;
+    }
+
+    *out4 = NULL;
+    *out6 = NULL;
+    *out_n = 0;
+
+    list_ctx_t ctx = {.iplen = iplen};
+    list_msg_cb(h, &ctx);
+    if (ctx.oom) {
+        free(ctx.out4);
+        free(ctx.out6);
+        return MT_ERR_NOMEM;
+    }
+
+    *out4 = ctx.out4;
+    *out6 = ctx.out6;
+    *out_n = ctx.n;
+    return MT_OK;
 }
 
 static mt_err_t real_list(nl_real_t *r, const char *name, uint8_t iplen, mt_ipset_entry4_t **out4,
