@@ -10,6 +10,13 @@
  * Save(): drains stdout (captured, bounded) and stderr (captured for
  * error reporting, bounded) concurrently via poll() until both close,
  * then waits for the child.
+ * Cancellation: when a token is attached (mt_ipt_set_cancel), its fd
+ * joins both poll() sets. Raising it while a child is running kills that
+ * child and returns MT_ERR_CANCELED -- iptables-restore applies each
+ * table in one atomic setsockopt at its COMMIT line, so a killed child
+ * leaves whole tables applied or not applied, never a half-written one,
+ * and the caller starts over from a full rebuild anyway.
+ *
  * Restore(): writes the transcript to the child's stdin while
  * concurrently draining stdout (discarded, matching Go which never reads
  * it either) and stderr (captured for error reporting), all through
@@ -24,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +48,51 @@ typedef struct exe_real {
     mt_ipt_proto_t proto;
     const char *save_cmd;
     const char *restore_cmd;
+    mt_cancel_t *cancel; /* borrowed, nullable */
 } exe_real_t;
+
+/* Messages iptables emits when the table changed under us: a chain we
+ * reference was deleted, one we create already exists, or another writer
+ * holds the lock. None of these mean our rules are wrong -- they mean the
+ * table we diffed against is gone -- so they map to MT_ERR_AGAIN and the
+ * caller rebuilds from scratch rather than reporting a failure. */
+static const char *const k_retryable_messages[] = {
+    "No chain/target/match by that name",
+    "No such file or directory",
+    "Chain already exists",
+    "does a rule with that number exist",
+    "Resource temporarily unavailable",
+    "Device or resource busy",
+    "holding the xtables lock",
+    "doesn't exist",
+    "does not exist",
+};
+
+static bool stderr_is_retryable(const mt_bytebuf_t *err_buf) {
+    if (err_buf->len == 0 || err_buf->data == NULL) { return false; }
+
+    /* mt_bytebuf_t is not NUL-terminated; copy into a bounded scratch
+     * buffer so the substring search cannot run off the end. */
+    char scratch[4096];
+    size_t n = err_buf->len < sizeof(scratch) - 1 ? err_buf->len : sizeof(scratch) - 1;
+    memcpy(scratch, err_buf->data, n);
+    scratch[n] = '\0';
+
+    for (size_t i = 0; i < sizeof(k_retryable_messages) / sizeof(k_retryable_messages[0]); i++) {
+        if (strstr(scratch, k_retryable_messages[i]) != NULL) { return true; }
+    }
+    return false;
+}
+
+/* Kills and reaps a child whose work we no longer want. */
+static void kill_child(pid_t pid) {
+    kill(pid, SIGKILL);
+    int status;
+    pid_t w;
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+}
 
 static mt_err_t set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -136,6 +188,11 @@ static mt_err_t wait_child(pid_t pid, const char *cmd, mt_bytebuf_t *err_buf) {
 
     if (w < 0) { return mt_err_from_errno(errno); }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (stderr_is_retryable(err_buf)) {
+            MT_DEBUG("%s lost a race with another writer (status=%d): %.*s", cmd, status,
+                     (int)err_buf->len, (const char *)err_buf->data);
+            return MT_ERR_AGAIN;
+        }
         MT_ERROR("%s failed (status=%d): %.*s", cmd, status, (int)err_buf->len,
                  (const char *)err_buf->data);
         return MT_ERR_IO;
@@ -149,9 +206,14 @@ static mt_err_t real_save(mt_ipt_executable_t *self, uint8_t **out, size_t *out_
 
     pid_t pid;
     int stdin_wr, stdout_rd, stderr_rd;
+    if (mt_cancel_raised(e->cancel)) { return MT_ERR_CANCELED; }
+
     mt_err_t err = spawn_with_pipes(argv, false, &pid, &stdin_wr, &stdout_rd, &stderr_rd);
     if (err != MT_OK) { return err; }
     (void)stdin_wr;
+
+    const int cancel_fd = mt_cancel_fd(e->cancel);
+    bool canceled = false;
 
     if (err == MT_OK) { err = set_nonblock(stdout_rd); }
     if (err == MT_OK) { err = set_nonblock(stderr_rd); }
@@ -165,8 +227,8 @@ static mt_err_t real_save(mt_ipt_executable_t *self, uint8_t **out, size_t *out_
     bool stdout_limited = false;
 
     while (err == MT_OK && (!stdout_eof || !stderr_eof)) {
-        struct pollfd pfds[2];
-        int n = 0, idx_out = -1, idx_err = -1;
+        struct pollfd pfds[3];
+        int n = 0, idx_out = -1, idx_err = -1, idx_cancel = -1;
         if (!stdout_eof) {
             pfds[n].fd = stdout_rd;
             pfds[n].events = POLLIN;
@@ -177,11 +239,21 @@ static mt_err_t real_save(mt_ipt_executable_t *self, uint8_t **out, size_t *out_
             pfds[n].events = POLLIN;
             idx_err = n++;
         }
+        if (cancel_fd >= 0) {
+            pfds[n].fd = cancel_fd;
+            pfds[n].events = POLLIN;
+            idx_cancel = n++;
+        }
 
         int pr = poll(pfds, (nfds_t)n, -1);
         if (pr < 0) {
             if (errno == EINTR) { continue; }
             err = mt_err_from_errno(errno);
+            break;
+        }
+
+        if (idx_cancel >= 0 && pfds[idx_cancel].revents != 0) {
+            canceled = true;
             break;
         }
 
@@ -224,9 +296,14 @@ static mt_err_t real_save(mt_ipt_executable_t *self, uint8_t **out, size_t *out_
     close(stdout_rd);
     close(stderr_rd);
 
-    mt_err_t wait_err = wait_child(pid, e->save_cmd, &err_buf);
-    if (err == MT_OK) { err = wait_err; }
-    if (err == MT_OK && stdout_limited) { err = MT_ERR_LIMIT; }
+    if (canceled) {
+        kill_child(pid);
+        err = MT_ERR_CANCELED;
+    } else {
+        mt_err_t wait_err = wait_child(pid, e->save_cmd, &err_buf);
+        if (err == MT_OK) { err = wait_err; }
+        if (err == MT_OK && stdout_limited) { err = MT_ERR_LIMIT; }
+    }
 
     mt_bytebuf_free(&err_buf);
 
@@ -246,8 +323,13 @@ static mt_err_t real_restore(mt_ipt_executable_t *self, const uint8_t *data, siz
 
     pid_t pid;
     int stdin_wr, stdout_rd, stderr_rd;
+    if (mt_cancel_raised(e->cancel)) { return MT_ERR_CANCELED; }
+
     mt_err_t err = spawn_with_pipes(argv, true, &pid, &stdin_wr, &stdout_rd, &stderr_rd);
     if (err != MT_OK) { return err; }
+
+    const int cancel_fd = mt_cancel_fd(e->cancel);
+    bool canceled = false;
 
     if (err == MT_OK) { err = set_nonblock(stdin_wr); }
     if (err == MT_OK) { err = set_nonblock(stdout_rd); }
@@ -266,8 +348,8 @@ static mt_err_t real_restore(mt_ipt_executable_t *self, const uint8_t *data, siz
     bool stderr_eof = (err != MT_OK);
 
     while (err == MT_OK && (!stdin_done || !stdout_eof || !stderr_eof)) {
-        struct pollfd pfds[3];
-        int n = 0, idx_in = -1, idx_out = -1, idx_err = -1;
+        struct pollfd pfds[4];
+        int n = 0, idx_in = -1, idx_out = -1, idx_err = -1, idx_cancel = -1;
         if (!stdin_done) {
             pfds[n].fd = stdin_wr;
             pfds[n].events = POLLOUT;
@@ -283,11 +365,21 @@ static mt_err_t real_restore(mt_ipt_executable_t *self, const uint8_t *data, siz
             pfds[n].events = POLLIN;
             idx_err = n++;
         }
+        if (cancel_fd >= 0) {
+            pfds[n].fd = cancel_fd;
+            pfds[n].events = POLLIN;
+            idx_cancel = n++;
+        }
 
         int pr = poll(pfds, (nfds_t)n, -1);
         if (pr < 0) {
             if (errno == EINTR) { continue; }
             err = mt_err_from_errno(errno);
+            break;
+        }
+
+        if (idx_cancel >= 0 && pfds[idx_cancel].revents != 0) {
+            canceled = true;
             break;
         }
 
@@ -352,11 +444,20 @@ static mt_err_t real_restore(mt_ipt_executable_t *self, const uint8_t *data, siz
     close(stdout_rd);
     close(stderr_rd);
 
-    mt_err_t wait_err = wait_child(pid, e->restore_cmd, &err_buf);
-    if (err == MT_OK) { err = wait_err; }
+    if (canceled) {
+        kill_child(pid);
+        err = MT_ERR_CANCELED;
+    } else {
+        mt_err_t wait_err = wait_child(pid, e->restore_cmd, &err_buf);
+        if (err == MT_OK) { err = wait_err; }
+    }
 
     mt_bytebuf_free(&err_buf);
     return err;
+}
+
+static void real_set_cancel(mt_ipt_executable_t *self, mt_cancel_t *cancel) {
+    ((exe_real_t *)self)->cancel = cancel;
 }
 
 static mt_ipt_proto_t real_proto(mt_ipt_executable_t *self) {
@@ -372,6 +473,7 @@ static const mt_ipt_executable_ops_t k_real_ops = {
     .restore = real_restore,
     .proto = real_proto,
     .destroy = real_destroy,
+    .set_cancel = real_set_cancel,
 };
 
 mt_ipt_executable_t *mt_ipt_executable_real_new(mt_ipt_proto_t proto) {

@@ -27,6 +27,9 @@ typedef enum mt_err {
                       * LIMIT so callers can map it to a single HTTP status
                       * (502) regardless of the underlying fetch failure
                       * mode, matching Go's app.ErrSubscriptionFetch */
+    MT_ERR_CANCELED, /* the caller asked for this work to be abandoned
+                      * (see cancel.h) -- not a failure: the work is
+                      * expected to be started over from scratch */
 } mt_err_t;
 
 /* Static string for an error code (never NULL). */

@@ -7,7 +7,7 @@
 
 TEST every_code_has_a_string(void)
 {
-    for (int e = MT_OK; e <= MT_ERR_SYS; e++) {
+    for (int e = MT_OK; e <= MT_ERR_CANCELED; e++) {
         const char *s = mt_err_str((mt_err_t)e);
         ASSERT(s != NULL);
         ASSERT(strlen(s) > 0);

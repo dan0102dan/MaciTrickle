@@ -286,6 +286,13 @@ mt_err_t mt_ruleset_disable(mt_ruleset_t *rs) {
     return e1 != MT_OK ? e1 : e2;
 }
 
+mt_err_t mt_ruleset_prepare_iptables(mt_ruleset_t *rs) {
+    if (!rs->enabled) { return MT_OK; }
+    if (!configured_enabled(rs)) { return MT_OK; }
+    if (!rs->ipset_to_link) { return MT_OK; }
+    return mt_ipset_to_link_prepare_iptables(rs->ipset_to_link);
+}
+
 /* ---- direct add (DNS hot path) -------------------------------------------- */
 
 mt_err_t mt_ruleset_add_ipv4(mt_ruleset_t *rs, mt_ipv4_subnet_t subnet, const uint32_t *ttl) {

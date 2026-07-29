@@ -30,4 +30,9 @@ bool mt_fake_ipt_get_rules(mt_fake_ipt_t *f, const char *table, const char *chai
                           mt_ipt_rule_t *const **out_rules, size_t *out_n);
 bool mt_fake_ipt_chain_exists(mt_fake_ipt_t *f, const char *table, const char *chain);
 
+/* Drops every table and chain, standing in for another writer replacing
+ * the whole ruleset (what Keenetic firmware does before it runs the
+ * netfilter.d hook). */
+void mt_fake_ipt_reset(mt_fake_ipt_t *f);
+
 #endif /* MT_TEST_FAKE_IPTABLES_H */

@@ -41,6 +41,11 @@ mt_err_t mt_ipset_to_link_disable(mt_ipset_to_link_t *l);
  * touching a group that's actively enabled). */
 mt_err_t mt_ipset_to_link_clear_if_disabled(mt_ipset_to_link_t *l);
 
+/* Re-stages this group's chains, rules and jumps for a full table
+ * rebuild, leaving the write to the caller's single commit. No-op unless
+ * the link is enabled. */
+mt_err_t mt_ipset_to_link_prepare_iptables(mt_ipset_to_link_t *l);
+
 /* Netlink-watcher-driven hooks (matches LinkUpHook/AddrChangeHook).
  * changed_iface_name/changed_ifindex identify which interface the
  * triggering event was about; callers should invoke these for every

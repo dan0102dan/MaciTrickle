@@ -72,6 +72,15 @@ bool mt_ruleset_runtime_enabled(const mt_ruleset_t *rs);
 mt_err_t mt_ruleset_enable(mt_ruleset_t *rs);
 mt_err_t mt_ruleset_disable(mt_ruleset_t *rs);
 
+/* Re-stages this group's iptables chains for a full table rebuild without
+ * writing them (the rebuild commits the whole table at once) and without
+ * touching the group's ipset, ip rule or routes -- those survive a table
+ * rewrite by the firmware and must not be torn down and recreated, which
+ * would drop every address the DNS path has cached into the set. No-op
+ * unless both runtime- and configured-enabled, like every other mutator
+ * here. */
+mt_err_t mt_ruleset_prepare_iptables(mt_ruleset_t *rs);
+
 /* Rebuilds ipset contents from the group's subnet/subnet6 rules (static
  * CIDRs, including the "0.0.0.0/0"/"::/0" two-halves split -- see
  * decisions.md) plus domain-type rules matched against the cache's known

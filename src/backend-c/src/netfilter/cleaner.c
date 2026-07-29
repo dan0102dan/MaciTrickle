@@ -52,3 +52,25 @@ mt_err_t mt_netfilter_clean_iptables(mt_ipt_t *ipt4, mt_ipt_t *ipt6, const char 
     mt_err_t e2 = clean_one(ipt6, chain_prefix);
     return e1 != MT_OK ? e1 : e2;
 }
+
+mt_err_t mt_netfilter_register_base_chains(mt_ipt_t *ipt4, mt_ipt_t *ipt6) {
+    static const struct {
+        const char *table;
+        const char *chain;
+    } base[] = {
+        {"filter", "FORWARD"},
+        {"mangle", "PREROUTING"},
+        {"nat", "PREROUTING"},
+        {"nat", "POSTROUTING"},
+    };
+
+    mt_ipt_t *ipts[2] = {ipt4, ipt6};
+    for (size_t i = 0; i < 2; i++) {
+        if (!ipts[i]) { continue; }
+        for (size_t b = 0; b < sizeof(base) / sizeof(base[0]); b++) {
+            mt_err_t err = mt_ipt_register_chain_patch(ipts[i], base[b].table, base[b].chain);
+            if (err != MT_OK) { return err; }
+        }
+    }
+    return MT_OK;
+}

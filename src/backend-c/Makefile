@@ -76,6 +76,7 @@ CORE_SRCS := \
     src/util/err.c \
     src/util/queue.c \
     src/util/bytebuf.c \
+    src/util/cancel.c \
     src/util/rand.c \
     src/core/lifecycle.c \
     src/logging/log.c \
@@ -122,6 +123,7 @@ NETFILTER_SRCS := \
     src/netfilter/ipset_to_link.c \
     src/netfilter/port_remap.c \
     src/netfilter/cleaner.c \
+    src/netfilter/committer.c \
     src/netfilter/ruleset.c \
     src/netlink/rtnl.c \
     src/netlink/watcher.c

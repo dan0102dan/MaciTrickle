@@ -5,6 +5,7 @@
 #include <ifaddrs.h>
 #include <linux/if.h>
 #include <net/if.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,8 @@
 
 #include "magitrickle/keenetic_rci.h"
 #include "magitrickle/log.h"
+#include "magitrickle/netfilter_cleaner.h"
+#include "magitrickle/nfcommit.h"
 #include "magitrickle/rulesnap.h"
 #include "magitrickle/sub_fetch.h"
 #include "magitrickle/sub_runtime.h"
@@ -43,7 +46,46 @@ struct mt_app {
     mt_group_t **sub_synth_groups;
     size_t n_sub_rulesets;
     size_t cap_sub_rulesets;
+
+    mt_port_remap_t *port_remap; /* borrowed, nullable (main() owns it) */
+
+    /* Netfilter committer (nfcommit.h) and the mutex serializing its
+     * rebuilds against this thread's own netfilter mutation. Both are
+     * absent unless the committer was started, in which case nf_mu is
+     * uncontended and every lock/unlock below is a no-op pair.
+     *
+     * This does not walk back decisions.md D-19's "netfilter mutation is
+     * single-threaded": the committer thread only ever *reads* the
+     * ruleset registry (to stage each group's chains), and the loop
+     * thread remains the only writer. That leaves the DNS hot path, the
+     * other reader, lock-free as D-17 requires -- readers never conflict
+     * with each other, and the lock exists solely so the registry cannot
+     * be rewritten, or an iptables engine driven, while a rebuild is
+     * mid-flight.
+     *
+     * Recursive on purpose: none of the entry points below nest today,
+     * but they are the kind that grows into each other (a subscription
+     * replace acquiring a sync, say), and a plain mutex would turn that
+     * edit into a deadlocked router rather than a failing test. */
+    pthread_mutex_t nf_mu;
+    bool nf_mu_ready;
+    mt_nfcommit_t *committer;
 };
+
+/* Taken by every entry point that mutates the ruleset registry or drives
+ * an iptables engine. Interrupting a pass in flight first means this
+ * thread waits for an abort rather than for a whole rebuild; the pass
+ * reschedules itself and picks up the change we are about to make. */
+static void app_nf_enter(mt_app_t *app) {
+    if (!app->nf_mu_ready) { return; }
+    mt_nfcommit_interrupt(app->committer);
+    pthread_mutex_lock(&app->nf_mu);
+}
+
+static void app_nf_leave(mt_app_t *app) {
+    if (!app->nf_mu_ready) { return; }
+    pthread_mutex_unlock(&app->nf_mu);
+}
 
 static mt_ruleset_deps_t ruleset_deps(mt_app_t *app) {
     mt_ruleset_deps_t deps = {
@@ -197,6 +239,9 @@ mt_app_t *mt_app_create(const mt_app_deps_t *deps) {
 
 void mt_app_destroy(mt_app_t *app) {
     if (!app) { return; }
+    /* Nothing below is safe while a rebuild can still be reading the
+     * ruleset registry. */
+    mt_app_stop_netfilter_committer(app);
     for (size_t i = 0; i < app->n_rulesets; i++) {
         mt_ruleset_disable(app->rulesets[i]);
         mt_ruleset_free(app->rulesets[i]);
@@ -227,7 +272,7 @@ mt_ruleset_t *mt_app_find_group_by_id(const mt_app_t *app, mt_id_t id) {
     return NULL;
 }
 
-mt_err_t mt_app_add_group(mt_app_t *app, mt_group_t *group) {
+static mt_err_t mt_app_add_group_unlocked(mt_app_t *app, mt_group_t *group) {
     for (size_t i = 0; i < app->cfg->n_groups; i++) {
         if (mt_id_equal(app->cfg->groups[i]->id, group->id)) {
             mt_group_free(group);
@@ -278,11 +323,25 @@ mt_err_t mt_app_add_group(mt_app_t *app, mt_group_t *group) {
     return MT_OK;
 }
 
-mt_err_t mt_app_sync_group(mt_app_t *app, mt_ruleset_t *rs) {
+mt_err_t mt_app_add_group(mt_app_t *app, mt_group_t *group) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_add_group_unlocked(app, group);
+    app_nf_leave(app);
+    return r;
+}
+
+static mt_err_t mt_app_sync_group_unlocked(mt_app_t *app, mt_ruleset_t *rs) {
     return mt_ruleset_sync(rs, app->cache, (int64_t)time(NULL));
 }
 
-void mt_app_clear_groups(mt_app_t *app) {
+mt_err_t mt_app_sync_group(mt_app_t *app, mt_ruleset_t *rs) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_sync_group_unlocked(app, rs);
+    app_nf_leave(app);
+    return r;
+}
+
+static void mt_app_clear_groups_unlocked(mt_app_t *app) {
     for (size_t i = 0; i < app->n_rulesets; i++) {
         mt_ruleset_disable(app->rulesets[i]);
         mt_ruleset_free(app->rulesets[i]);
@@ -292,7 +351,13 @@ void mt_app_clear_groups(mt_app_t *app) {
     republish_or_log(app);
 }
 
-void mt_app_remove_group_by_index(mt_app_t *app, size_t idx) {
+void mt_app_clear_groups(mt_app_t *app) {
+    app_nf_enter(app);
+    mt_app_clear_groups_unlocked(app);
+    app_nf_leave(app);
+}
+
+static void mt_app_remove_group_by_index_unlocked(mt_app_t *app, size_t idx) {
     if (idx >= app->n_rulesets) { return; }
     mt_ruleset_free(app->rulesets[idx]);
     rulesets_remove_at(app, idx);
@@ -300,7 +365,13 @@ void mt_app_remove_group_by_index(mt_app_t *app, size_t idx) {
     republish_or_log(app);
 }
 
-bool mt_app_remove_group_by_id(mt_app_t *app, mt_id_t id) {
+void mt_app_remove_group_by_index(mt_app_t *app, size_t idx) {
+    app_nf_enter(app);
+    mt_app_remove_group_by_index_unlocked(app, idx);
+    app_nf_leave(app);
+}
+
+static bool mt_app_remove_group_by_id_unlocked(mt_app_t *app, mt_id_t id) {
     for (size_t i = 0; i < app->n_rulesets; i++) {
         if (mt_id_equal(mt_ruleset_group(app->rulesets[i])->id, id)) {
             mt_app_remove_group_by_index(app, i);
@@ -308,6 +379,13 @@ bool mt_app_remove_group_by_id(mt_app_t *app, mt_id_t id) {
         }
     }
     return false;
+}
+
+bool mt_app_remove_group_by_id(mt_app_t *app, mt_id_t id) {
+    app_nf_enter(app);
+    bool r = mt_app_remove_group_by_id_unlocked(app, id);
+    app_nf_leave(app);
+    return r;
 }
 
 /* ---- subscriptions ------------------------------------------------------------ */
@@ -342,7 +420,7 @@ mt_ruleset_t *mt_app_find_subscription_ruleset_by_id(const mt_app_t *app, mt_id_
     return NULL;
 }
 
-mt_err_t mt_app_add_subscription(mt_app_t *app, mt_subscription_t *sub) {
+static mt_err_t mt_app_add_subscription_unlocked(mt_app_t *app, mt_subscription_t *sub) {
     for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
         if (mt_id_equal(app->cfg->subscriptions[i]->id, sub->id)) {
             mt_subscription_free(sub);
@@ -369,7 +447,14 @@ mt_err_t mt_app_add_subscription(mt_app_t *app, mt_subscription_t *sub) {
     return MT_OK;
 }
 
-mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, size_t n) {
+mt_err_t mt_app_add_subscription(mt_app_t *app, mt_subscription_t *sub) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_add_subscription_unlocked(app, sub);
+    app_nf_leave(app);
+    return r;
+}
+
+static mt_err_t mt_app_replace_subscriptions_unlocked(mt_app_t *app, mt_subscription_t **subs, size_t n) {
     mt_subscription_t **new_arr = n > 0 ? calloc(n, sizeof(*new_arr)) : NULL;
     if (n > 0 && !new_arr) {
         for (size_t i = 0; i < n; i++) { mt_subscription_free(subs[i]); }
@@ -403,7 +488,14 @@ mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, s
     return MT_OK;
 }
 
-mt_err_t mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id, bool *out_found) {
+mt_err_t mt_app_replace_subscriptions(mt_app_t *app, mt_subscription_t **subs, size_t n) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_replace_subscriptions_unlocked(app, subs, n);
+    app_nf_leave(app);
+    return r;
+}
+
+static mt_err_t mt_app_remove_subscription_by_id_unlocked(mt_app_t *app, mt_id_t id, bool *out_found) {
     size_t idx = app->cfg->n_subscriptions;
     for (size_t i = 0; i < app->cfg->n_subscriptions; i++) {
         if (mt_id_equal(app->cfg->subscriptions[i]->id, id)) {
@@ -450,6 +542,13 @@ mt_err_t mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id, bool *out_f
     return MT_OK;
 }
 
+mt_err_t mt_app_remove_subscription_by_id(mt_app_t *app, mt_id_t id, bool *out_found) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_remove_subscription_by_id_unlocked(app, id, out_found);
+    app_nf_leave(app);
+    return r;
+}
+
 /* ---- subscription sync (fetch-backed) ----------------------------------------- */
 
 static mt_subscription_t *find_subscription_mut(mt_app_t *app, mt_id_t id) {
@@ -464,8 +563,10 @@ static void free_sub_rule_array(mt_sub_rule_t **rules, size_t n) {
     free(rules);
 }
 
-mt_err_t mt_app_sync_subscription_by_id(mt_app_t *app, mt_id_t id, int64_t now_unix,
-                                        const char *url_override, bool *out_changed) {
+static mt_err_t mt_app_sync_subscription_by_id_unlocked(mt_app_t *app, mt_id_t id,
+                                                        int64_t now_unix,
+                                                        const char *url_override,
+                                                        bool *out_changed) {
     *out_changed = false;
 
     mt_subscription_t *sub = find_subscription_mut(app, id);
@@ -546,7 +647,16 @@ mt_err_t mt_app_sync_subscription_by_id(mt_app_t *app, mt_id_t id, int64_t now_u
     return MT_OK;
 }
 
-mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *out_any_changed) {
+mt_err_t mt_app_sync_subscription_by_id(mt_app_t *app, mt_id_t id, int64_t now_unix,
+                                        const char *url_override, bool *out_changed) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_sync_subscription_by_id_unlocked(app, id, now_unix, url_override,
+                                                         out_changed);
+    app_nf_leave(app);
+    return r;
+}
+
+static mt_err_t mt_app_sync_due_subscriptions_unlocked(mt_app_t *app, int64_t now_unix, bool *out_any_changed) {
     *out_any_changed = false;
 
     mt_id_t *due_ids = NULL;
@@ -703,6 +813,13 @@ mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *ou
     return MT_OK;
 }
 
+mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *out_any_changed) {
+    app_nf_enter(app);
+    mt_err_t r = mt_app_sync_due_subscriptions_unlocked(app, now_unix, out_any_changed);
+    app_nf_leave(app);
+    return r;
+}
+
 /* ---- interfaces -------------------------------------------------------------- */
 
 /* Mirrors Go's constant.IgnoredInterfaces: empty on the default/OpenWrt
@@ -803,14 +920,138 @@ mt_err_t mt_app_save_config(mt_app_t *app, const char *path, const char *version
     return mt_config_save_file(app->cfg, version, path);
 }
 
-mt_err_t mt_app_force_commit_iptables(mt_app_t *app) {
+void mt_app_set_port_remap(mt_app_t *app, mt_port_remap_t *remap) {
+    app->port_remap = remap;
+}
+
+/* One pass of the rebuild, with the netfilter lock already held. */
+static mt_err_t rebuild_netfilter_locked(mt_app_t *app, mt_cancel_t *cancel) {
+    /* Take everything of ours out of the kernel before putting anything
+     * back. What is left in the tables after an aborted write, or after
+     * the firmware replaced them, is not something worth reasoning about
+     * -- starting from "none of it is there" makes the result depend only
+     * on the current group set. */
+    mt_err_t err = mt_netfilter_clean_iptables(app->ipt4, app->ipt6,
+                                               app->cfg->app.netfilter.iptables.chain_prefix);
+    if (err != MT_OK) { return err; }
+    if (mt_cancel_raised(cancel)) { return MT_ERR_CANCELED; }
+
+    err = mt_netfilter_register_base_chains(app->ipt4, app->ipt6);
+    if (err != MT_OK) { return err; }
+
+    err = mt_port_remap_prepare_iptables(app->port_remap);
+    if (err != MT_OK) { return err; }
+
+    for (size_t i = 0; i < app->n_rulesets; i++) {
+        err = mt_ruleset_prepare_iptables(app->rulesets[i]);
+        if (err != MT_OK) { return err; }
+    }
+    for (size_t i = 0; i < app->n_sub_rulesets; i++) {
+        err = mt_ruleset_prepare_iptables(app->sub_rulesets[i]);
+        if (err != MT_OK) { return err; }
+    }
+
+    if (mt_cancel_raised(cancel)) { return MT_ERR_CANCELED; }
+
     if (app->ipt4) {
-        mt_err_t err = mt_ipt_commit(app->ipt4);
+        err = mt_ipt_commit(app->ipt4);
         if (err != MT_OK) { return err; }
     }
     if (app->ipt6) {
-        mt_err_t err = mt_ipt_commit(app->ipt6);
+        err = mt_ipt_commit(app->ipt6);
         if (err != MT_OK) { return err; }
     }
     return MT_OK;
+}
+
+mt_err_t mt_app_rebuild_netfilter(mt_app_t *app, mt_cancel_t *cancel) {
+    if (app->nf_mu_ready) { pthread_mutex_lock(&app->nf_mu); }
+
+    /* Attached for exactly this pass. Leaving it on the engines would
+     * also abort commits made by the API on the loop thread -- those are
+     * synchronous, report their result to a caller who is waiting for it,
+     * and have no business being cancelled by a netfilter.d event. Since
+     * both threads only drive an engine while holding nf_mu, the token is
+     * attached precisely while the committer owns them. */
+    if (app->ipt4) { mt_ipt_set_cancel(app->ipt4, cancel); }
+    if (app->ipt6) { mt_ipt_set_cancel(app->ipt6, cancel); }
+
+    mt_err_t err = rebuild_netfilter_locked(app, cancel);
+
+    if (app->ipt4) { mt_ipt_set_cancel(app->ipt4, NULL); }
+    if (app->ipt6) { mt_ipt_set_cancel(app->ipt6, NULL); }
+
+    if (app->nf_mu_ready) { pthread_mutex_unlock(&app->nf_mu); }
+    return err;
+}
+
+#ifdef MT_ENTWARE_KN
+static mt_err_t rebuild_netfilter_cb(void *ud, mt_cancel_t *cancel) {
+    return mt_app_rebuild_netfilter(ud, cancel);
+}
+#endif
+
+mt_err_t mt_app_start_netfilter_committer(mt_app_t *app) {
+#ifndef MT_ENTWARE_KN
+    (void)app;
+    return MT_OK;
+#else
+    if (app->committer) { return MT_ERR_STATE; }
+
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) { return MT_ERR_SYS; }
+    bool mu_ok = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0 &&
+                 pthread_mutex_init(&app->nf_mu, &attr) == 0;
+    pthread_mutexattr_destroy(&attr);
+    if (!mu_ok) { return MT_ERR_SYS; }
+
+    app->committer = mt_nfcommit_new(rebuild_netfilter_cb, app);
+    if (!app->committer) {
+        pthread_mutex_destroy(&app->nf_mu);
+        return MT_ERR_NOMEM;
+    }
+
+    /* Published before the thread starts so the first request coming in
+     * over the webhook already takes the lock. */
+    app->nf_mu_ready = true;
+
+    mt_err_t err = mt_nfcommit_start(app->committer);
+    if (err != MT_OK) {
+        app->nf_mu_ready = false;
+        mt_nfcommit_free(app->committer);
+        app->committer = NULL;
+        pthread_mutex_destroy(&app->nf_mu);
+        return err;
+    }
+    MT_INFO("netfilter table committer started");
+    return MT_OK;
+#endif
+}
+
+void mt_app_stop_netfilter_committer(mt_app_t *app) {
+    if (!app || !app->committer) { return; }
+
+    /* Joins the thread, so no pass can still have the token attached to
+     * an engine by the time this returns. */
+    mt_nfcommit_free(app->committer);
+    app->committer = NULL;
+
+    app->nf_mu_ready = false;
+    pthread_mutex_destroy(&app->nf_mu);
+}
+
+mt_err_t mt_app_force_commit_iptables(mt_app_t *app) {
+    if (app->committer) {
+        /* Nothing to wait for and nothing to report: the committer aborts
+         * whatever it is writing and rebuilds the table from scratch. */
+        mt_nfcommit_request(app->committer);
+        return MT_OK;
+    }
+
+    app_nf_enter(app);
+    mt_err_t err = MT_OK;
+    if (app->ipt4) { err = mt_ipt_commit(app->ipt4); }
+    if (err == MT_OK && app->ipt6) { err = mt_ipt_commit(app->ipt6); }
+    app_nf_leave(app);
+    return err;
 }
