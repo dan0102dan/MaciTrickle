@@ -253,10 +253,11 @@ mt_err_t mt_app_sync_due_subscriptions(mt_app_t *app, int64_t now_unix, bool *ou
 
 typedef struct mt_iface_info {
     char id[16];   /* IFNAMSIZ */
-    char name[64]; /* friendly alias; empty unless a router-specific API
-                    * supplies one -- always empty here, matching Go's
-                    * DummyRouterSpecificAPI (the Keenetic RCI alias
-                    * lookup is entware_kn-only and deferred to Phase 8) */
+    char name[64]; /* friendly alias, or empty when the platform has no
+                    * router-specific source for one. Filled from the
+                    * Keenetic RCI lookup under -DMT_ENTWARE_KN (see
+                    * keenetic_rci.h); empty elsewhere, matching Go's
+                    * DummyRouterSpecificAPI. */
 } mt_iface_info_t;
 
 /* Enumerates system network interfaces (getifaddrs, deduped by name),

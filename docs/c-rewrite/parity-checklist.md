@@ -162,20 +162,28 @@ empty-list default and the Keenetic list under the flag) and a full
 `-Werror` build in both modes. `PointToPoint`-flag filtering and
 `showAllInterfaces` bypass semantics were already correct (unaffected).
 
-**PASS (documented, deliberately deferred — not fixed this phase)**: the
-Keenetic RCI friendly-name lookup (`GetIfaceAliases`, an HTTP call to a
-real router's `localhost:79/rci/` service) remains the
-`app.h`-documented "always empty here, matching Go's
-DummyRouterSpecificAPI" stub for the default/non-`entware_kn` path — this
-is *correct* default-platform behavior (Go's own default build is
-identical: a dummy stub, real RCI lookup is `entware_kn`-only). A real
-`entware_kn` implementation needs an actual Keenetic router's RCI service
-to develop and verify against safely; this sandbox has none. Note also
-that Go's *own* dedicated `entware_kn` test
-(`keenetic_router_specific_test.go`) only covers this RCI lookup with a
-mocked HTTP server — it does not cover the ignored-interfaces list this
-review just fixed, meaning that specific list had *zero* automated test
-coverage on the Go side too until the C port's new unit test above.
+**PASS (gap closed after Phase 9 — see D-62)**: the Keenetic RCI
+friendly-name lookup (`GetIfaceAliases`) was left as a stub by this
+review, on the reasoning that it "needs an actual Keenetic router's RCI
+service to develop and verify against safely". That reasoning was wrong
+in an important way: Go's own test never used a real router either — it
+used a mocked HTTP server — so the same coverage was achievable here all
+along. The consequence was user-visible on real hardware: the WebUI's
+interface picker showed bare kernel names (`nwg0`) instead of the
+Keenetic labels (`Home VPN`) the Go build displayed.
+
+Now implemented in `src/interfaces/keenetic_rci.c`
+(`mt_kn_get_iface_aliases`) and wired into `mt_app_list_interfaces`,
+preserving Go's exact semantics: two RCI calls (`GET
+/rci/show/interface`, then one batched `POST /rci/`), positional
+response matching, `description` → `interface-name` → skip alias
+selection, and skipping entries whose label equals the system name. The
+default/non-`entware_kn` path still yields an empty set without touching
+the network, matching Go's `DummyRouterSpecificAPI`. Verified by
+`tests/unit/test_keenetic_rci.c` (11 cases porting Go's own test plus
+the length-mismatch/trimming/skip edges its table left implicit) and by
+an ASan+UBSan run of the real libcurl transport against a stub RCI
+server, in both default and `ENTWARE_KN=1` builds.
 
 **PASS.** Netlink watcher contract (link-up/new-address re-programs
 ip rule/route, link removal is a no-op) — covered by Phase 5's netlink
@@ -214,12 +222,12 @@ scope limit.
 
 Of 11 contract sections: **10 pass with cited automated-test evidence**
 (several with explicitly-permitted, contract-sanctioned hardening
-divergences), **1 section (interfaces/platform) had a real, previously-
-undetected gap found and fixed during this review** (the Keenetic
-ignored-interfaces list), and **1 narrow, deliberately-scoped-out item
-remains** (the Keenetic RCI alias lookup — needs real hardware, matches
-Go's own zero test coverage for the underlying list this review fixed,
-and does not regress the default/non-`entware_kn` platform behavior).
+divergences) and **1 section (interfaces/platform) had two real gaps** —
+the Keenetic ignored-interfaces list, found and fixed during this
+review, and the Keenetic RCI alias lookup, which this review wrongly
+scoped out as needing real hardware and which was later implemented and
+tested against a stub RCI server exactly as Go had done (D-62). Both are
+now closed; no item remains deferred.
 One sandbox-specific (not code-specific) live-verification gap is named
 in section 7 (`ipset` non-functional in this particular session's
 container). No section was found unimplemented, silently divergent, or

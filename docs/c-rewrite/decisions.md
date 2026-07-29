@@ -2867,3 +2867,77 @@ loud, a run that stays green has produced every package it was supposed
 to, and a missing arch cannot reach a release quietly. The expected
 asset count is 68 -- 7 Entware, 59 from the release lines, 2 from
 snapshots -- against 71 jobs and the three absences above.
+
+## D-62: Port the Keenetic RCI interface-alias lookup that Phase 9 scoped out
+
+**Status: accepted; closes the last deferred parity item.** Phase 9's
+parity checklist recorded the Keenetic RCI friendly-name lookup
+(Go's `internal/interfaces/keenetic_router_specific.go`,
+`GetIfaceAliases`) as "deliberately deferred", on the reasoning that it
+"needs an actual Keenetic router's RCI service to develop and verify
+against safely; this sandbox has none".
+
+**That reasoning was wrong, and the checklist even contained the
+evidence against it**: the same paragraph noted that Go's own test
+covers this lookup "with a mocked HTTP server". Go never needed a real
+router to develop or test it either. Deferring on hardware grounds was
+therefore not a real constraint — the identical mock-server approach was
+available the whole time, and is what this entry uses.
+
+**The cost was user-visible.** On real `entware_kn` hardware the WebUI's
+interface picker listed bare kernel names (`nwg0`, `nwg1`) where the Go
+build showed the Keenetic labels the user actually set (`Home VPN`).
+`mt_iface_info_t.name` was hardwired empty on every platform. This was
+reported from a live router, not caught by any test here — a reminder
+that "matches Go's default-platform behavior" is not the same claim as
+"matches Go on the platform the feature exists for", and the checklist
+conflated the two.
+
+**Implementation** (`src/interfaces/keenetic_rci.c`, new). Preserves
+Go's protocol exactly, because RCI's shape is not negotiable:
+
+1. `GET /rci/show/interface` → object keyed by RCI interface id, values
+   carrying `description` and `interface-name`. Non-object values are
+   skipped per entry, mirroring Go's `json.Unmarshal`-error `continue`.
+2. One batched `POST /rci/` carrying an array element per interface id.
+   The response is an array matched back **positionally** — RCI does not
+   echo the id, so this ordering coupling is the contract's most
+   breakable point and gets its own unit test.
+3. Alias selection: trimmed `description`, else trimmed
+   `interface-name`, else skip; also skip when the result equals the
+   system name (nothing there the user isn't already seeing).
+
+Trimming is applied both at parse time and again in
+`mt_kn_build_aliases`. That looks redundant but is deliberate: Go
+trimmed at the alias-building step, and keeping it there makes that
+exported function correct on its own rather than only when fed by this
+file's own parsers. A unit test asserting a whitespace-only label is
+what surfaced the difference.
+
+**Platform gating** matches Go's build tags rather than inventing a new
+mechanism: the module compiles everywhere, but `mt_kn_get_iface_aliases`
+performs RCI calls only under `-DMT_ENTWARE_KN` and otherwise returns an
+empty set without touching the network — the direct analogue of Go's
+`DummyRouterSpecificAPI` under `!entware_kn`. `mt_app_list_interfaces`
+treats any failure as "no aliases" and logs at debug, exactly as Go's
+`interfaces.List` did; an unreachable RCI must never fail the interface
+list itself.
+
+**Hardening beyond Go**: a 1 MiB cap on an RCI response body. Go had
+none. This is a local, trusted endpoint, but an unbounded read into a
+router's small RAM is a worse failure mode than losing aliases.
+
+**Verification**: `tests/unit/test_keenetic_rci.c` — 11 cases porting
+Go's own test assertions (batch request shape, positional matching,
+`description`/`interface-name` precedence) plus the edges Go's table
+left implicit (response/request length mismatch in both directions,
+whitespace-only and self-equal labels, malformed and non-object
+payloads, empty list short-circuit). The libcurl transport itself,
+which unit tests do not reach, was exercised under ASan+UBSan against a
+stub RCI server: aliases resolved correctly, the self-equal entry was
+skipped, and an unreachable endpoint degraded to `MT_ERR_UPSTREAM` with
+an empty set and no leak. Both the default and `ENTWARE_KN=1` builds
+pass the full suite; `make static_analysis` is clean (the two cppcheck
+notes on this file are `style`-category, which this project's gate does
+not enable, and one of them applies equally to the pre-existing
+`write_cb` in `subscriptions/fetch.c`).
