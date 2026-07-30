@@ -27,7 +27,7 @@ ifeq ($(strip $(PKG_VERSION)),)
 	endif
 
 	ifeq ($(strip $(PKG_VERSION)),)
-		PKG_VERSION_PRERELEASE := $(if $(TAG),$(shell echo "$(TAG)" | sed 's/-rev[0-9]*$$//' | awk -F. 'BEGIN{OFS="."} {$$NF=$$NF+1; print}'),0.0.0)
+		PKG_VERSION_PRERELEASE := $(if $(TAG),$(shell echo "$(TAG)" | sed 's/-rev[0-9]*$$//' | awk -F. 'BEGIN{OFS="."} {if (NF >= 3) {$$3=$$3+1; NF=3} else {$$NF=$$NF+1}; print}'),0.0.0)
 		PRERELEASE_DATE := $(shell date -u +%Y%m%d%H%M%S)
 		COMMIT := $(shell git rev-parse --short HEAD)
 		PKG_VERSION := $(PKG_VERSION_PRERELEASE)~git$(PRERELEASE_DATE).$(COMMIT)

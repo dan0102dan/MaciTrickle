@@ -884,6 +884,10 @@ jobs:
             package=".build/magitrickle_${artifact_version}-${PKG_REVISION}_openwrt-${{ matrix.openwrt_version }}_${{ matrix.name }}.${package_ext}"
             cp "${packages[0]}" "$package"
 
+            if [ "$package_ext" = ipk ]; then
+              sh tools/ci/check-openwrt-ipk-scripts.sh "$package"
+            fi
+
             # Release SDKs ship with CONFIG_AUTOREMOVE enabled, which wipes
             # a package's build directory the moment it finishes compiling
             # -- everything except .pkgdir, the staged install tree the
