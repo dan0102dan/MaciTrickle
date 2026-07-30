@@ -31,10 +31,7 @@
 <div class="select-wrap" class:missing={missing_selection} {...rest}>
   <Select.Root type="single" {onValueChange} items={options} bind:value={selected}>
     <Select.Trigger aria-label={ariaLabel}>
-      <div
-        class="selected"
-        class:has-description={selected_description}
-      >
+      <div class="selected" class:has-description={selected_description}>
         <div class="selected-text">
           <div class="selected-value">{selected_label}</div>
           {#if selected_description}

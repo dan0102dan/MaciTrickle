@@ -2,8 +2,9 @@
   import { getContext } from "svelte";
 
   import { t } from "../../../data/locale.svelte";
-  import { Search } from "../../../components/ui/icons";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
+
+  import { Search } from "../../../components/ui/icons";
 
   const store = getContext<GroupsStore>(GROUPS_STORE_CONTEXT);
   if (!store) {
